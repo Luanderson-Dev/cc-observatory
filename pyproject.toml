@@ -45,6 +45,11 @@ cc-observatory = "ccobs.cli:main"
 requires = ["uv_build>=0.12.23,<0.13"]
 build-backend = "uv_build"
 
+[tool.uv]
+# setup-uv installs the highest uv in this range in CI. Bump it together with the
+# uv_build bound in [build-system].
+required-version = ">=0.12.23,<0.13"
+
 [tool.uv.build-backend]
 module-name = "ccobs"
 

@@ -59,6 +59,9 @@ tests, loosening ruff or mypy).
     - feature → `develop`: **squash**. The PR title becomes the changelog line, so it
       must describe the whole delivery in Conventional Commits (CI checks it);
     - release → `main` and the back-merge `main` → `develop`: **merge commit**, never squash.
+- CI validates every PR title with `cz check --allowed-prefixes`: it must be a
+  Conventional Commit, and the default bypass for `Merge`, `Revert`, `fixup!` and
+  `squash!` is off, so release and back-merge PRs need Conventional titles too.
 - Commits:
     - one commit per stage, Conventional Commits validated by the commitizen hook
       (`feat`, `fix`, `refactor`, `perf`, `docs`, `build`, `ci`, `chore`, `test`, `bump`);
@@ -78,10 +81,14 @@ tests, loosening ruff or mypy).
     2. `git flow release start X.Y.Z`, `uv version X.Y.Z`,
        `uv run cz changelog --incremental --unreleased-version vX.Y.Z`, commit
        `bump: version X.Y.Z`.
-    3. PR to `main`, green CI, `gh pr merge --merge`.
-    4. On the updated `main`: `git tag -a vX.Y.Z -m "vX.Y.Z"`, push the tag,
+    3. PR to `main` with `gh pr create --base main --title "bump: version X.Y.Z"`,
+       green CI, `gh pr merge --merge`.
+    4. On the updated `main`: `git tag -a vX.Y.Z -m "vX.Y.Z"`, push the tag (this runs
+       `release.yml`, which publishes to PyPI by trusted publishing),
        `gh release create vX.Y.Z --generate-notes`.
-    5. Back-merge: PR `main` → `develop` with `--merge`; confirm with
+    5. Back-merge:
+       `gh pr create --base develop --head main --title "chore: merge main into develop after vX.Y.Z"`,
+       then `gh pr merge --merge`; confirm with
        `git merge-base --is-ancestor origin/main origin/develop`; delete the release branch.
 - Hotfix: `git flow hotfix start X.Y.Z` from `main`, fix with a test, then release
   steps 2 to 5.
@@ -187,15 +194,15 @@ docs/adr/         architecture decision records (MADR)
 
 ## Milestones
 
-| Milestone | Release | Scope                                                              |
-| --------- | ------- | ------------------------------------------------------------------ |
-| 0         | v0.1.0  | Foundation, tooling, CI, ADRs, telemetry and hooks spike, fixtures |
-| 1         | v0.2.0  | Observability stack in compose, provisioned Grafana                |
-| 2         | v0.3.0  | Hook ingestion, session state machine, SQLite, blocks, `/metrics`  |
-| 3         | v0.4.0  | Web UI (HTMX + SSE)                                                |
-| 4         | v0.5.0  | `ccobs setup`, `uninstall`, `doctor`, `status`                     |
-| 5         | v0.6.0  | Alerts (browser and Discord)                                       |
-| 6         | v0.7.0  | Grafana dashboards and polish                                      |
-| 7         | v1.0.0  | Distribution: GHCR multi-arch images, PyPI, contributor docs       |
+| Milestone | Release | Scope                                                                                  |
+| --------- | ------- | -------------------------------------------------------------------------------------- |
+| 0         | v0.1.0  | Foundation, tooling, CI, ADRs, telemetry and hooks spike, fixtures, first PyPI release |
+| 1         | v0.2.0  | Observability stack in compose, provisioned Grafana                                    |
+| 2         | v0.3.0  | Hook ingestion, session state machine, SQLite, blocks, `/metrics`                      |
+| 3         | v0.4.0  | Web UI (HTMX + SSE)                                                                    |
+| 4         | v0.5.0  | `ccobs setup`, `uninstall`, `doctor`, `status`                                         |
+| 5         | v0.6.0  | Alerts (browser and Discord)                                                           |
+| 6         | v0.7.0  | Grafana dashboards and polish                                                          |
+| 7         | v1.0.0  | Distribution: GHCR multi-arch images, release hardening, contributor docs              |
 
 Current: milestone 0.

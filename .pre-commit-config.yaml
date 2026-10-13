@@ -18,23 +18,36 @@ repos:
         args: [--fix=lf]
         exclude: '\.(bat|cmd)$'
 
-  - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.17.0
-    hooks:
-      - id: ruff-check
-        args: [--fix]
-      - id: ruff-format
-
-  - repo: https://github.com/commitizen-tools/commitizen
-    rev: v4.19.2
-    hooks:
-      - id: commitizen
-
+  # Tools run through uv so their versions come from uv.lock, the same as in CI.
   - repo: local
     hooks:
+      - id: ruff-check
+        name: ruff check
+        entry: uv run ruff check --fix --force-exclude
+        language: system
+        types_or: [python, pyi]
+        require_serial: true
+
+      - id: ruff-format
+        name: ruff format
+        entry: uv run ruff format --force-exclude
+        language: system
+        types_or: [python, pyi]
+        require_serial: true
+
       - id: mypy
         name: mypy
         entry: uv run mypy
         language: system
         types: [python]
         pass_filenames: false
+
+      # Local commits keep Commitizen's default bypass for Merge, Revert, fixup! and
+      # squash! messages (git merge, git revert, autosquash). PR titles, which become the
+      # changelog lines, are checked strictly in CI (.github/workflows/pr-title.yml).
+      # --allow-abort keeps an empty message as Git's normal "abort the commit".
+      - id: commitizen
+        name: commitizen check
+        entry: uv run cz check --allow-abort --commit-msg-file
+        language: system
+        stages: [commit-msg]

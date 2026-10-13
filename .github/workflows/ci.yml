@@ -1,0 +1,119 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main, develop]
+
+permissions:
+  contents: read
+
+# Pull requests: one group per PR, and a new push cancels the run in progress.
+# Pushes to main and develop: one group per commit, so no run is cancelled or queued.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  lint:
+    name: Lint and types
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          enable-cache: true
+
+      - name: Check that uv.lock is up to date
+        run: uv lock --check
+
+      - name: Install the project
+        id: sync
+        run: uv sync --locked
+
+      # Only for the inline annotations on the PR diff; pre-commit below runs every check.
+      - name: Ruff annotations
+        run: uv run ruff check --output-format=github .
+
+      - name: pre-commit (ruff, mypy and file checks)
+        if: ${{ !cancelled() && steps.sync.outcome == 'success' }}
+        run: uv run pre-commit run --all-files --show-diff-on-failure
+
+  test:
+    name: Tests (${{ matrix.os }}, py${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python-version: ["3.12"]
+        include:
+          - os: ubuntu-latest
+            python-version: "3.13"
+          - os: ubuntu-latest
+            python-version: "3.14"
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # python-version sets UV_PYTHON for the rest of the job, which overrides .python-version.
+      - name: Set up uv with Python ${{ matrix.python-version }}
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          enable-cache: true
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install the project
+        run: uv sync --locked
+
+      - name: Pytest
+        run: uv run pytest
+
+  build:
+    name: Build distributions
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # No cache: uv build only needs the build backend, and sharing the lint job's
+      # cache key would let this smaller cache replace the full one.
+      - name: Set up uv
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          enable-cache: false
+
+      # Release and hotfix PRs into main: the branch name is the version the tag will carry,
+      # so a missing or wrong `uv version X.Y.Z` is caught before the tag exists.
+      - name: Check that the release branch matches the project version
+        if: >-
+          github.event_name == 'pull_request' && github.base_ref == 'main' &&
+          (startsWith(github.head_ref, 'release/') || startsWith(github.head_ref, 'hotfix/'))
+        shell: bash
+        env:
+          HEAD_REF: ${{ github.head_ref }}
+        run: |
+          version="$(uv version --short)"
+          if [ "${HEAD_REF##*/}" != "$version" ]; then
+            echo "::error::Branch ${HEAD_REF} does not match the project version ${version} in pyproject.toml. Run 'uv version ${HEAD_REF##*/}' on this branch."
+            exit 1
+          fi
+          echo "Branch ${HEAD_REF} matches the project version ${version}."
+
+      - name: Build sdist and wheel
+        run: uv build

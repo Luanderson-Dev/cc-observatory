@@ -1,0 +1,96 @@
+# Builds the sdist and wheel for a vX.Y.Z tag and publishes them to PyPI with trusted
+# publishing (OIDC), so no API token is stored in the repository.
+#
+# One-time setup on PyPI (by the maintainer, before the first release): add a pending
+# trusted publisher at https://pypi.org/manage/account/publishing/ with
+#   PyPI project name: cc-observatory
+#   Owner:             Luanderson-Dev
+#   Repository name:   cc-observatory
+#   Workflow name:     release.yml
+#   Environment name:  pypi
+# The pending publisher becomes a regular one when the first upload creates the project.
+#
+# The `pypi` environment is not configured by hand in the repository settings: GitHub
+# creates it automatically the first time the publish-pypi job runs.
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: read
+
+# One release at a time, and a release that started is never cancelled halfway.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build distributions
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # Full history so that origin/main is available for the ancestry check below.
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check that the tagged commit is on main
+        run: |
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::Commit ${GITHUB_SHA} is not on main. Releases are tagged only on the updated main, after the release PR is merged."
+            exit 1
+          fi
+          echo "Commit ${GITHUB_SHA} is on main."
+
+      # No cache on release builds, so a cache written by another ref cannot reach them.
+      - name: Set up uv
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          enable-cache: false
+
+      - name: Check that the tag matches the project version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version="$(uv version --short)"
+          if [ "${TAG#v}" != "$version" ]; then
+            echo "::error::Tag ${TAG} does not match the project version ${version} in pyproject.toml. Run 'uv version ${TAG#v}' on the release branch, or tag the right commit."
+            exit 1
+          fi
+          echo "Tag ${TAG} matches the project version ${version}."
+
+      - name: Build sdist and wheel
+        run: uv build
+
+      - name: Upload distributions
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  publish-pypi:
+    name: Publish to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: pypi
+      url: https://pypi.org/project/cc-observatory/
+    permissions:
+      id-token: write # OIDC token for PyPI trusted publishing and PEP 740 attestations
+    steps:
+      - name: Download distributions
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
