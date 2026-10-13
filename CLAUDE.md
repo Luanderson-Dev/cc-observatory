@@ -135,6 +135,10 @@ a new ADR supersedes it, and only the old one's status line changes.
 
 - Metadata only by default. Without the capture-content opt-in, prompts, tool inputs
   and outputs, assistant messages and error text are dropped before anything is stored.
+- The collector also drops content-bearing telemetry (attributes such as `prompt`,
+  `response` and `tool_input`, the raw API body and system prompt events, `tool.output`
+  span events, `workspace.host_paths`) while the opt-in is off, even if `OTEL_LOG_*`
+  flags were set outside `ccobs setup` (ADR 0006).
 - The collector deletes personal attributes (`user.email`, `user.id` (the identity
   provider subject on gateway sessions), `user.account_uuid`, `user.account_id`,
   `organization.id`, and `user.groups` and `identity.source` on gateway sessions) by

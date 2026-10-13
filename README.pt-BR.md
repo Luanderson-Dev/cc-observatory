@@ -22,13 +22,14 @@ O que já existe:
   e Commitizen;
 - CI no GitHub Actions: lint, checagem de tipos e testes em Linux, macOS e Windows, build
   do pacote, checagem de Conventional Commits nos títulos de PR e um workflow de release
-  que publica no PyPI por trusted publishing.
+  que publica no PyPI por trusted publishing;
+- registros de decisão de arquitetura (ADRs) para as decisões tomadas até agora.
 
-O que vem a seguir: o restante do milestone 0 (registros de decisão de arquitetura, um
-spike que registra o que a telemetria e os hooks do Claude Code realmente enviam,
-fixtures de teste sanitizadas de sessões reais e a primeira release no PyPI, a v0.1.0) e,
-depois, a stack de observabilidade no Docker Compose com um Grafana provisionado
-(v0.2.0). O plano completo está no roteiro mais abaixo.
+O que vem a seguir: o restante do milestone 0 (um spike que registra o que a telemetria
+e os hooks do Claude Code realmente enviam, fixtures de teste sanitizadas de sessões
+reais e a primeira release no PyPI, a v0.1.0) e, depois, a stack de observabilidade no
+Docker Compose com um Grafana provisionado (v0.2.0). O plano completo está no roteiro
+mais abaixo.
 
 Salvo indicação em contrário, o restante deste README descreve o projeto planejado.
 
@@ -55,8 +56,10 @@ prevista.
 - **Grafana** para análises mais profundas, provisionado com as fontes de dados (v0.2.0)
   e com dashboards que o app abre por links já filtrados pela sessão, agente ou projeto
   que você estava vendo (v0.7.0).
-- **Alertas**: notificações no navegador e, opcionalmente, um webhook do Discord quando
-  uma sessão fica bloqueada (v0.6.0).
+- **Alertas** (v0.6.0): notificações no navegador e, opcionalmente, um webhook do Discord
+  quando uma sessão espera por você além de um limite de tempo, quando erros de API se
+  repetem ou quando o custo estimado de uma sessão ou de um dia passa de um limite. Você
+  define os limites por variáveis de ambiente ou em uma tela de configurações.
 
 ## Como funciona
 
@@ -90,7 +93,8 @@ Grafana ◄── Prometheus, Loki, Tempo (provisioned datasources and dashboard
   agora, e isso só os hooks informam, no momento em que acontece.
 
 Mais detalhes para quem contribui estão em [docs/architecture.md](docs/architecture.md)
-(em inglês).
+(em inglês). As decisões por trás desse projeto, e os motivos delas, estão nos registros
+de decisão de arquitetura em [docs/adr/](docs/adr/README.md) (em inglês).
 
 ## Início rápido (planejado, disponível a partir da v0.5.0)
 
@@ -127,8 +131,9 @@ instalá-la.
 - **Só metadados por padrão.** O texto dos prompts, as entradas e saídas das
   ferramentas, as mensagens do assistente e os textos de erro não são armazenados.
 - **A captura de conteúdo é opt-in explícito.** O `ccobs setup --capture-content` mostra
-  um aviso e então liga a captura de conteúdo nas duas pontas: nas configurações de
-  telemetria do Claude Code e no app.
+  um aviso e então liga a captura de conteúdo nas configurações de telemetria do Claude
+  Code e na stack (no collector e no app). Sem ele, o collector descarta o conteúdo da
+  telemetria mesmo que o Claude Code tenha sido configurado para enviá-lo.
 - **Os atributos pessoais são removidos.** O collector apaga da telemetria o seu e-mail e
   os IDs do seu usuário, da sua conta e da sua organização antes que qualquer coisa seja
   armazenada.
