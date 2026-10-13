@@ -81,9 +81,10 @@ to each part from the release that ships it.
   keep them in mind when you share screenshots, exports or bug reports.
 - **Content capture is opt-in.** By default, prompt text, tool inputs and outputs,
   assistant messages and error text are dropped before anything is stored.
-  `ccobs setup --capture-content` turns content capture on in both Claude Code and the
-  app. Captured content can include source code, file contents and any secret that shows
-  up in a prompt or a tool's output.
+  `ccobs setup --capture-content` turns content capture on in Claude Code, the collector
+  and the app; without it, the collector drops content even if Claude Code sends it.
+  Captured content can include source code, file contents and any secret that shows up
+  in a prompt or a tool's output.
 - **Personal attributes.** The collector deletes `user.email`, `user.id` (on gateway
   sessions it is the identity provider subject), `user.account_uuid`, `user.account_id`
   and `organization.id` (and `user.groups` and `identity.source` on gateway sessions)

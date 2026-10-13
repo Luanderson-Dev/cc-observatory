@@ -7,7 +7,8 @@ part names the milestone that brings it (milestones and releases are listed in t
 roadmap in the [README](../README.md)).
 
 Decisions and their reasons are recorded as architecture decision records (ADRs, MADR
-format) in [`docs/adr/`](adr/). When this page and an ADR disagree, the ADR wins.
+format) in [`docs/adr/`](adr/README.md). When this page and an ADR disagree, the ADR
+wins.
 
 ## Overview
 
@@ -136,8 +137,8 @@ not from the documentation alone.
   gateway sessions.
 - **Metadata only by default.** Without the capture-content opt-in, prompts, tool inputs
   and outputs, assistant messages and error text are dropped before anything is stored.
-  The opt-in has to be turned on at both ends: Claude Code's content variables and the
-  app's storage.
+  The opt-in has to be turned on in Claude Code's content variables, the collector and
+  the app; without it, the collector drops content even if Claude Code sends it.
 - **Telemetry settings are ignored in project settings.** Claude Code applies the
   OpenTelemetry exporter variables from the environment it starts in, a `--settings`
   file, the user settings (`~/.claude/settings.json`) and managed settings, but ignores

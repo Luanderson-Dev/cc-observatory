@@ -22,13 +22,13 @@ What exists today:
   Commitizen;
 - CI on GitHub Actions: lint, type checks and tests on Linux, macOS and Windows, a
   package build, a Conventional Commits check on PR titles, and a release workflow that
-  publishes to PyPI with trusted publishing.
+  publishes to PyPI with trusted publishing;
+- architecture decision records (ADRs) for the decisions made so far.
 
-What comes next: the rest of milestone 0 (architecture decision records, a spike that
-records what Claude Code's telemetry and hooks really send, sanitized test fixtures from
-real sessions, and the first PyPI release, v0.1.0), then the observability stack in
-Docker Compose with a provisioned Grafana (v0.2.0). The full plan is in the roadmap
-below.
+What comes next: the rest of milestone 0 (a spike that records what Claude Code's
+telemetry and hooks really send, sanitized test fixtures from real sessions, and the
+first PyPI release, v0.1.0), then the observability stack in Docker Compose with a
+provisioned Grafana (v0.2.0). The full plan is in the roadmap below.
 
 Unless a section says otherwise, the rest of this README describes the planned design.
 
@@ -52,8 +52,10 @@ parentheses.
 - **Grafana** for deeper analysis, provisioned with its datasources (v0.2.0) and with
   dashboards that the app links to, already filtered to the session, agent or project
   you were looking at (v0.7.0).
-- **Alerts**: browser notifications and, optionally, a Discord webhook when a session is
-  blocked (v0.6.0).
+- **Alerts** (v0.6.0): browser notifications and, optionally, a Discord webhook when a
+  session has been waiting on you for longer than a threshold, when API errors keep
+  repeating, or when the estimated cost of a session or of a day goes over a limit. You
+  set the thresholds with environment variables or on a settings screen.
 
 ## How it works
 
@@ -87,6 +89,7 @@ Grafana ◄── Prometheus, Loki, Tempo (provisioned datasources and dashboard
   report, at the moment it happens.
 
 More detail for contributors is in [docs/architecture.md](https://github.com/Luanderson-Dev/cc-observatory/blob/main/docs/architecture.md).
+The decisions behind this design, and their reasons, are recorded as architecture decision records in [docs/adr/](https://github.com/Luanderson-Dev/cc-observatory/blob/main/docs/adr/README.md).
 
 ## Quick start (planned, available from v0.5.0)
 
@@ -123,8 +126,9 @@ without installing it.
 - **Metadata only by default.** Prompt text, tool inputs and outputs, assistant messages
   and error text are not stored.
 - **Content capture is an explicit opt-in.** `ccobs setup --capture-content` shows a
-  warning and then turns content capture on at both ends: in Claude Code's telemetry
-  settings and in the app.
+  warning and then turns content capture on in Claude Code's telemetry settings and in
+  the stack (the collector and the app). Without it, the collector drops content from the
+  telemetry even if Claude Code was set to send it.
 - **Personal attributes are removed.** The collector deletes your email address and your
   user, account and organization IDs from the telemetry before anything is stored.
 - **Everything stays on your machine.** That is a design goal that the bundled configs

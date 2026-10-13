@@ -24,7 +24,8 @@ Look for, in this order:
 5. Tests that don't cover the new behaviour, or that depend on the machine (paths,
    time zone, network).
 6. Loose typing (`Any`, `type: ignore` or `noqa` without a reason).
-7. Commit hygiene: files that don't belong to the stage, generated files, CRLF.
+7. Commit hygiene: files that don't belong to the stage, generated files, CRLF; new
+   dependencies: license compatible with MIT.
 
 Reply with a short list: for each problem, file:line, what is wrong, the scenario that
 breaks and the suggested fix. If there are no problems, answer "approved" and list
