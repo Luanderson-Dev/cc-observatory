@@ -173,6 +173,7 @@ uv run pre-commit run --all-files
 uv run ruff check . && uv run ruff format --check .
 uv run mypy
 uv run pytest                               # unit tests (what CI runs)
+uv run pytest tests/test_cli.py --no-cov    # one file (skip the coverage gate)
 ```
 
 ## Layout

@@ -1,0 +1,97 @@
+[project]
+name = "cc-observatory"
+version = "0.0.0"
+description = "Local observability for Claude Code: sessions, subagents, blocks, logs, tokens and cost on OpenTelemetry, Prometheus, Loki and Grafana."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Luanderson Pimenta Mendes", email = "contato@luanderson.dev.br" }]
+requires-python = ">=3.12"
+keywords = [
+  "claude-code",
+  "observability",
+  "opentelemetry",
+  "prometheus",
+  "loki",
+  "grafana",
+  "monitoring",
+]
+classifiers = [
+  "Development Status :: 2 - Pre-Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Topic :: System :: Monitoring",
+  "Typing :: Typed",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/Luanderson-Dev/cc-observatory"
+Repository = "https://github.com/Luanderson-Dev/cc-observatory"
+Issues = "https://github.com/Luanderson-Dev/cc-observatory/issues"
+Changelog = "https://github.com/Luanderson-Dev/cc-observatory/blob/main/CHANGELOG.md"
+
+[project.scripts]
+ccobs = "ccobs.cli:main"
+cc-observatory = "ccobs.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.12.23,<0.13"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "ccobs"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "N", "S", "RUF", "C4", "PT"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101"]
+
+[tool.mypy]
+strict = true
+python_version = "3.12"
+files = ["src", "tests"]
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-markers --strict-config -m 'not integration' --cov=ccobs --cov-report=term-missing"
+markers = ["integration: needs the docker compose stack running"]
+testpaths = ["tests"]
+xfail_strict = true
+
+[tool.coverage.run]
+branch = true
+source = ["ccobs"]
+patch = ["subprocess"]
+
+[tool.coverage.report]
+fail_under = 90
+show_missing = true
+exclude_also = ["if TYPE_CHECKING:", "if __name__ == .__main__.:"]
+
+[tool.commitizen]
+name = "cz_conventional_commits"
+version_provider = "uv"
+tag_format = "v$version"
+update_changelog_on_bump = true
+major_version_zero = true
+
+[dependency-groups]
+dev = [
+  "commitizen>=4.19.2",
+  "mypy>=2.4.0",
+  "pre-commit>=4.7.0",
+  "pytest>=9.1.1",
+  "pytest-cov>=7.1.0",
+  "ruff>=0.17.0",
+]
