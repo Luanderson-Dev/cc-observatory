@@ -23,13 +23,18 @@ O que já existe:
 - CI no GitHub Actions: lint, checagem de tipos e testes em Linux, macOS e Windows, build
   do pacote, checagem de Conventional Commits nos títulos de PR e um workflow de release
   que publica no PyPI por trusted publishing;
-- registros de decisão de arquitetura (ADRs) para as decisões tomadas até agora.
+- registros de decisão de arquitetura (ADRs) para as decisões tomadas até agora,
+  incluindo como os hooks chegam ao app
+  ([ADR 0011](docs/adr/0011-hook-delivery-http-plus-async-sessionstart.md), em inglês)
+  e o que o Claude Code 2.1.296 realmente envia na telemetria e nos hooks
+  ([ADR 0012](docs/adr/0012-observed-telemetry-and-hook-contract.md), em inglês);
+- o ferramental de captura de fixtures para desenvolvimento (`tools/capture/`, fora do
+  pacote) e fixtures de teste sanitizadas, gravadas a partir de sessões reais e isoladas
+  do Claude Code (`tests/fixtures/`).
 
-O que vem a seguir: o restante do milestone 0 (um spike que registra o que a telemetria
-e os hooks do Claude Code realmente enviam, fixtures de teste sanitizadas de sessões
-reais e a primeira release no PyPI, a v0.1.0) e, depois, a stack de observabilidade no
-Docker Compose com um Grafana provisionado (v0.2.0). O plano completo está no roteiro
-mais abaixo.
+O que vem a seguir: a primeira release no PyPI (v0.1.0), que fecha o milestone 0, e,
+depois, a stack de observabilidade no Docker Compose com um Grafana provisionado
+(v0.2.0). O plano completo está no roteiro mais abaixo.
 
 Salvo indicação em contrário, o restante deste README descreve o projeto planejado.
 
@@ -154,17 +159,22 @@ relatar uma vulnerabilidade.
 - **Os hooks nunca mudam as decisões do Claude Code.** O app responde a toda chamada de
   hook com uma resposta 2xx vazia, nunca com uma decisão, e o `setup` dá a todo hook um
   timeout curto.
-- **Se a stack estiver fora do ar, o Claude Code continua funcionando.** Ele pode mostrar
-  avisos de erro de hook em alguns eventos. A documentação vai explicar esse trade-off
-  quando o registro de decisão de arquitetura sobre os hooks for publicado (milestone 0).
+- **Se a stack estiver fora do ar, o Claude Code continua funcionando.** Enquanto a stack
+  estiver fora do ar, o Claude Code mostra na transcrição um aviso de erro de hook na
+  maioria dos eventos de hook (o próprio Claude não vê esses avisos). O
+  [ADR 0011](docs/adr/0011-hook-delivery-http-plus-async-sessionstart.md) (em inglês)
+  explica esse trade-off e como o cc-observatory o mantém pequeno: o `ccobs doctor`
+  confere se o endpoint dos hooks responde e aponta os hooks que estão falhando, e o
+  `ccobs uninstall` remove os hooks.
 
 ## Requisitos (planejado)
 
 - Docker com Compose v2 (Docker Desktop no Windows e no macOS, ou Docker Engine com o
   plugin Compose no Linux).
 - [uv](https://docs.astral.sh/uv/).
-- Um Claude Code recente. A versão mínima suportada será registrada durante o
-  milestone 0.
+- Claude Code 2.1.296 ou mais recente. É a versão com que o cc-observatory foi testado
+  ([ADR 0012](docs/adr/0012-observed-telemetry-and-hook-contract.md), em inglês);
+  versões anteriores não são suportadas até serem testadas.
 
 ## Roteiro
 
