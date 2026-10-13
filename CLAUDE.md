@@ -135,9 +135,10 @@ a new ADR supersedes it, and only the old one's status line changes.
 
 - Metadata only by default. Without the capture-content opt-in, prompts, tool inputs
   and outputs, assistant messages and error text are dropped before anything is stored.
-- The collector deletes personal attributes (`user.email`, `user.account_uuid`,
-  `user.account_id`, `organization.id`, and `user.groups` and `identity.source` on
-  gateway sessions) by default.
+- The collector deletes personal attributes (`user.email`, `user.id` (the identity
+  provider subject on gateway sessions), `user.account_uuid`, `user.account_id`,
+  `organization.id`, and `user.groups` and `identity.source` on gateway sessions) by
+  default.
 - Paths in hook payloads (`cwd`, `transcript_path`, ...) contain the OS username;
   treat them as personal data.
 - Test fixtures come from real sessions but are sanitized; a guard test fails if
@@ -147,6 +148,10 @@ a new ADR supersedes it, and only the old one's status line changes.
 ### Local only
 
 - Every published port binds to `127.0.0.1`; there is no login.
+- Browser defences (from v0.3.0), since any web page can send requests to localhost: the
+  app only accepts a `Host` header in the allowlist (`localhost`, `127.0.0.1`, `[::1]`),
+  the hook endpoint ignores any request whose `Content-Type` is not `application/json`
+  (still answering an empty 2xx), and there is no permissive CORS.
 - Keep a `host` label on stored data for a future central mode, without implementing it.
 
 ### Code
