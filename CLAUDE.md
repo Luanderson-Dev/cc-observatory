@@ -197,6 +197,9 @@ uv run pytest tests/test_cli.py --no-cov    # one file (skip the coverage gate)
 ```text
 src/ccobs/        package (CLI entry point in cli.py)
 tests/            unit tests; integration tests are marked @pytest.mark.integration
+tests/fixtures/   sanitized real payloads (hooks and OTLP) captured from Claude Code
+tools/capture/    dev-only fixture capture tooling (not packaged; tests import it
+                  through `pythonpath = ["."]`); its `out/` holds raw data, never committed
 docs/adr/         architecture decision records (MADR)
 .claude/agents/   project subagents
 ```
