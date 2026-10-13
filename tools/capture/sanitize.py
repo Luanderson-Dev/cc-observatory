@@ -1,10 +1,11 @@
 """Turn raw capture output into sanitized test fixtures.
 
 Reads ``scenarios.json``, the hook captures and the collector's OTLP files from
-``--raw``, keeps each scenario's own records, redacts personal data and writes
-``hooks/``, ``otlp/`` and ``manifest.json`` under ``--dest``, replacing the files of the
-previous run. Content-bearing telemetry is refused (unless ``--allow-content``); after
-redaction, a structure check makes sure no key, name or ID changed and a guard looks for
+``--raw``, keeps each scenario's own records, replaces the summaries written by internal
+agents, redacts personal data and writes ``hooks/``, ``otlp/`` and ``manifest.json``
+under ``--dest``, replacing the files of the previous run. Content-bearing telemetry is
+refused (unless ``--allow-content``); after redaction, a structure check makes sure no
+key, name or ID changed (other than IDs turned into their fakes) and a guard looks for
 personal data left. If any check fails, nothing is written. See
 ``tools/capture/README.md``.
 """
@@ -22,7 +23,8 @@ import socket
 import string
 import subprocess
 import sys
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+import unicodedata
+from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -73,6 +75,45 @@ BUILTIN_SKILLS: Final = frozenset(
         "verify",
     }
 )
+# Values Claude Code itself puts in name fields (generic stand-ins for a real name, such as
+# mcp_server.name "custom"), and the capture's own MCP server: never collected as names.
+KEPT_NAMES: Final = frozenset({"custom", "third-party", "mcp_tool", CAPTURE_MCP_SERVER})
+# Fields that hold plugin, marketplace, skill or MCP server names (hook payload keys and
+# OTLP attribute keys; mcp_server.name is also the name inside a hook's mcp_server
+# object), with the kind of names they hold, and each kind's placeholder.
+NAME_FIELD_KINDS: Final[Mapping[str, str]] = {
+    "plugin.name": "plugin name",
+    "plugin_name": "plugin name",
+    "marketplace.name": "marketplace name",
+    "marketplace_name": "marketplace name",
+    "skill.name": "skill name",
+    "skill_name": "skill name",
+    "skill": "skill name",
+    "mcp_server_name": "MCP server name",
+    "mcp_server.name": "MCP server name",
+    "server_name": "MCP server name",
+}
+NAME_PLACEHOLDER_TEMPLATES: Final[Mapping[str, str]] = {
+    "plugin name": "plugin-{}",
+    "marketplace name": "marketplace-{}",
+    "skill name": "skill-{}",
+    "MCP server name": "mcp-server-{}",
+}
+
+# What replaces a summary written by an internal agent (see internal_summary_keys).
+INTERNAL_SUMMARY: Final = "<internal summary removed>"
+# Subagent types built into Claude Code, whose last message is kept even without an Agent
+# tool call in the session (a subagent the session started keeps it too).
+KNOWN_AGENT_TYPES: Final = frozenset({"general-purpose", "Explore", "Plan"})
+# The memory types of instructions that come from the capture workspace itself.
+WORKSPACE_MEMORY_TYPES: Final = frozenset({"Project", "Local"})
+
+# Fakes for IDs, numbered by first appearance: tool use IDs keep their prefix (toolu_,
+# srvtoolu_) and their length, plugin ID hashes are 16 hex digits, client request IDs are
+# UUIDs (the a000 group keeps them apart from the identity placeholders).
+TOOL_USE_ID_TEMPLATE: Final = "01EXAMPLE{:015d}"
+PLUGIN_ID_HASH_TEMPLATE: Final = "{:016x}"
+CLIENT_REQUEST_ID_TEMPLATE: Final = "00000000-0000-4000-a000-{:012d}"
 
 # Content-bearing telemetry (ADR 0006). Claude Code only sends it when an OTEL_LOG_* flag
 # is on, and the capture settings turn every one of them off.
@@ -102,7 +143,7 @@ _METRIC_DATA: Final = ("gauge", "sum", "histogram", "exponentialHistogram", "sum
 # How a sensitive literal matches, decided by its label (see literal_mode).
 type Mode = Literal["anywhere", "word", "name"]
 _LOOSE_LABELS: Final = ("username", "hostname", "forbidden text", "email domain")
-_NAME_LABELS: Final = ("plugin name", "marketplace name", "skill name", "MCP server name")
+_NAME_LABELS: Final = tuple(NAME_PLACEHOLDER_TEMPLATES)
 _PATH_LABELS: Final = ("home directory", "home alias", "workspace root")
 # Values the maintainer controls: a conflict with a placeholder is an error, not a drop.
 _CONTROLLED_LABELS: Final = (*_PATH_LABELS, "username", "hostname", "forbidden text")
@@ -123,6 +164,9 @@ _RESERVED_TEXTS: Final = (
     "projects\\capture",
     ".claude.json",
     "req_EXAMPLE0001",
+    "toolu_" + TOOL_USE_ID_TEMPLATE.format(1),
+    PLUGIN_ID_HASH_TEMPLATE.format(1),
+    CLIENT_REQUEST_ID_TEMPLATE.format(1),
     "plugin-1",
     "marketplace-1",
     "skill-1",
@@ -144,21 +188,7 @@ _FAKE_VALUES: Final = frozenset(
     )
 )
 
-# Fields that hold plugin, marketplace, skill or MCP server names (hook payload keys and
-# OTLP attribute keys).
-_NAME_FIELDS: Final = frozenset(
-    {
-        "plugin.name",
-        "marketplace.name",
-        "skill.name",
-        "mcp_server_name",
-        "plugin_name",
-        "marketplace_name",
-        "skill_name",
-        "server_name",
-        "skill",
-    }
-)
+_NAME_FIELDS: Final = frozenset(NAME_FIELD_KINDS)
 # The keys of an OTLP AnyValue wrapper: a value inside them belongs to the attribute.
 _ANY_VALUE_KEYS: Final = frozenset({"stringValue", "arrayValue", "values"})
 # Fields that redaction must never change (besides every dict key).
@@ -210,7 +240,9 @@ _EDGE_PUNCTUATION: Final = "._-"
 # IDs) and Anthropic object IDs.
 _ID_TOKEN: Final = re.compile(
     r"(?<![A-Za-z0-9])(?:[0-9A-Fa-f]{8}(?:-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}"
-    r"|[0-9A-Fa-f]{16,64}|(?:toolu|srvtoolu|msg|req)_[A-Za-z0-9]{16,})(?![A-Za-z0-9])"
+    r"|[0-9A-Fa-f]{16,64}"
+    r"|(?:(?:srv)?toolu_(?:vrtx_|bdrk_)?|msg_(?:vrtx_|bdrk_)?|req_)[A-Za-z0-9]{16,})"
+    r"(?![A-Za-z0-9])"
 )
 _SCENARIO_NAME: Final = re.compile(r"[a-z0-9][a-z0-9-]*")
 _FIXTURE_FILE: Final = re.compile(
@@ -219,6 +251,13 @@ _FIXTURE_FILE: Final = re.compile(
 _REQUEST_ID: Final = re.compile(
     r"(?<![A-Za-z0-9])req_(?!EXAMPLE\d{4}(?![A-Za-z0-9]))[A-Za-z0-9]{16,}"
 )
+# Tool use IDs, with the Vertex AI (vrtx) and Bedrock (bdrk) forms; group 1 is the prefix.
+_TOOL_USE_ID: Final = re.compile(
+    r"(?<![A-Za-z0-9])((?:srv)?toolu_(?:vrtx_|bdrk_)?)"
+    r"(?!01EXAMPLE\d{15}(?![A-Za-z0-9]))[A-Za-z0-9]{16,}"
+)
+_FAKE_PLUGIN_ID_HASH: Final = re.compile(r"0{8}[0-9a-f]{8}")
+_FAKE_CLIENT_REQUEST_ID: Final = re.compile(r"00000000-0000-4000-a000-\d{12}")
 # The lookbehind makes a match start only where the local part starts: without it, a long
 # run of letters with no "@" (a base64 blob) is retried from every position (quadratic).
 _EMAIL: Final = re.compile(
@@ -262,6 +301,42 @@ _ENCODED_COMPONENT: Final = re.compile(r"-+[A-Za-z0-9]")
 _ALLOWED_UNDER_ENCODED_HOME: Final = re.compile(
     r"-(?:projects-capture|-claude(?:-json)?|AppData-Local-Temp)(?![A-Za-z0-9])", re.IGNORECASE
 )
+# Absolute paths, for the guard: drive paths (C:\, C:/); Git Bash and WSL drive paths
+# (/c/, /mnt/c/), only with a slash after the letter (so a `cmd /c` switch stays); the
+# usual POSIX roots; home-relative paths (~/x, ~name); and a drive path in Claude Code's
+# projects-dir form (C--Projects-...), as a path segment or in prose. The POSIX forms do
+# not start after a word character, dot, colon, dash, star or hash, so URL paths
+# (host/tmp/...), relative paths, globs (**/a/**) and fragments (#/a/b) stay.
+_ABSOLUTE_PATH: Final = re.compile(
+    r"(?<![A-Za-z0-9])[A-Za-z]:[\\/]"
+    r"|(?<![\w.:*#(-])(?:/mnt)?/[A-Za-z](?=/)"
+    r"|(?<![\w.:*#-])/(?:home|Users|tmp|mnt|opt|var|private|Volumes|media|run/media|root|srv"
+    r"|workspaces|cygdrive)(?![A-Za-z0-9._-])"
+    r"|(?<![\w~])~(?:[\\/]|[A-Za-z])"
+    r"|(?:^|(?<=[\\/]))[A-Za-z]--(?=[A-Za-z0-9])"
+    r"|(?<![A-Za-z0-9-])[A-Za-z]--[A-Za-z0-9]+-",
+    re.IGNORECASE,
+)
+# The fake homes an absolute path may start with (the user name ends where a path name
+# would, as in _PATH_NAME).
+_FAKE_HOME_AT: Final = re.compile(
+    r"(?:[A-Za-z]:[\\/]+|(?:/mnt)?/[A-Za-z]/+)Users[\\/]+user(?![^\\/\s\"'<>|:*?])"
+    r"|/home/+user(?![^\\/\s\"'<>|:*?])"
+    r"|[A-Za-z]--Users-user(?![A-Za-z0-9])",
+    re.IGNORECASE,
+)
+# A file in a capture workspace: under the fake workspace root (the --workspace-root
+# after redaction) and inside one of its workspaces, never directly in the root.
+_IN_FAKE_WORKSPACE: Final = re.compile(
+    r"(?:[A-Za-z]:[\\/]+Users[\\/]+user|(?:/mnt)?/[A-Za-z]/+Users/+user|/home/+user)"
+    r"[\\/]+projects[\\/]+capture[\\/]+[^\\/]+[\\/]+[^\\/]",
+    re.IGNORECASE,
+)
+# Literal \uXXXX escapes (JSON inside a string), decoded before the non-ASCII check.
+_UNICODE_ESCAPE: Final = re.compile(r"\\u([0-9A-Fa-f]{4})")
+# Letters outside ASCII that are units and ordinals rather than words: micro sign and the
+# feminine and masculine ordinal indicators.
+_ALLOWED_NON_ASCII: Final = frozenset({chr(0x00B5), chr(0x00AA), chr(0x00BA)})
 
 # Plugin and marketplace directories, and MCP tool names (mcp__<server>__<tool>).
 _PLUGIN_CACHE_PATH: Final = re.compile(
@@ -301,6 +376,8 @@ class Names:
     marketplaces: tuple[str, ...] = ()
     skills: tuple[str, ...] = ()
     mcp_servers: tuple[str, ...] = ()
+    plugin_id_hashes: tuple[str, ...] = ()
+    client_request_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -321,6 +398,16 @@ class ContentError(Exception):
 
 class StructureError(Exception):
     """Redaction would change a key, a name or an ID, or make two keys equal."""
+
+
+class WorkspaceRootError(Exception):
+    """``--workspace-root`` is too close to the top: mapping it to the fake workspace
+    would pass far more than the capture workspaces off as workspace."""
+
+
+class IsolationError(Exception):
+    """The capture session loaded instructions from outside its workspace (the user's
+    CLAUDE.md, rules or memory), so it was not isolated from the user's own setup."""
 
 
 class LiteralConflictError(Exception):
@@ -677,12 +764,15 @@ def _attribute_key(node: JSONObject) -> str | None:
 
 def _child_field(node: JSONObject, key: str, parent: str | None) -> str | None:
     """The field a child value belongs to: its key, or for the value of an OTLP KeyValue
-    the attribute key (carried through the AnyValue wrapper)."""
+    the attribute key (carried through the AnyValue wrapper), or ``mcp_server.name`` for
+    the name in a hook payload's ``mcp_server`` object."""
     attribute = _attribute_key(node)
     if attribute is not None and key == "value":
         return attribute
     if key in _ANY_VALUE_KEYS:
         return parent
+    if parent == "mcp_server" and key == "name":
+        return "mcp_server.name"
     return key
 
 
@@ -707,6 +797,13 @@ def replace_request_ids(text: str, names: StableNames) -> str:
     return _REQUEST_ID.sub(lambda match: names(match.group()), text)
 
 
+def replace_tool_use_ids(text: str, names: StableNames) -> str:
+    """Replace tool use IDs (``toolu_...``, ``srvtoolu_...``, ``toolu_vrtx_...``,
+    ``toolu_bdrk_...``) with stable fakes that keep the prefix; ``names`` numbers the IDs
+    (TOOL_USE_ID_TEMPLATE gives the same length)."""
+    return _TOOL_USE_ID.sub(lambda match: f"{match[1]}{names(match.group())}", text)
+
+
 def _walk(value: JSON, location: str = "$") -> Iterator[tuple[str, JSON]]:
     """Every node of a JSON value with its location (``$.a[0].b``)."""
     yield location, value
@@ -716,6 +813,19 @@ def _walk(value: JSON, location: str = "$") -> Iterator[tuple[str, JSON]]:
     elif isinstance(value, list):
         for index, item in enumerate(value):
             yield from _walk(item, f"{location}[{index}]")
+
+
+def _field_strings(value: JSON, parent: str | None = None) -> Iterator[tuple[str | None, str]]:
+    """Every string value (not key) of a JSON value, with the field it belongs to (see
+    _child_field; None at the top)."""
+    if isinstance(value, str):
+        yield parent, value
+    elif isinstance(value, list):
+        for item in value:
+            yield from _field_strings(item, parent)
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            yield from _field_strings(item, _child_field(value, key, parent))
 
 
 def _strings(value: JSON) -> Iterator[str]:
@@ -797,42 +907,50 @@ def _is_builtin_skill(name: str) -> bool:
     return name.removeprefix("/") in BUILTIN_SKILLS
 
 
-def _never_kept(name: str) -> bool:
-    return False
+def _is_kept_name(name: str) -> bool:
+    return name in KEPT_NAMES
 
 
-def _names(found: Iterable[str], keep: Callable[[str], bool] = _never_kept) -> tuple[str, ...]:
+def _is_kept_skill(name: str) -> bool:
+    return _is_kept_name(name) or _is_builtin_skill(name)
+
+
+def _is_fake_plugin_id_hash(value: str) -> bool:
+    return _FAKE_PLUGIN_ID_HASH.fullmatch(value) is not None
+
+
+def _is_fake_client_request_id(value: str) -> bool:
+    return _FAKE_CLIENT_REQUEST_ID.fullmatch(value) is not None
+
+
+def _names(found: Iterable[str], keep: Callable[[str], bool]) -> tuple[str, ...]:
     return tuple(name for name in _unique(found) if not keep(name))
 
 
 def collect_names(otlp_docs: Iterable[JSON], hook_payloads: Iterable[JSON]) -> Names:
-    """Identity values, plugins, marketplaces, skills and MCP servers, by first appearance.
+    """Identity values, plugins, marketplaces, skills, MCP servers, plugin ID hashes and
+    client request IDs, by first appearance.
 
-    Plugins and marketplaces come from ``plugin.name`` and ``marketplace.name`` and from
-    ``.claude/plugins/...`` paths; skills from ``skill.name`` (built-in ones are kept); MCP
-    servers from ``mcp_server_name`` and ``mcp__<server>__<tool>`` names (the capture's own
-    server is kept).
+    Names come from every field of NAME_FIELD_KINDS (``plugin.name``, ``plugin_name``,
+    ``skill``, ``mcp_server.name``, ...), from ``.claude/plugins/...`` paths (plugins and
+    marketplaces) and from ``mcp__<server>__<tool>`` names (MCP servers); built-in skills
+    are kept. Plugin ID hashes and client request IDs come from ``plugin_id_hash`` and
+    ``client_request_id``. KEPT_NAMES and values that are already fakes are not collected.
     """
     docs, payloads = list(otlp_docs), list(hook_payloads)
-    plugins: list[str] = []
-    marketplaces: list[str] = []
-    skills: list[str] = []
-    servers: list[str] = []
-    by_key = {
-        "plugin.name": plugins,
-        "marketplace.name": marketplaces,
-        "skill.name": skills,
-        "mcp_server_name": servers,
-    }
-    for doc in docs:
-        for _, key, inner in _key_values(doc):
-            if key in by_key:
-                by_key[key].extend(_string_values(inner))
-    for payload in payloads:
-        for _, node in _walk(payload):
-            server = node.get("mcp_server_name") if isinstance(node, dict) else None
-            if isinstance(server, str):
-                servers.append(server)
+    found: dict[str, list[str]] = {kind: [] for kind in NAME_PLACEHOLDER_TEMPLATES}
+    plugin_id_hashes: list[str] = []
+    client_request_ids: list[str] = []
+    ids_by_field = {"plugin_id_hash": plugin_id_hashes, "client_request_id": client_request_ids}
+    for value in [*docs, *payloads]:
+        for name, text in _field_strings(value):
+            kind = NAME_FIELD_KINDS.get(name or "")
+            if kind is not None:
+                found[kind].append(text)
+            elif name in ids_by_field:
+                ids_by_field[name].append(text)
+    plugins, marketplaces = found["plugin name"], found["marketplace name"]
+    servers = found["MCP server name"]
     for text in (text for value in [*docs, *payloads] for text in _strings(value)):
         for match in _PLUGIN_CACHE_PATH.finditer(text):
             marketplaces.append(match[1])
@@ -841,10 +959,12 @@ def collect_names(otlp_docs: Iterable[JSON], hook_payloads: Iterable[JSON]) -> N
         servers += [match[1] for match in _MCP_TOOL.finditer(text)]
     return Names(
         identity=collect_identity_values(docs),
-        plugins=_names(plugins),
-        marketplaces=_names(marketplaces),
-        skills=_names(skills, keep=_is_builtin_skill),
-        mcp_servers=_names(servers, keep=lambda name: name == CAPTURE_MCP_SERVER),
+        plugins=_names(plugins, keep=_is_kept_name),
+        marketplaces=_names(marketplaces, keep=_is_kept_name),
+        skills=_names(found["skill name"], keep=_is_kept_skill),
+        mcp_servers=_names(servers, keep=_is_kept_name),
+        plugin_id_hashes=_names(plugin_id_hashes, keep=_is_fake_plugin_id_hash),
+        client_request_ids=_names(client_request_ids, keep=_is_fake_client_request_id),
     )
 
 
@@ -860,11 +980,19 @@ def email_domains(names: Names) -> list[str]:
 
 
 def _name_groups(names: Names) -> list[tuple[str, tuple[str, ...], str]]:
+    values = {
+        "plugin name": names.plugins,
+        "marketplace name": names.marketplaces,
+        "skill name": names.skills,
+        "MCP server name": names.mcp_servers,
+    }
+    return [(kind, values[kind], template) for kind, template in NAME_PLACEHOLDER_TEMPLATES.items()]
+
+
+def _id_groups(names: Names) -> list[tuple[str, tuple[str, ...], str]]:
     return [
-        ("plugin name", names.plugins, "plugin-{}"),
-        ("marketplace name", names.marketplaces, "marketplace-{}"),
-        ("skill name", names.skills, "skill-{}"),
-        ("MCP server name", names.mcp_servers, "mcp-server-{}"),
+        ("plugin id hash", names.plugin_id_hashes, PLUGIN_ID_HASH_TEMPLATE),
+        ("client request id", names.client_request_ids, CLIENT_REQUEST_ID_TEMPLATE),
     ]
 
 
@@ -909,7 +1037,7 @@ def _candidates(ctx: LocalContext, names: Names) -> list[tuple[str, str, str]]:
     ]
     candidates += [
         (f"{label} {number}", value, template.format(number))
-        for label, values, template in _name_groups(names)
+        for label, values, template in [*_name_groups(names), *_id_groups(names)]
         for number, value in enumerate(values, start=1)
     ]
     return candidates
@@ -1112,6 +1240,60 @@ def _has_path_outside_workspace(text: str) -> bool:
     )
 
 
+def _has_path_outside_fake_home(text: str) -> bool:
+    """An absolute path that does not start with a fake home (another drive, the root of
+    a drive, /tmp, /opt, ..., or someone else's home)."""
+    return any(
+        _FAKE_HOME_AT.match(text, match.start()) is None for match in _ABSOLUTE_PATH.finditer(text)
+    )
+
+
+def _has_non_ascii_letter(text: str) -> bool:
+    """A letter or combining mark outside ASCII, after decoding literal ``\\uXXXX`` escapes
+    and NFC normalization. Punctuation, symbols and digits are fine, and so are the micro
+    sign and the ordinal indicators."""
+    if text.isascii() and _UNICODE_ESCAPE.search(text) is None:
+        return False
+    decoded = _UNICODE_ESCAPE.sub(lambda match: chr(int(match[1], 16)), text)
+    return any(
+        not char.isascii()
+        and char not in _ALLOWED_NON_ASCII
+        and unicodedata.category(char)[0] in ("L", "M")
+        for char in unicodedata.normalize("NFC", decoded)
+    )
+
+
+def _in_fake_workspace(path: str) -> bool:
+    return _IN_FAKE_WORKSPACE.match(path) is not None and _DOT_DOT.search(path) is None
+
+
+def find_isolation_problems(payload: Mapping[str, JSON]) -> list[Finding]:
+    """Signs that a capture session was not isolated from the user's own setup, in one
+    redacted hook payload: an InstructionsLoaded whose memory type is not Project or
+    Local, or whose file is not in the capture workspace (``<fake home>/projects/capture``
+    once ``--workspace-root`` is replaced). Findings never hold values."""
+    if payload.get("hook_event_name") != "InstructionsLoaded":
+        return []
+    findings: list[Finding] = []
+    memory_type, file_path = payload.get("memory_type"), payload.get("file_path")
+    if not (isinstance(memory_type, str) and memory_type in WORKSPACE_MEMORY_TYPES):
+        findings.append(Finding("instructions not from the capture workspace", "$.memory_type"))
+    if not (isinstance(file_path, str) and _in_fake_workspace(file_path)):
+        findings.append(Finding("instructions file outside the capture workspace", "$.file_path"))
+    return findings
+
+
+def _is_foreign_id(field: str | None, text: str) -> str | None:
+    """The kind of a ``plugin_id_hash`` or ``client_request_id`` value that is not a fake."""
+    if not text:
+        return None
+    if field == "plugin_id_hash" and not _is_fake_plugin_id_hash(text):
+        return "plugin id hash"
+    if field == "client_request_id" and not _is_fake_client_request_id(text):
+        return "client request id"
+    return None
+
+
 class _Detector:
     """Finds personal data in one string: the guard's checks, by kind or label."""
 
@@ -1138,6 +1320,8 @@ class _Detector:
 
     def kinds(self, text: str, field: str | None = None) -> list[str]:
         """Kinds of personal data in ``text``, a value of ``field`` (None for keys)."""
+        if text == INTERNAL_SUMMARY:
+            return []
         kinds = []
         if any(not _allowed_email(m.group()) for m in _EMAIL.finditer(text)):
             kinds.append("email")
@@ -1145,8 +1329,12 @@ class _Detector:
             kinds.append("user path")
         if _has_path_outside_workspace(text):
             kinds.append("path outside workspace")
+        if _has_path_outside_fake_home(text):
+            kinds.append("absolute path outside fake home")
         if _REQUEST_ID.search(text):
             kinds.append("request id")
+        if _TOOL_USE_ID.search(text):
+            kinds.append("tool use id")
         ids: list[_IdSpans] = []
         kinds += [
             label for label, pattern in self._patterns if self._literal_found(pattern, text, ids)
@@ -1154,12 +1342,18 @@ class _Detector:
         kinds += [label for _, _, label, _ in self._plain.uses(text)]
         if field in _NAME_FIELDS and (entry := self._plain.entry(text)) is not None:
             kinds.append(entry[0])
+        if (foreign := _is_foreign_id(field, text)) is not None:
+            kinds.append(foreign)
+        if _has_non_ascii_letter(text):
+            kinds.append("non-ascii letter")
         return list(dict.fromkeys(kinds))
 
 
 def find_personal_data(value: JSON, literals: Mapping[str, str]) -> list[Finding]:
     """Find emails outside example.com, user paths, paths under the fake home outside the
-    workspace, real request IDs and the given literals.
+    workspace, absolute paths outside the fake home, real request and tool use IDs,
+    ``plugin_id_hash`` and ``client_request_id`` values that are not fakes, letters outside
+    ASCII, and the given literals.
 
     ``literals`` maps a label (used as the finding's kind) to a value; each matches as
     literal_mode says, and never inside an ID. Keys are checked too. Findings never hold
@@ -1236,16 +1430,24 @@ def find_content(doc: JSON) -> list[Finding]:
 class Redactor:
     """Redact strings, hook payloads and OTLP export requests with stable fakes.
 
-    Each string goes through, in order: the local paths, identity values and distinctive
-    names as whole words; plain-word names where used as names; request IDs; the
-    username, hostname, ``--forbid`` texts and email domains (the whole token around
-    them, except in dict keys); and the safety net. Nothing cuts into an ID. Raises
-    StructureError if two keys of an object would become equal, and
-    LiteralConflictError for a value that would match inside the placeholders.
+    Each string goes through, in order: the local paths, identity values, distinctive
+    names, plugin ID hashes and client request IDs as whole words; plain-word names where
+    used as names; request and tool use IDs; the username, hostname, ``--forbid`` texts and
+    email domains (the whole token around them, except in dict keys); and the safety net.
+    Nothing cuts into an ID. A name field (``plugin.name``, ``marketplace.name``, ...)
+    holding a collected name of its own kind gets that kind's placeholder, so a
+    marketplace named like a plugin still becomes ``marketplace-N``. Raises StructureError
+    if two keys of an object would become equal, and LiteralConflictError for a value that
+    would match inside the placeholders.
     """
 
     def __init__(self, ctx: LocalContext, names: Names) -> None:
         literals = _literals(ctx, names)
+        self._field_names = {
+            (literal.label.rsplit(" ", 1)[0], literal.value.casefold()): literal.fake
+            for literal in literals
+            if literal.label.startswith(_NAME_LABELS)
+        }
         structured = [(real, fake, False) for real, fake in path_replacements(ctx)]
         structured += [
             (literal.value, literal.fake, False)
@@ -1268,12 +1470,21 @@ class Redactor:
             }
         )
         self._request_ids = StableNames("req_EXAMPLE{:04d}")
+        self._tool_use_ids = StableNames(TOOL_USE_ID_TEMPLATE)
+
+    def ids(self, value: str) -> str:
+        """``value`` with only its request and tool use IDs turned into their fakes."""
+        value = replace_request_ids(value, self._request_ids)
+        return replace_tool_use_ids(value, self._tool_use_ids)
 
     def text(self, value: str, *, key: bool = False) -> str:
-        """Redact one string (``key``: a dict key, never matched inside longer words)."""
+        """Redact one string (``key``: a dict key, never matched inside longer words).
+        INTERNAL_SUMMARY stays as it is."""
+        if value == INTERNAL_SUMMARY:
+            return value
         value = self._structured(value)
         value = self._plain.replace(value)
-        value = replace_request_ids(value, self._request_ids)
+        value = self.ids(value)
         value = self._loose(value, tokens=not key)
         return scrub_safety_net(value)
 
@@ -1283,7 +1494,11 @@ class Redactor:
 
     def _value(self, value: JSON, location: str, parent: str | None) -> JSON:
         if isinstance(value, str):
-            if parent in _NAME_FIELDS:
+            kind = NAME_FIELD_KINDS.get(parent or "")
+            if kind is not None:
+                fake = self._field_names.get((kind, value.casefold()))
+                if fake is not None:
+                    return fake
                 value = self._plain.field(value)
             return self.text(value)
         if isinstance(value, list):
@@ -1313,22 +1528,86 @@ def _structure_changes(
     original: JSON,
     redacted: JSON,
     protected: frozenset[str],
+    id_fakes: Callable[[str], str],
     location: str = "$",
     parent: str | None = None,
 ) -> Iterator[tuple[str, str, str]]:
-    """``(what, where, original text)`` for every key or protected field that changed."""
+    """``(what, where, original text)`` for every key or protected field that changed into
+    anything but ``id_fakes`` of it (the original with its IDs turned into their fakes)."""
     if isinstance(original, str):
-        if original != redacted and parent is not None and parent in protected:
+        changed = original != redacted and redacted != id_fakes(original)
+        if changed and parent is not None and parent in protected:
             yield parent, location, original
     elif isinstance(original, list) and isinstance(redacted, list):
         for index, (old, new) in enumerate(zip(original, redacted, strict=True)):
-            yield from _structure_changes(old, new, protected, f"{location}[{index}]", parent)
+            where = f"{location}[{index}]"
+            yield from _structure_changes(old, new, protected, id_fakes, where, parent)
     elif isinstance(original, dict) and isinstance(redacted, dict):
         for (key, old), (new_key, new) in zip(original.items(), redacted.items(), strict=True):
-            if key != new_key:
+            if key != new_key and new_key != id_fakes(key):
                 yield "a key", f"{location} (key)", key
             child = _child_field(original, key, parent)
-            yield from _structure_changes(old, new, protected, f"{location}.{new_key}", child)
+            where = f"{location}.{new_key}"
+            yield from _structure_changes(old, new, protected, id_fakes, where, child)
+
+
+# Summaries written by internal agents.
+
+
+def started_agent_types(payloads: Iterable[JSON]) -> frozenset[str]:
+    """The subagent types whose last message a session's SubagentStop may keep: each
+    ``subagent_type`` the session asked for in a PreToolUse of the Agent tool, and
+    KNOWN_AGENT_TYPES."""
+    started = set(KNOWN_AGENT_TYPES)
+    for payload in payloads:
+        if not isinstance(payload, dict) or payload.get("hook_event_name") != "PreToolUse":
+            continue
+        tool_input = payload.get("tool_input")
+        if payload.get("tool_name") == "Agent" and isinstance(tool_input, dict):
+            subagent_type = tool_input.get("subagent_type")
+            if isinstance(subagent_type, str) and subagent_type:
+                started.add(subagent_type)
+    return frozenset(started)
+
+
+def internal_summary_keys(
+    payload: Mapping[str, JSON], agent_types: Collection[str] = KNOWN_AGENT_TYPES
+) -> list[str]:
+    """The keys of a hook payload that hold a summary written by an internal agent.
+
+    PostCompact's ``compact_summary``, and the ``last_assistant_message`` of a SubagentStop
+    whose ``agent_type`` is not in ``agent_types`` (started_agent_types of the session):
+    internal agents such as compaction and prompt suggestion, which run with an empty or
+    unknown type, summarize the whole context, the user's own instructions (CLAUDE.md,
+    memory) included, so no redaction of names and paths can make them safe. The rule
+    fails closed: a missing or unknown type counts as internal.
+    """
+    event, agent_type = payload.get("hook_event_name"), payload.get("agent_type")
+    keys: list[str] = []
+    if event == "PostCompact":
+        keys.append("compact_summary")
+    if event == "SubagentStop" and not (isinstance(agent_type, str) and agent_type in agent_types):
+        keys.append("last_assistant_message")
+    return [key for key in keys if key in payload]
+
+
+def drop_internal_summaries(
+    payload: JSONObject, agent_types: Collection[str] = KNOWN_AGENT_TYPES
+) -> JSONObject:
+    """``payload`` with each internal summary (internal_summary_keys) replaced by
+    INTERNAL_SUMMARY. The keys and their order stay; a null summary stays null."""
+    keys = internal_summary_keys(payload, agent_types)
+    return {
+        key: INTERNAL_SUMMARY if key in keys and value is not None else value
+        for key, value in payload.items()
+    }
+
+
+def _drop_line_summaries(line: JSONObject, agent_types: Collection[str]) -> JSONObject:
+    payload = line.get("payload")
+    if not isinstance(payload, dict):
+        return line
+    return {**line, "payload": drop_internal_summaries(payload, agent_types)}
 
 
 # Selection.
@@ -1542,14 +1821,17 @@ def _check_content(scenarios: Iterable[_Scenario]) -> None:
 
 
 def _check_structure(
-    pairs: Mapping[str, list[tuple[JSON, JSON, bool]]], literals: Mapping[str, str]
+    pairs: Mapping[str, list[tuple[JSON, JSON, bool]]],
+    literals: Mapping[str, str],
+    id_fakes: Callable[[str], str],
 ) -> None:
     detector = _Detector(literals)
     problems: list[str] = []
     for name, records in pairs.items():
         for number, (original, redacted, otlp) in enumerate(records, start=1):
             protected = _PROTECTED_FIELDS | _PROTECTED_OTLP_FIELDS if otlp else _PROTECTED_FIELDS
-            for what, where, text in _structure_changes(original, redacted, protected):
+            changes = _structure_changes(original, redacted, protected, id_fakes)
+            for what, where, text in changes:
                 labels = ", ".join(detector.kinds(text)) or "redaction"
                 problems.append(f"{name} record {number}: changed {what} at {where} ({labels})")
     if problems:
@@ -1558,6 +1840,30 @@ def _check_structure(
             " remove is part of Claude Code's own names: pass --user '' or --host '' for the"
             " username or hostname, or leave out that --forbid text, and add distinctive"
             f" forms of your name with --forbid:{_report(problems)}"
+        )
+
+
+def _line_isolation_problems(line: JSON) -> list[Finding]:
+    payload = line.get("payload") if isinstance(line, dict) else None
+    if not isinstance(payload, dict):
+        return []
+    return [
+        Finding(found.kind, "$.payload" + found.location.removeprefix("$"))
+        for found in find_isolation_problems(payload)
+    ]
+
+
+def _check_isolation(outputs: Mapping[str, list[JSON]]) -> None:
+    hooks = {name: records for name, records in outputs.items() if name.startswith("hooks/")}
+    problems = _problems(hooks, _line_isolation_problems)
+    if problems:
+        raise IsolationError(
+            "the capture was not isolated from your own Claude Code setup, nothing was"
+            " written: Claude Code loaded instructions from outside the capture workspace"
+            " (a CLAUDE.md, rules or memory of yours). Capture again through run_claude.sh"
+            " with its default isolation (CAPTURE_ISOLATION=1), in a workspace root with no"
+            " CLAUDE.md, CLAUDE.local.md or .claude/ in it or above it, and pass that root"
+            f" as --workspace-root:{_report(problems)}"
         )
 
 
@@ -1631,19 +1937,72 @@ def _remove_previous(dest: Path, files: Iterable[str]) -> None:
     (dest / "manifest.json").unlink(missing_ok=True)
 
 
-def sanitize(raw: Path, dest: Path, ctx: LocalContext, *, allow_content: bool = False) -> list[str]:
+_MIN_WORKSPACE_ROOT_DEPTH: Final = 2
+
+
+def workspace_root_problem(ctx: LocalContext) -> str | None:
+    """Why ``ctx.workspace_root`` cannot be mapped to the fake workspace (None if it can).
+
+    A relative path, a drive or filesystem root, a single top-level directory, or the
+    home directory or one above it would pass everything below it off as the capture
+    workspace, and with it the isolation check."""
+    raw = ctx.workspace_root
+    if not raw:
+        return None
+    if not (_is_windows_path(raw) or raw.startswith("/")):
+        return "--workspace-root must be an absolute path"
+    root = _normalize_path(raw)
+    if len([part for part in _SEPARATORS.split(root)[1:] if part]) < _MIN_WORKSPACE_ROOT_DEPTH:
+        return (
+            "--workspace-root must be at least two directories below a drive or the"
+            " filesystem root, such as C:\\ccobs-capture\\<run> or /tmp/ccobs-capture/<run>"
+        )
+    folded = root.casefold()
+    for home in _home_spellings(ctx):
+        separator = "\\" if _is_windows_path(home) else "/"
+        if home.casefold() == folded or home.casefold().startswith(folded + separator):
+            return "--workspace-root must not be the home directory or a directory above it"
+    return None
+
+
+def sanitize(
+    raw: Path,
+    dest: Path,
+    ctx: LocalContext,
+    *,
+    allow_content: bool = False,
+    allow_unisolated: bool = False,
+) -> list[str]:
     """Write sanitized fixtures for every scenario in ``raw/scenarios.json`` under ``dest``.
 
     Replaces the files listed in ``dest/manifest.json`` (and the manifest) and returns the
-    written paths, relative to ``dest``. Raises ContentError (unless ``allow_content``),
+    written paths, relative to ``dest``. Internal summaries are replaced before anything
+    else (drop_internal_summaries). ``scenarios.json`` must say ``"isolated": true``,
+    which goes into the manifest, and every InstructionsLoaded must come from the
+    capture workspace, unless ``allow_unisolated`` (the manifest then records false).
+    Raises WorkspaceRootError, IsolationError, ContentError (unless ``allow_content``),
     StructureError, PersonalDataError, LiteralConflictError or DestinationError, and
     writes nothing, if a check fails.
     """
+    if (problem := workspace_root_problem(ctx)) is not None:
+        raise WorkspaceRootError(problem)
     manifest = _read_json(raw / "scenarios.json")
     if not isinstance(manifest, dict):
         raise ValueError("scenarios.json must hold an object")
+    isolated = manifest.get("isolated") is True
+    if not isolated and not allow_unisolated:
+        raise IsolationError(
+            'scenarios.json does not say the capture was isolated ("isolated": true),'
+            " nothing was written. Capture through run_headless.sh and run_claude.sh with"
+            " their default isolation (CAPTURE_ISOLATION=1, the isolation column of"
+            ' out/headless-sessions.tsv), then set "isolated": true in scenarios.json; for'
+            " an exploratory capture, pass --allow-unisolated."
+        )
     otlp = {signal: _read_jsonl(raw / f"otlp-{signal}.jsonl") for signal in SIGNALS}
     scenarios = _select(raw, manifest.get("scenarios"), otlp)
+    for scenario in scenarios:
+        agent_types = started_agent_types(line.get("payload") for line in scenario.hooks)
+        scenario.hooks = [_drop_line_summaries(line, agent_types) for line in scenario.hooks]
     if not allow_content:
         _check_content(scenarios)
     names = collect_names(
@@ -1681,12 +2040,15 @@ def sanitize(raw: Path, dest: Path, ctx: LocalContext, *, allow_content: bool = 
             }
         )
     header = {key: redactor.value(value) for key, value in manifest.items() if key != "scenarios"}
+    header["isolated"] = isolated and not allow_unisolated
     if "telemetry_env" not in header and (env := _telemetry_env(raw)) is not None:
         header["telemetry_env"] = redactor.value(env)
     outputs["manifest.json"] = [{**header, "scenarios": entries}]
 
     literals = guard_literals(ctx, names)
-    _check_structure(pairs, literals)
+    _check_structure(pairs, literals, redactor.ids)
+    if not allow_unisolated:
+        _check_isolation(outputs)
     _check(outputs, literals)
     _remove_previous(dest, _previous_fixtures(dest))
     for name, records in outputs.items():
@@ -1734,6 +2096,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="keep content-bearing telemetry (prompts, tool content, API bodies) instead of"
         " refusing it",
     )
+    parser.add_argument(
+        "--allow-unisolated",
+        action="store_true",
+        help="accept a capture that scenarios.json does not mark as isolated, and instructions"
+        " loaded from outside the workspace (exploratory use; the manifest records"
+        ' "isolated": false)',
+    )
     return parser
 
 
@@ -1759,13 +2128,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         forbid=_unique([*args.forbid, *kept]),
     )
     try:
-        written = sanitize(args.raw, args.dest, ctx, allow_content=args.allow_content)
+        written = sanitize(
+            args.raw,
+            args.dest,
+            ctx,
+            allow_content=args.allow_content,
+            allow_unisolated=args.allow_unisolated,
+        )
     except (
         ContentError,
         StructureError,
         PersonalDataError,
         LiteralConflictError,
         DestinationError,
+        IsolationError,
+        WorkspaceRootError,
     ) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

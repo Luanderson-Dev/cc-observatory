@@ -10,6 +10,12 @@ waits on the hook events that the capture server appends to ``--hooks``. Scenari
 - ``elicitation-idle``: decline an MCP elicitation (``elicit_server.py``) with Esc, wait
   for ``idle_prompt``, then ``/exit``.
 
+Start Claude Code through ``run_claude.sh``, which checks the workspace and writes its
+synthetic ``CLAUDE.md`` (``tools/capture/workspace.py``) and isolates the session from
+your own setup by default (``--setting-sources project,local``, ``--strict-mcp-config``,
+``--no-chrome``, no auto memory, no claude.ai connectors; see ``CAPTURE_ISOLATION``
+there).
+
 pywinpty is not a dev dependency; run this with ``uv run --with pywinpty`` (see
 ``tools/capture/README.md``). Each run calls the Anthropic API and costs a little money.
 """

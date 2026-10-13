@@ -11,16 +11,24 @@
 # script starts and stops its own capture servers.
 #
 # Environment:
-#   CAPTURE_WORKSPACE_ROOT   where the per-scenario workspaces go (default: a new temp dir)
+#   CAPTURE_WORKSPACE_ROOT   where the per-scenario workspaces go (default:
+#                            C:/ccobs-capture/run-<UTC time> in Git Bash, outside your
+#                            home, which has .claude/; /tmp/ccobs-capture/run-<UTC time>
+#                            elsewhere). The root must have no CLAUDE.md,
+#                            CLAUDE.local.md or .claude/ in it or above it, and sit
+#                            outside any git repository and any Claude Code scratchpad;
+#                            the script checks (python -m tools.capture.workspace).
 #   CAPTURE_MODEL            model for the scenarios (default: haiku)
-#   CAPTURE_SETTING_SOURCES  if set, passed as `claude --setting-sources` (for example
-#                            "project,local" skips your user settings: their hooks,
-#                            plugins and env). Unset by default.
-#
-# Every run passes --strict-mcp-config, so your own MCP servers stay out of the capture.
+#   CAPTURE_ISOLATION        1 (default): every run is isolated from your own Claude Code
+#                            setup (run_claude.sh passes --setting-sources project,local
+#                            and --strict-mcp-config, turns auto memory and claude.ai
+#                            connectors off, and writes a synthetic CLAUDE.md in each
+#                            workspace). 0 loads your setup, for exploratory runs only,
+#                            never for fixtures.
 #
 # Output in tools/capture/out/: hooks-<scenario>.jsonl, the settings files, and
-# headless-sessions.tsv (scenario, session id, hooks file) for out/scenarios.json. The
+# headless-sessions.tsv (scenario, session id, hooks file, isolation: the
+# CAPTURE_ISOLATION of the run, 1 or 0) for out/scenarios.json. The
 # workspace root printed at the end is the sanitizer's --workspace-root.
 set -euo pipefail
 
@@ -28,6 +36,11 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo="$(cd "$here/../.." && pwd)"
 out="$here/out"
 model="${CAPTURE_MODEL:-haiku}"
+isolation="${CAPTURE_ISOLATION:-1}"
+if [[ "$isolation" != 0 && "$isolation" != 1 ]]; then
+  echo "CAPTURE_ISOLATION must be 1 (the default) or 0" >&2
+  exit 2
+fi
 port=8790       # capture server, normal mode
 slow_port=8791  # capture server, slow mode (endpoint timeout)
 dead_port=8799  # nothing listens here (endpoint down)
@@ -69,14 +82,23 @@ prompt_ok="Reply with the word ok."
 cd "$repo"
 mkdir -p "$out"
 python="$(uv run python -c 'import sys; print(sys.executable)')"
-workspace_root="${CAPTURE_WORKSPACE_ROOT:-$(mktemp -d)}"
+run_name="run-$(date -u +%Y%m%dT%H%M%SZ)"
+case "$(uname -s)" in
+  MINGW* | MSYS* | CYGWIN*) default_root="/c/ccobs-capture/$run_name" ;;
+  *) default_root="/tmp/ccobs-capture/$run_name" ;;
+esac
+workspace_root="${CAPTURE_WORKSPACE_ROOT:-$default_root}"
 mkdir -p "$workspace_root"
-workspace_root="$(cd "$workspace_root" && pwd)"
-server_pid=""
-setting_sources=()
-if [[ -n "${CAPTURE_SETTING_SOURCES:-}" ]]; then
-  setting_sources=(--setting-sources "$CAPTURE_SETTING_SOURCES")
+workspace_root="$(cd "$workspace_root" && pwd -P)"
+native_root="$workspace_root"
+if command -v cygpath >/dev/null 2>&1; then
+  native_root="$(cygpath -w "$workspace_root")"
 fi
+if ! "$python" -m tools.capture.workspace check-root "$native_root"; then
+  rmdir "$workspace_root" 2>/dev/null || true
+  exit 1
+fi
+server_pid=""
 
 stop_server() {
   if [[ -n "$server_pid" ]]; then
@@ -129,20 +151,26 @@ workspace() {
   printf '%s\n' "$dir"
 }
 
-# run <scenario> <settings> <workspace> <hooks file or -> [claude args...]: one session.
-# --strict-mcp-config keeps the user's own MCP servers out of every run. The odd
-# expansion of setting_sources keeps an empty array safe under `set -u` in bash 3.2
-# (macOS).
+# run <scenario> <settings> <workspace> <hooks file or -> [claude args...]: one session,
+# isolated from the user's own setup by run_claude.sh (see CAPTURE_ISOLATION). A
+# refused workspace (run_claude.sh exit status 3) stops the whole capture, and its
+# session is not recorded.
 run() {
   local name="$1" settings_file="$2" dir="$3" hooks_file="$4"
   shift 4
-  local session_id
+  local session_id status=0
   session_id="$("$python" -c 'import uuid; print(uuid.uuid4())')"
   echo "== $name (session $session_id)"
-  bash "$here/run_claude.sh" "$settings_file" "$dir" --session-id "$session_id" \
-    --strict-mcp-config ${setting_sources[@]+"${setting_sources[@]}"} "$@" ||
-    echo "   claude exited with status $? (expected for headless-api-error)"
-  printf '%s\t%s\t%s\n' "$name" "$session_id" "$hooks_file" >>"$out/headless-sessions.tsv"
+  bash "$here/run_claude.sh" "$settings_file" "$dir" --session-id "$session_id" "$@" ||
+    status=$?
+  if [[ $status -eq 3 ]]; then
+    echo "the workspace of $name was refused; stopping the capture" >&2
+    exit 3
+  fi
+  if [[ $status -ne 0 ]]; then
+    echo "   claude exited with status $status (expected for headless-api-error)"
+  fi
+  printf '%s\t%s\t%s\t%s\n' "$name" "$session_id" "$hooks_file" "$isolation" >>"$out/headless-sessions.tsv"
   sleep 6  # Let the last metric export (5 s interval) reach the collector.
 }
 
@@ -235,9 +263,5 @@ for scenario in "${scenarios[@]}"; do
   run_scenario "$scenario"
 done
 
-native_root="$workspace_root"
-if command -v cygpath >/dev/null 2>&1; then
-  native_root="$(cygpath -w "$workspace_root")"
-fi
 echo "sessions: $out/headless-sessions.tsv"
 echo "workspace root (sanitizer --workspace-root): $native_root"

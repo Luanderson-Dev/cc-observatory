@@ -18,31 +18,42 @@ from typing import Any
 import pytest
 
 from tools.capture import sanitize as sanitize_module
+from tools.capture.jsontypes import JSON, JSONObject
 from tools.capture.sanitize import (
     IDENTITY_PLACEHOLDERS,
+    INTERNAL_SUMMARY,
+    NAME_FIELD_KINDS,
+    NAME_PLACEHOLDER_TEMPLATES,
     ContentError,
     DestinationError,
+    IsolationError,
     LiteralConflictError,
     LocalContext,
     Names,
     Redactor,
     StableNames,
     StructureError,
+    WorkspaceRootError,
     collect_identity_values,
     collect_names,
+    drop_internal_summaries,
     encode_project_dir,
     filter_otlp,
     find_content,
+    find_isolation_problems,
     find_personal_data,
     git_identity,
     guard_literals,
     hook_records,
+    internal_summary_keys,
     redact_identity_attributes,
     replace_request_ids,
+    replace_tool_use_ids,
     reserved_conflict,
     sanitize,
     scrub_safety_net,
     short_path,
+    started_agent_types,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -60,6 +71,17 @@ GROUPS = "eng-platform"
 IDP = "okta"
 REQ_A = "req_011CAbCdEfGhIjKlMnOpQrSt"
 REQ_B = "req_011CZyXwVuTsRqPoNmLkJiHg"
+TOOL_A = "toolu_01AbCdEfGhIjKlMnOpQrStUv"
+TOOL_B = "toolu_01BcDeFgHiJkLmNoPqRsTuVw"
+SERVER_TOOL = "srvtoolu_01ZyXwVuTsRqPoNmLkJiHgFe"
+FAKE_TOOL_1 = "toolu_01EXAMPLE000000000000001"
+FAKE_TOOL_2 = "toolu_01EXAMPLE000000000000002"
+CLIENT_A = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1"
+CLIENT_B = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb2"
+FAKE_CLIENT_1 = "00000000-0000-4000-a000-000000000001"
+FAKE_CLIENT_2 = "00000000-0000-4000-a000-000000000002"
+PLUGIN_HASH_A = "abcdef0123456789"
+PLUGIN_HASH_B = "fedcba9876543210"
 SESSION = "11111111-1111-4111-8111-111111111111"
 OTHER_SESSION = "22222222-2222-4222-8222-222222222222"
 THIRD_SESSION = "33333333-3333-4333-8333-333333333333"
@@ -126,6 +148,14 @@ def records_of(doc: dict[str, Any]) -> Iterator[dict[str, Any]]:
     for resource in doc["resourceLogs"]:
         for scope in resource["scopeLogs"]:
             yield from scope["logRecords"]
+
+
+def spans_of(doc: JSONObject) -> Iterator[dict[str, Any]]:
+    """The spans of an OTLP traces export request (as Any, for indexing in asserts)."""
+    resources: Any = doc["resourceSpans"]
+    for resource in resources:
+        for scope in resource["scopeSpans"]:
+            yield from scope["spans"]
 
 
 def point(session: str, value: float) -> dict[str, Any]:
@@ -646,6 +676,226 @@ def test_guard_looks_for_plain_word_names_only_where_they_are_used_as_names() ->
     assert [f.kind for f in find_personal_data(doc, literals)] == ["MCP server name 1"]
 
 
+@pytest.mark.parametrize("name", ["acme-tools", "acme"])
+def test_a_marketplace_named_like_a_plugin_gets_a_marketplace_placeholder(name: str) -> None:
+    doc = logs_doc(
+        log_record(SESSION, kv("plugin.name", name), kv("marketplace.name", name)),
+        log_record(SESSION, kv("plugin.name", "other-plugin"), kv("marketplace.name", name)),
+    )
+
+    out = Redactor(CTX, collect_names([doc], [])).otlp(doc)
+
+    assert isinstance(out, dict)
+    names = [string_attributes(r["attributes"]) for r in records_of(out)]
+    assert [(n["plugin.name"], n["marketplace.name"]) for n in names] == [
+        ("plugin-1", "marketplace-1"),
+        ("plugin-2", "marketplace-1"),
+    ]
+
+
+def test_mcp_server_names_of_hook_payloads_are_name_fields() -> None:
+    payload: JSONObject = {
+        "tool_name": "mcp__git__status",
+        "mcp_server": {"name": "git", "source": "dynamic"},
+        "tool_input": {"command": "git status"},
+    }
+
+    names = collect_names([], [payload])
+
+    assert names.mcp_servers == ("git",)
+    assert Redactor(CTX, names).value(payload) == {
+        "tool_name": "mcp__mcp-server-1__status",
+        "mcp_server": {"name": "mcp-server-1", "source": "dynamic"},
+        "tool_input": {"command": "git status"},
+    }
+    findings = find_personal_data({"mcp_server": {"name": "git"}}, guard_literals(CTX, names))
+    assert [(f.kind, f.location) for f in findings] == [("MCP server name 1", "$.mcp_server.name")]
+
+
+def test_otlp_mcp_server_names_are_collected_and_generic_names_kept() -> None:
+    doc = logs_doc(
+        log_record(SESSION, kv("mcp_server.name", "corp-db")),
+        log_record(SESSION, kv("mcp_server.name", "custom"), kv("mcp_tool.name", "custom")),
+        log_record(SESSION, kv("marketplace.name", "third-party"), kv("tool_name", "mcp_tool")),
+    )
+
+    names = collect_names([doc], [])
+    out = Redactor(CTX, names).otlp(doc)
+
+    assert isinstance(out, dict)
+    assert (names.mcp_servers, names.marketplaces) == (("corp-db",), ())
+    values = [string_attributes(r["attributes"]) for r in records_of(out)]
+    assert values[0]["mcp_server.name"] == "mcp-server-1"
+    assert (values[1]["mcp_server.name"], values[1]["mcp_tool.name"]) == ("custom", "custom")
+    assert (values[2]["marketplace.name"], values[2]["tool_name"]) == ("third-party", "mcp_tool")
+
+
+def test_plugin_id_hashes_get_stable_fakes_everywhere() -> None:
+    doc = logs_doc(
+        log_record(SESSION, kv("plugin.name", "acme-tools"), kv("plugin_id_hash", PLUGIN_HASH_A)),
+        log_record(SESSION, kv("plugin.name", "other"), kv("plugin_id_hash", PLUGIN_HASH_B)),
+        log_record(OTHER_SESSION, kv("plugin_id_hash", PLUGIN_HASH_A)),
+        log_record(OTHER_SESSION, kv("plugin_id_hash", "0000000000000001")),
+    )
+    hook_payload: JSONObject = {"note": f"plugin {PLUGIN_HASH_B} loaded"}
+
+    names = collect_names([doc], [hook_payload])
+    sanitizer = Redactor(CTX, names)
+    out = sanitizer.otlp(doc)
+
+    assert isinstance(out, dict)
+    assert names.plugin_id_hashes == (PLUGIN_HASH_A, PLUGIN_HASH_B)
+    assert [string_attributes(r["attributes"])["plugin_id_hash"] for r in records_of(out)] == [
+        "0000000000000001",
+        "0000000000000002",
+        "0000000000000001",
+        "0000000000000001",
+    ]
+    assert sanitizer.value(hook_payload) == {"note": "plugin 0000000000000002 loaded"}
+    assert guard_literals(CTX, names)["plugin id hash 1"] == PLUGIN_HASH_A
+
+
+def test_guard_reports_plugin_id_hashes_that_are_not_fakes() -> None:
+    real = logs_doc(log_record(SESSION, kv("plugin_id_hash", PLUGIN_HASH_A)))
+    fake = logs_doc(log_record(SESSION, kv("plugin_id_hash", "0000000000000001")))
+
+    findings = find_personal_data(real, {})
+
+    assert [f.kind for f in findings] == ["plugin id hash"]
+    assert all(PLUGIN_HASH_A not in str(f) for f in findings)
+    assert find_personal_data(fake, {}) == []
+
+
+def test_tool_use_ids_map_to_stable_fakes_of_the_same_shape() -> None:
+    names = StableNames("01EXAMPLE{:015d}")
+
+    text = replace_tool_use_ids(f"{TOOL_A} then {TOOL_B} then {TOOL_A}, x_{SERVER_TOOL}", names)
+
+    assert text == (
+        f"{FAKE_TOOL_1} then {FAKE_TOOL_2} then {FAKE_TOOL_1}, x_srvtoolu_01EXAMPLE000000000000003"
+    )
+    assert len(FAKE_TOOL_1) == len(TOOL_A)
+    assert replace_tool_use_ids(f"already {FAKE_TOOL_2}", names) == f"already {FAKE_TOOL_2}"
+
+
+def test_tool_use_ids_and_client_request_ids_stay_consistent_across_hooks_and_otlp() -> None:
+    hooks: list[JSON] = [
+        {"hook_event_name": "PreToolUse", "tool_use_id": TOOL_B},
+        {"hook_event_name": "PostToolBatch", "tool_calls": [{"tool_use_id": TOOL_A}]},
+        {"hook_event_name": "StopFailure", "error": f"request {CLIENT_B} failed"},
+    ]
+    doc = traces_doc(
+        span(
+            SESSION,
+            "claude_code.tool",
+            kv("tool_use_id", TOOL_A),
+            kv("gen_ai.tool.call.id", TOOL_A),
+        ),
+        span(SESSION, "claude_code.llm_request", kv("client_request_id", CLIENT_A)),
+        span(SESSION, "claude_code.llm_request", kv("client_request_id", CLIENT_B)),
+    )
+
+    names = collect_names([doc], hooks)
+    sanitizer = Redactor(CTX, names)
+    out_hooks = [sanitizer.value(payload) for payload in hooks]
+    out = sanitizer.otlp(doc)
+
+    assert isinstance(out, dict)
+    assert names.client_request_ids == (CLIENT_A, CLIENT_B)
+    assert out_hooks == [
+        {"hook_event_name": "PreToolUse", "tool_use_id": FAKE_TOOL_1},
+        {"hook_event_name": "PostToolBatch", "tool_calls": [{"tool_use_id": FAKE_TOOL_2}]},
+        {"hook_event_name": "StopFailure", "error": f"request {FAKE_CLIENT_2} failed"},
+    ]
+    spans = list(spans_of(out))
+    tool_attributes = string_attributes(spans[0]["attributes"])
+    assert (tool_attributes["tool_use_id"], tool_attributes["gen_ai.tool.call.id"]) == (
+        FAKE_TOOL_2,
+        FAKE_TOOL_2,
+    )
+    assert [string_attributes(s["attributes"])["client_request_id"] for s in spans[1:]] == [
+        FAKE_CLIENT_1,
+        FAKE_CLIENT_2,
+    ]
+    assert guard_literals(CTX, names)["client request id 1"] == CLIENT_A
+
+
+def test_guard_reports_tool_use_ids_and_client_request_ids_that_are_not_fakes() -> None:
+    real = traces_doc(
+        span(SESSION, "claude_code.llm_request", kv("client_request_id", CLIENT_A)),
+        span(SESSION, "claude_code.tool", kv("tool_use_id", TOOL_A)),
+    )
+    fake = traces_doc(
+        span(SESSION, "claude_code.llm_request", kv("client_request_id", FAKE_CLIENT_1)),
+        span(SESSION, "claude_code.tool", kv("tool_use_id", FAKE_TOOL_1)),
+    )
+
+    findings = find_personal_data(real, {})
+
+    assert {f.kind for f in findings} == {"client request id", "tool use id"}
+    assert all(CLIENT_A not in str(f) and TOOL_A not in str(f) for f in findings)
+    assert find_personal_data(fake, {}) == []
+
+
+def test_names_are_collected_from_every_name_field() -> None:
+    payload: JSONObject = {
+        "plugin_name": "acme-tools",
+        "marketplace_name": "acme-market",
+        "skill_name": "acme-skill",
+        "tool_input": {"skill": "my-skill"},
+        "server_name": "corp-db",
+        "other": {"skill": "simplify", "server_name": "custom"},
+    }
+
+    names = collect_names([], [payload])
+
+    assert (names.plugins, names.marketplaces, names.skills, names.mcp_servers) == (
+        ("acme-tools",),
+        ("acme-market",),
+        ("acme-skill", "my-skill"),
+        ("corp-db",),
+    )
+    assert Redactor(CTX, names).value(payload) == {
+        "plugin_name": "plugin-1",
+        "marketplace_name": "marketplace-1",
+        "skill_name": "skill-1",
+        "tool_input": {"skill": "skill-2"},
+        "server_name": "mcp-server-1",
+        "other": {"skill": "simplify", "server_name": "custom"},
+    }
+
+
+def test_name_fields_and_their_placeholders_come_from_one_mapping() -> None:
+    assert set(NAME_FIELD_KINDS.values()) == set(NAME_PLACEHOLDER_TEMPLATES)
+    assert NAME_PLACEHOLDER_TEMPLATES == {
+        "plugin name": "plugin-{}",
+        "marketplace name": "marketplace-{}",
+        "skill name": "skill-{}",
+        "MCP server name": "mcp-server-{}",
+    }
+    assert {"plugin.name", "marketplace_name", "skill", "mcp_server.name", "server_name"} <= set(
+        NAME_FIELD_KINDS
+    )
+
+
+@pytest.mark.parametrize("platform", ["vrtx", "bdrk"])
+def test_cloud_tool_use_ids_keep_their_prefix(platform: str) -> None:
+    real = f"toolu_{platform}_01AbCdEfGhIjKlMnOpQrStUv"
+    fake = f"toolu_{platform}_01EXAMPLE000000000000001"
+
+    assert replace_tool_use_ids(f"id {real}.", StableNames("01EXAMPLE{:015d}")) == f"id {fake}."
+    assert [f.kind for f in find_personal_data({"id": real}, {})] == ["tool use id"]
+    assert find_personal_data({"id": fake}, {}) == []
+
+
+def test_cloud_message_and_tool_use_ids_are_ids_that_literals_never_cut() -> None:
+    ctx = LocalContext(home="C:\\Users\\mnop", user="mnop", host=HOST)
+    message = "msg_vrtx_01AbCdEfGhIjKlMnOpQrStUv and msg_bdrk_01AbCdEfGhIjKlMnOpQrStUv"
+
+    assert Redactor(ctx, Names()).text(message) == message
+    assert find_personal_data(message, guard_literals(ctx, Names())) == []
+
+
 def test_names_and_token_matching_never_rewrite_keys() -> None:
     names = Names(mcp_servers=("time", "memory"))
     payload: dict[str, Any] = {
@@ -672,7 +922,7 @@ def test_id_shaped_tokens_are_left_alone() -> None:
     ctx = LocalContext(home="C:\\Users\\cafe", user="cafe", host=HOST)
     text = (
         "trace 0af7651916cdcafe8448eb211c80319c span b7ad6b71cafe3331"
-        " session 6f1c2a9e-cafe-4e1a-9a3c-2b7d8e9f0a1b tool toolu_01CafeXyzAbcDefGhiJklMno"
+        " session 6f1c2a9e-cafe-4e1a-9a3c-2b7d8e9f0a1b message msg_01CafeXyzAbcDefGhiJklMno"
     )
 
     assert redactor(ctx=ctx).text(text) == text
@@ -723,7 +973,7 @@ def test_forbidden_texts_match_with_their_original_case_rules() -> None:
 
     assert redactor(ctx=ctx).text("Herr Weiß kommt") == "Herr redacted kommt"
     findings = find_personal_data("Herr Weiß", guard_literals(ctx, Names()))
-    assert [f.kind for f in findings] == ["forbidden text 1"]
+    assert {f.kind for f in findings} == {"forbidden text 1", "non-ascii letter"}
 
 
 # Safety net and what is kept.
@@ -806,6 +1056,108 @@ def test_redactor_keeps_ids_models_numbers_and_content() -> None:
 
 def test_redactor_redacts_keys_too() -> None:
     assert redactor().value({"C:\\Users\\jdoe\\a.txt": 1}) == {"C:\\Users\\user\\a.txt": 1}
+
+
+# Summaries written by internal agents (compaction, prompt suggestion).
+
+
+def subagent_stop(agent_type: str | None, message: str = "x") -> JSONObject:
+    payload: JSONObject = {"hook_event_name": "SubagentStop", "agent_id": "a1b2c3"}
+    if agent_type is not None:
+        payload["agent_type"] = agent_type
+    payload["last_assistant_message"] = message
+    return payload
+
+
+def agent_call(subagent_type: str, tool_name: str = "Agent") -> JSONObject:
+    return {
+        "hook_event_name": "PreToolUse",
+        "tool_name": tool_name,
+        "tool_input": {"description": "d", "prompt": "p", "subagent_type": subagent_type},
+    }
+
+
+def test_internal_summaries_are_replaced_and_their_keys_kept() -> None:
+    compact: JSONObject = {
+        "session_id": SESSION,
+        "hook_event_name": "PostCompact",
+        "compact_summary": "Summary: Herr Weiß keeps notes in D:\\work\\acme.",
+        "trigger": "manual",
+    }
+    payloads = [compact, subagent_stop(""), subagent_stop(None), subagent_stop("acme-reviewer")]
+    originals = copy.deepcopy(payloads)
+
+    out = [drop_internal_summaries(payload) for payload in payloads]
+
+    assert INTERNAL_SUMMARY == "<internal summary removed>"
+    assert out == [
+        {**compact, "compact_summary": INTERNAL_SUMMARY},
+        *({**payload, "last_assistant_message": INTERNAL_SUMMARY} for payload in payloads[1:]),
+    ]
+    assert [list(payload) for payload in out] == [list(payload) for payload in originals]
+    assert payloads == originals
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        subagent_stop("Explore"),
+        subagent_stop("general-purpose"),
+        subagent_stop("Plan"),
+        {"hook_event_name": "Stop", "agent_type": "", "last_assistant_message": "done"},
+        {"hook_event_name": "PreCompact", "trigger": "manual", "custom_instructions": ""},
+        {"hook_event_name": "PostCompact", "trigger": "auto", "compact_summary": None},
+        {"hook_event_name": "SubagentStop", "agent_type": ""},
+    ],
+)
+def test_other_messages_are_kept(payload: JSONObject) -> None:
+    assert drop_internal_summaries(payload) == payload
+
+
+def test_only_subagents_the_session_started_keep_their_last_message() -> None:
+    session: list[JSON] = [
+        agent_call("acme-reviewer"),
+        agent_call("not-an-agent", tool_name="Read"),
+        {"hook_event_name": "PreToolUse", "tool_name": "Agent", "tool_input": {"x": 1}},
+        agent_call(""),
+    ]
+
+    started = started_agent_types(session)
+
+    assert started == {"acme-reviewer", "general-purpose", "Explore", "Plan"}
+    assert drop_internal_summaries(subagent_stop("acme-reviewer"), started) == subagent_stop(
+        "acme-reviewer"
+    )
+    for agent_type in ("not-an-agent", "statusline-setup", ""):
+        out = drop_internal_summaries(subagent_stop(agent_type), started)
+        assert out["last_assistant_message"] == INTERNAL_SUMMARY
+
+
+def test_internal_summary_keys_name_the_fields_written_by_internal_agents() -> None:
+    assert internal_summary_keys({"hook_event_name": "PostCompact", "compact_summary": "x"}) == [
+        "compact_summary"
+    ]
+    assert internal_summary_keys(subagent_stop("")) == ["last_assistant_message"]
+    assert internal_summary_keys(subagent_stop("acme-reviewer")) == ["last_assistant_message"]
+    assert internal_summary_keys(subagent_stop("acme-reviewer"), {"acme-reviewer"}) == []
+    assert internal_summary_keys(subagent_stop("Explore")) == []
+    assert internal_summary_keys({"hook_event_name": "PostCompact"}) == []
+
+
+def test_the_internal_summary_placeholder_is_never_rewritten() -> None:
+    ctx = LocalContext(home="C:\\Users\\mary", user="mary", host=HOST)
+
+    sanitizer = Redactor(ctx, Names())
+
+    assert sanitizer.text(INTERNAL_SUMMARY) == INTERNAL_SUMMARY
+    assert sanitizer.value({"compact_summary": INTERNAL_SUMMARY}) == {
+        "compact_summary": INTERNAL_SUMMARY
+    }
+    assert sanitizer.text("mary ran it") == "user ran it"
+    # The key is neutral here: the guard reports a username found inside any key, and
+    # "mary" is inside "compact_summary" (a known limitation, see the README).
+    assert find_personal_data({"text": INTERNAL_SUMMARY}, {"username": "mary"}) == []
+    assert not reserved_conflict("mary")
 
 
 # OTLP filtering by session.
@@ -1087,7 +1439,11 @@ def test_guard_reports_personal_data_by_kind_and_location(text: str, kind: str) 
 def test_guard_checks_keys_without_echoing_them() -> None:
     findings = find_personal_data({"outer": {"D:\\Users\\alice": "x"}}, {})
 
-    assert [(f.kind, f.location) for f in findings] == [("user path", "$.outer (key)")]
+    assert {(f.kind, f.location) for f in findings} == {
+        ("user path", "$.outer (key)"),
+        ("absolute path outside fake home", "$.outer (key)"),
+    }
+    assert all("alice" not in str(f) for f in findings)
 
 
 def test_guard_findings_never_include_the_value() -> None:
@@ -1095,6 +1451,223 @@ def test_guard_findings_never_include_the_value() -> None:
 
     assert {f.kind for f in findings} == {"email", "username", "hostname"}
     assert all("jdoe" not in str(f).lower() for f in findings)
+
+
+@pytest.mark.parametrize("word", ["ação", "Weiß", "naïve", "Привет", "日本語"])
+def test_guard_reports_non_ascii_letters_by_location_only(word: str) -> None:
+    findings = find_personal_data({"note": f"see {word} here", word: 1}, {})
+
+    pairs = [(f.kind, f.location) for f in findings]
+    assert ("non-ascii letter", "$.note") in pairs
+    assert ("non-ascii letter", "$ (key)") in pairs
+    assert all(word not in str(f) for f in findings)
+
+
+def test_guard_allows_non_ascii_punctuation_symbols_and_digits() -> None:
+    # Em dash, en dash, ellipsis, arrow, copyright, degree, euro, one half, superscript two.
+    text = "a \u2014 b \u2013 c \u2026 \u2192 \u00a9 20 \u00b0C \u20ac \u00bd \u00b2"
+
+    assert find_personal_data({"note": text}, {}) == []
+
+
+BACKSLASH = chr(0x5C)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "cafe" + chr(0x0301),  # e and a combining acute accent: NFC makes it a letter
+        "x" + chr(0x0301),  # a combining mark that composes with nothing
+        f"caf{BACKSLASH}u00e9 in an escaped JSON string",
+        f"{BACKSLASH}u00C7a",
+    ],
+)
+def test_guard_reports_composed_marks_and_escaped_letters(text: str) -> None:
+    assert [f.kind for f in find_personal_data({"note": text}, {})] == ["non-ascii letter"]
+
+
+def test_guard_allows_micro_sign_ordinal_indicators_and_escaped_punctuation() -> None:
+    text = f"5 {chr(0xB5)}s, 1{chr(0xAA)}, 2{chr(0xBA)}, {BACKSLASH}u2014 and {BACKSLASH}u00e"
+
+    assert find_personal_data({"note": text}, {}) == []
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "D:\\work\\acme\\notes.txt",
+        "C:\\Projects\\repo\\0b6e1f2a\\scratchpad\\spike\\ws\\notes.txt",
+        "C:/Projects/repo/notes.txt",
+        "C:\\\\Projects\\\\repo",
+        "open E:\\ now",
+        "C:\\Users\\Public\\x",
+        "C:\\Users\\users\\x",
+        "/d/work/notes.txt",
+        "/c/Projects/repo",
+        "/mnt/d/work",
+        "/mnt/data/x",
+        "see /tmp/capture/notes.txt",
+        "written to /tmp",
+        "/opt/tools/bin",
+        "/var/folders/x",
+        "/private/var/folders/x",
+        "/Users/user/x",
+        "/home/username/x",
+        "file:///tmp/x",
+        "C:\\Users\\user\\AppData\\Local\\Temp\\claude\\C--Projects-repo\\0b6e\\scratchpad",
+        "C--Projects-repo-ws",
+        "in C--Projects-repo-ws we",
+        "('C--Work-acme-notes')",
+        "~/notes.txt",
+        "see ~\\notes.txt",
+        "~alice/notes.txt",
+        "/Volumes/Data/x",
+        "/media/usb/x",
+        "/run/media/jdoe/x",
+        "/root/.bashrc",
+        "/srv/app",
+        "/workspaces/repo",
+        "/cygdrive/c/Users/user/x",
+    ],
+)
+def test_guard_reports_absolute_paths_outside_the_fake_home(text: str) -> None:
+    findings = find_personal_data({"payload": {"items": ["fine", text]}}, {})
+
+    pairs = [(f.kind, f.location) for f in findings]
+    assert ("absolute path outside fake home", "$.payload.items[1]") in pairs
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "C:\\Users\\user\\projects\\capture\\ws\\notes.txt",
+        "c:/users/USER/.claude.json",
+        "C:\\Users\\user",
+        "C:\\\\Users\\\\user\\\\projects\\\\capture",
+        "cd C:\\Users\\user && ls",
+        "/home/user/projects/capture/ws",
+        "/home/user",
+        "/c/Users/user/projects/capture/repo",
+        "/mnt/c/Users/user/projects/capture",
+        "C:\\Users\\user\\.claude\\projects\\C--Users-user-projects-capture-ws\\a.jsonl",
+        "https://example.org/tmp/x",
+        "https://api.github.com/users/octocat/repos",
+        "http://127.0.0.1:4318/v1/metrics",
+        "file:///C%3A%5CUsers%5Cuser%5Cprojects",
+        "claude -p: TaskCreate at 12:30",
+        "src/a/b.py, ./tmp/x, ../var/y and docs/home/z",
+        "nav-home-button, a--b and x--y",
+        "Glob(**/a/**)",
+        "see #/a/b",
+        "run cmd /c",
+        "cmd /c\n",
+        "cmd /c dir",
+        "JDOE~1 and PROGRA~1 and a~b",
+        "the workspace is C--Users-user-projects-capture-ws here",
+    ],
+)
+def test_guard_allows_the_fake_home_urls_and_relative_paths(text: str) -> None:
+    kinds = [f.kind for f in find_personal_data(text, {})]
+
+    assert "absolute path outside fake home" not in kinds
+
+
+SESSION_DIR = "C--ccobs-capture-run-1-headless-x"
+
+
+def test_a_workspace_root_outside_the_home_maps_into_the_fake_workspace() -> None:
+    ctx = LocalContext(home=HOME, user=USER, host=HOST, workspace_root="C:\\ccobs-capture\\run-1")
+    payload: JSONObject = {
+        "hook_event_name": "InstructionsLoaded",
+        "cwd": "C:\\ccobs-capture\\run-1\\headless-x",
+        "transcript_path": f"{HOME}\\.claude\\projects\\{SESSION_DIR}\\{SESSION}.jsonl",
+        "scratchpad_dir": f"{HOME}\\AppData\\Local\\Temp\\claude\\{SESSION_DIR}\\abc\\scratchpad",
+        "memory_type": "Project",
+        "file_path": "C:\\ccobs-capture\\run-1\\headless-x\\CLAUDE.md",
+        "tool_input": {"file_path": "C:/ccobs-capture/run-1/headless-x/notes.txt"},
+        "command": "ls /c/ccobs-capture/run-1/headless-x",
+    }
+
+    out = Redactor(ctx, Names()).value(payload)
+
+    assert isinstance(out, dict)
+    assert out["cwd"] == "C:\\Users\\user\\projects\\capture\\headless-x"
+    assert out["file_path"] == "C:\\Users\\user\\projects\\capture\\headless-x\\CLAUDE.md"
+    assert find_personal_data(out, {}) == []
+    assert find_isolation_problems(out) == []
+
+
+def test_a_posix_workspace_root_outside_the_home_maps_into_the_fake_workspace() -> None:
+    # /srv rather than /tmp (both outside the home, both flagged by the guard unless mapped).
+    root = "/srv/ccobs-capture/run-1"
+    ctx = LocalContext(home="/home/jdoe", user=USER, host=HOST, workspace_root=root)
+    payload: JSONObject = {
+        "hook_event_name": "InstructionsLoaded",
+        "cwd": f"{root}/headless-x",
+        "transcript_path": f"/home/jdoe/.claude/projects/{encode_project_dir(root)}-headless-x/s",
+        "memory_type": "Project",
+        "file_path": f"{root}/headless-x/CLAUDE.md",
+    }
+
+    out = Redactor(ctx, Names()).value(payload)
+
+    assert isinstance(out, dict)
+    assert out["file_path"] == "/home/user/projects/capture/headless-x/CLAUDE.md"
+    assert find_personal_data(out, {}) == []
+    assert find_isolation_problems(out) == []
+
+
+def instructions(memory_type: str | None, file_path: str | None) -> JSONObject:
+    payload: JSONObject = {"hook_event_name": "InstructionsLoaded", "load_reason": "session_start"}
+    if memory_type is not None:
+        payload["memory_type"] = memory_type
+    if file_path is not None:
+        payload["file_path"] = file_path
+    return payload
+
+
+@pytest.mark.parametrize(
+    ("memory_type", "file_path"),
+    [
+        ("Project", "C:\\Users\\user\\projects\\capture\\ws\\CLAUDE.md"),
+        ("Project", "C:/Users/user/projects/capture/ws/.claude/rules/style.md"),
+        ("Local", "C:\\Users\\user\\projects\\capture\\ws\\CLAUDE.local.md"),
+        ("Project", "/home/user/projects/capture/ws/CLAUDE.md"),
+    ],
+)
+def test_instructions_from_the_capture_workspace_pass_the_isolation_check(
+    memory_type: str, file_path: str
+) -> None:
+    assert find_isolation_problems(instructions(memory_type, file_path)) == []
+
+
+@pytest.mark.parametrize(
+    ("memory_type", "file_path", "locations"),
+    [
+        ("User", "C:\\Users\\user\\.claude\\CLAUDE.md", ["$.memory_type", "$.file_path"]),
+        ("Managed", "C:\\Users\\user\\projects\\capture\\ws\\CLAUDE.md", ["$.memory_type"]),
+        (None, "C:\\Users\\user\\projects\\capture\\ws\\CLAUDE.md", ["$.memory_type"]),
+        ("Project", "C:\\Users\\user\\projects\\CLAUDE.md", ["$.file_path"]),
+        ("Project", "C:\\Users\\user\\projects\\capture\\..\\CLAUDE.md", ["$.file_path"]),
+        ("Project", "D:\\work\\CLAUDE.md", ["$.file_path"]),
+        ("Project", "C:\\Users\\user\\projects\\capture\\CLAUDE.md", ["$.file_path"]),
+        ("Project", "/home/user/projects/capture/CLAUDE.md", ["$.file_path"]),
+        ("Project", None, ["$.file_path"]),
+    ],
+)
+def test_instructions_from_outside_the_workspace_fail_the_isolation_check(
+    memory_type: str | None, file_path: str | None, locations: list[str]
+) -> None:
+    findings = find_isolation_problems(instructions(memory_type, file_path))
+
+    assert [f.location for f in findings] == locations
+    assert all("CLAUDE" not in str(f) and "User" not in f.kind for f in findings)
+
+
+def test_the_isolation_check_ignores_other_events() -> None:
+    other: JSONObject = {"hook_event_name": "SessionStart", "file_path": "D:\\work\\x"}
+
+    assert find_isolation_problems(other) == []
 
 
 # End to end.
@@ -1126,6 +1699,7 @@ def make_raw(raw: Path) -> None:
         "collector_version": "0.162.0",
         "captured_on": "2026-10-12",
         "platform": "windows",
+        "isolated": True,
         "scenarios": [
             {
                 "name": "headless-basic",
@@ -1284,6 +1858,7 @@ def test_cli_writes_sanitized_fixtures_per_scenario(tmp_path: Path) -> None:
         "collector_version": "0.162.0",
         "captured_on": "2026-10-12",
         "platform": "windows",
+        "isolated": True,
         "scenarios": [
             {
                 "name": "headless-basic",
@@ -1575,7 +2150,12 @@ def test_cli_skips_conflicting_git_identity_values_and_accepts_an_empty_user(
     seen: list[LocalContext] = []
 
     def fake_sanitize(
-        raw: Path, dest: Path, ctx: LocalContext, *, allow_content: bool = False
+        raw: Path,
+        dest: Path,
+        ctx: LocalContext,
+        *,
+        allow_content: bool = False,
+        allow_unisolated: bool = False,
     ) -> list[str]:
         seen.append(ctx)
         return []
@@ -1589,6 +2169,284 @@ def test_cli_skips_conflicting_git_identity_values_and_accepts_an_empty_user(
     (ctx,) = seen
     assert (ctx.user, ctx.host, ctx.forbid) == ("", "", ("one@corp.invalid",))
     assert "git" in capsys.readouterr().err
+
+
+def append_hook(raw: Path, received_at: str, event: str, **fields: JSON) -> None:
+    record = hook(received_at, "/hooks/http", SESSION, event)
+    record["body"].update(fields)
+    append_jsonl(raw / "hooks-run.jsonl", record)
+
+
+def test_sanitize_replaces_internal_summaries(tmp_path: Path) -> None:
+    raw, dest = tmp_path / "raw", tmp_path / "fixtures"
+    make_raw(raw)
+    append_hook(
+        raw,
+        "2026-10-13T01:20:10+00:00",
+        "SubagentStop",
+        agent_id="a1b2c3",
+        agent_type="",
+        last_assistant_message="Olá: jdoe keeps notes in D:\\work\\acme",
+    )
+    append_hook(
+        raw,
+        "2026-10-13T01:20:11+00:00",
+        "PostCompact",
+        trigger="manual",
+        compact_summary="Resumo: ação in D:\\work\\acme",
+    )
+
+    sanitize(raw, dest, CTX)
+
+    payloads = [line["payload"] for line in read_jsonl(dest / "hooks" / "headless-basic.jsonl")]
+    assert payloads[-2]["last_assistant_message"] == INTERNAL_SUMMARY
+    assert payloads[-1]["compact_summary"] == INTERNAL_SUMMARY
+    assert "acme" not in (dest / "hooks" / "headless-basic.jsonl").read_text(encoding="utf-8")
+
+
+def test_sanitize_keeps_the_last_message_of_subagents_the_session_started(
+    tmp_path: Path,
+) -> None:
+    raw, dest = tmp_path / "raw", tmp_path / "fixtures"
+    make_raw(raw)
+    append_hook(
+        raw,
+        "2026-10-13T01:20:10+00:00",
+        "PreToolUse",
+        tool_name="Agent",
+        tool_input={"description": "d", "prompt": "p", "subagent_type": "code-reviewer"},
+    )
+    append_hook(
+        raw,
+        "2026-10-13T01:20:11+00:00",
+        "SubagentStop",
+        agent_type="code-reviewer",
+        last_assistant_message="Two findings.",
+    )
+    append_hook(
+        raw,
+        "2026-10-13T01:20:12+00:00",
+        "SubagentStop",
+        agent_type="statusline-setup",
+        last_assistant_message="acme notes",
+    )
+
+    sanitize(raw, dest, CTX)
+
+    payloads = [line["payload"] for line in read_jsonl(dest / "hooks" / "headless-basic.jsonl")]
+    assert payloads[-2]["last_assistant_message"] == "Two findings."
+    assert payloads[-1]["last_assistant_message"] == INTERNAL_SUMMARY
+
+
+def test_sanitize_refuses_a_capture_that_loaded_instructions_from_outside_the_workspace(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    raw, dest = tmp_path / "raw", tmp_path / "fixtures"
+    make_raw(raw)
+    append_hook(
+        raw,
+        "2026-10-13T01:20:10+00:00",
+        "InstructionsLoaded",
+        memory_type="User",
+        file_path=f"{HOME}\\.claude\\CLAUDE.md",
+        load_reason="session_start",
+    )
+
+    with pytest.raises(IsolationError, match="isolated"):
+        sanitize(raw, dest, CTX)
+    assert sanitize_module.main(cli_args(raw, dest)) == 1
+
+    err = capsys.readouterr().err
+    assert "hooks/headless-basic.jsonl record 4: " in err
+    assert "at $.payload.memory_type" in err
+    assert "at $.payload.file_path" in err
+    assert "CAPTURE_ISOLATION" in err
+    assert not [text for text in ("jdoe", ".claude\\CLAUDE.md", "User\n") if text in err]
+    assert not dest.exists()
+
+
+def test_sanitize_accepts_the_synthetic_project_instructions(tmp_path: Path) -> None:
+    raw, dest = tmp_path / "raw", tmp_path / "fixtures"
+    make_raw(raw)
+    append_hook(
+        raw,
+        "2026-10-13T01:20:10+00:00",
+        "InstructionsLoaded",
+        memory_type="Project",
+        file_path=f"{WORKSPACE}\\ws\\CLAUDE.md",
+        load_reason="session_start",
+    )
+
+    sanitize(raw, dest, CTX)
+
+    payloads = [line["payload"] for line in read_jsonl(dest / "hooks" / "headless-basic.jsonl")]
+    assert payloads[-1]["file_path"] == "C:\\Users\\user\\projects\\capture\\ws\\CLAUDE.md"
+
+
+def mark_isolated(raw: Path, isolated: object) -> None:
+    """Set (or, for None, remove) the top-level "isolated" of scenarios.json."""
+    manifest = json.loads((raw / "scenarios.json").read_text(encoding="utf-8"))
+    manifest.pop("isolated", None)
+    if isolated is not None:
+        manifest["isolated"] = isolated
+    (raw / "scenarios.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+
+@pytest.mark.parametrize("isolated", [None, False, "true"])
+def test_sanitize_refuses_a_capture_not_marked_isolated(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], isolated: object
+) -> None:
+    raw, dest = tmp_path / "raw", tmp_path / "fixtures"
+    make_raw(raw)
+    mark_isolated(raw, isolated)
+
+    with pytest.raises(IsolationError, match="--allow-unisolated"):
+        sanitize(raw, dest, CTX)
+    assert sanitize_module.main(cli_args(raw, dest)) == 1
+
+    assert '"isolated": true' in capsys.readouterr().err
+    assert not dest.exists()
+
+
+def test_allow_unisolated_records_an_unisolated_capture(tmp_path: Path) -> None:
+    raw, dest = tmp_path / "raw", tmp_path / "fixtures"
+    make_raw(raw)
+    mark_isolated(raw, None)
+    append_hook(
+        raw,
+        "2026-10-13T01:20:10+00:00",
+        "InstructionsLoaded",
+        memory_type="User",
+        file_path=f"{HOME}\\.claude\\CLAUDE.md",
+        load_reason="session_start",
+    )
+
+    assert sanitize_module.main([*cli_args(raw, dest), "--allow-unisolated"]) == 0
+
+    manifest = json.loads((dest / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["isolated"] is False
+    payloads = [line["payload"] for line in read_jsonl(dest / "hooks" / "headless-basic.jsonl")]
+    assert payloads[-1]["memory_type"] == "User"
+
+
+def test_allow_unisolated_always_records_false(tmp_path: Path) -> None:
+    raw, dest = tmp_path / "raw", tmp_path / "fixtures"
+    make_raw(raw)  # marked "isolated": true
+
+    assert sanitize_module.main([*cli_args(raw, dest), "--allow-unisolated"]) == 0
+
+    manifest = json.loads((dest / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["isolated"] is False
+
+
+@pytest.mark.parametrize(
+    "root",
+    [
+        "C:\\",
+        "C:",
+        "D:/",
+        "C:\\ccobs-capture",
+        "/srv",
+        "/",
+        HOME,
+        "c:/users/JDOE/",
+        "C:\\Users",
+        "/home/jdoe",
+    ],
+)
+def test_sanitize_refuses_a_workspace_root_too_close_to_the_top(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], root: str
+) -> None:
+    raw, dest = tmp_path / "raw", tmp_path / "fixtures"
+    make_raw(raw)
+    home = "/home/jdoe" if root.startswith("/") else HOME
+    ctx = LocalContext(home=home, user=USER, host=HOST, workspace_root=root)
+
+    with pytest.raises(WorkspaceRootError, match="--workspace-root"):
+        sanitize(raw, dest, ctx)
+    args = cli_args(raw, dest)
+    args[args.index("--workspace-root") + 1] = root
+    args[args.index("--home") + 1] = home
+    assert sanitize_module.main(args) == 1
+
+    assert "--workspace-root" in capsys.readouterr().err
+    assert not dest.exists()
+
+
+@pytest.mark.parametrize(
+    "root", ["C:\\ccobs-capture\\run-1", "C:/ccobs-capture/run-1/", "/srv/ccobs-capture", WORKSPACE]
+)
+def test_sanitize_accepts_a_workspace_root_two_levels_down(tmp_path: Path, root: str) -> None:
+    raw, dest = tmp_path / "raw", tmp_path / "fixtures"
+    make_raw(raw)
+
+    assert sanitize(raw, dest, dataclasses.replace(CTX, workspace_root=root))
+
+
+def test_sanitize_refuses_non_ascii_letters_and_foreign_paths(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    raw, dest = tmp_path / "raw", tmp_path / "fixtures"
+    make_raw(raw)
+    append_hook(raw, "2026-10-13T01:20:10+00:00", "UserPromptSubmit", prompt="Olá, café")
+    append_hook(
+        raw,
+        "2026-10-13T01:20:11+00:00",
+        "PreToolUse",
+        tool_name="Read",
+        tool_input={"file_path": "D:\\work\\acme\\notes.txt"},
+    )
+
+    assert sanitize_module.main(cli_args(raw, dest)) == 1
+
+    err = capsys.readouterr().err
+    assert "non-ascii letter at $.payload.prompt" in err
+    assert "absolute path outside fake home at $.payload.tool_input.file_path" in err
+    assert not [text for text in ("Olá", "café", "acme", "work\\") if text in err]
+    assert not dest.exists()
+
+
+def test_sanitize_turns_tool_use_ids_into_fakes_that_pass_the_structure_check(
+    tmp_path: Path,
+) -> None:
+    raw, dest = tmp_path / "raw", tmp_path / "fixtures"
+    make_raw(raw)
+    append_hook(raw, "2026-10-13T01:20:10+00:00", "PreToolUse", tool_use_id=TOOL_A)
+    append_jsonl(
+        raw / "otlp-logs.jsonl",
+        logs_doc(log_record(SESSION, kv("event.name", "tool_result"), kv("tool_use_id", TOOL_A))),
+    )
+
+    sanitize(raw, dest, CTX)
+
+    payloads = [line["payload"] for line in read_jsonl(dest / "hooks" / "headless-basic.jsonl")]
+    assert payloads[-1]["tool_use_id"] == FAKE_TOOL_1
+    (*_, tool_log) = (
+        record
+        for doc in read_jsonl(dest / "otlp/headless-basic/logs.jsonl")
+        for record in records_of(doc)
+    )
+    assert string_attributes(tool_log["attributes"])["tool_use_id"] == FAKE_TOOL_1
+
+
+def test_structure_check_still_catches_other_changes_to_id_fields(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    raw, dest = tmp_path / "raw", tmp_path / "fixtures"
+    make_raw(raw)
+    append_hook(raw, "2026-10-13T01:20:10+00:00", "PreToolUse", tool_use_id=TOOL_A)
+    safety_net = sanitize_module.scrub_safety_net
+
+    def mangle_ids(text: str) -> str:
+        return safety_net(text).replace("01EXAMPLE", "01MANGLED")
+
+    monkeypatch.setattr(sanitize_module, "scrub_safety_net", mangle_ids)
+
+    with pytest.raises(StructureError, match=r"changed tool_use_id at \$\.tool_use_id") as excinfo:
+        sanitize(raw, dest, CTX)
+
+    assert TOOL_A not in str(excinfo.value)
+    assert not dest.exists()
 
 
 def test_sanitize_fails_when_a_scenario_has_no_hook_records(tmp_path: Path) -> None:
@@ -1627,12 +2485,17 @@ def test_sanitize_rejects_duplicate_scenario_names(tmp_path: Path) -> None:
 def test_cli_defaults_to_the_current_machine(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    seen: list[tuple[LocalContext, bool]] = []
+    seen: list[tuple[LocalContext, bool, bool]] = []
 
     def fake_sanitize(
-        raw: Path, dest: Path, ctx: LocalContext, *, allow_content: bool = False
+        raw: Path,
+        dest: Path,
+        ctx: LocalContext,
+        *,
+        allow_content: bool = False,
+        allow_unisolated: bool = False,
     ) -> list[str]:
-        seen.append((ctx, allow_content))
+        seen.append((ctx, allow_content, allow_unisolated))
         return []
 
     monkeypatch.setattr(sanitize_module, "sanitize", fake_sanitize)
@@ -1645,7 +2508,13 @@ def test_cli_defaults_to_the_current_machine(
     args = ["--raw", str(tmp_path), "--dest", str(tmp_path / "f")]
     assert sanitize_module.main(args) == 0
     assert sanitize_module.main([*args, "--forbid", "acme", "--home-alias", "D:\\Users\\x"]) == 0
-    assert seen == [
+    assert sanitize_module.main([*args, "--allow-unisolated"]) == 0
+    assert [(content, unisolated) for _, content, unisolated in seen] == [
+        (False, False),
+        (False, False),
+        (False, True),
+    ]
+    assert seen[:2] == [
         (
             LocalContext(
                 home=str(Path.home()),
@@ -1655,6 +2524,7 @@ def test_cli_defaults_to_the_current_machine(
                 home_aliases=("C:\\Users\\SOMEON~1",),
                 forbid=("Some One", "one@corp.invalid"),
             ),
+            False,
             False,
         ),
         (
@@ -1666,6 +2536,7 @@ def test_cli_defaults_to_the_current_machine(
                 home_aliases=("D:\\Users\\x", "C:\\Users\\SOMEON~1"),
                 forbid=("acme", "Some One", "one@corp.invalid"),
             ),
+            False,
             False,
         ),
     ]
@@ -1682,5 +2553,11 @@ def test_module_runs_with_python_dash_m() -> None:
     )
 
     assert result.returncode == 0, result.stderr
-    for option in ("--workspace-root", "--forbid", "--home-alias", "--allow-content"):
+    for option in (
+        "--workspace-root",
+        "--forbid",
+        "--home-alias",
+        "--allow-content",
+        "--allow-unisolated",
+    ):
         assert option in result.stdout

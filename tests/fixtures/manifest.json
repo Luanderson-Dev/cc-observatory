@@ -1,0 +1,131 @@
+{
+  "claude_code_version": "2.1.296",
+  "collector_version": "0.162.0",
+  "captured_on": "2026-10-13",
+  "platform": "windows",
+  "isolated": true,
+  "telemetry_env": {
+    "CLAUDE_CODE_ENABLE_TELEMETRY": "1",
+    "CLAUDE_CODE_ENHANCED_TELEMETRY_BETA": "1",
+    "OTEL_METRICS_EXPORTER": "otlp",
+    "OTEL_LOGS_EXPORTER": "otlp",
+    "OTEL_TRACES_EXPORTER": "otlp",
+    "OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf",
+    "OTEL_EXPORTER_OTLP_METRICS_PROTOCOL": "http/protobuf",
+    "OTEL_EXPORTER_OTLP_LOGS_PROTOCOL": "http/protobuf",
+    "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL": "http/protobuf",
+    "OTEL_EXPORTER_OTLP_HEADERS": "",
+    "OTEL_RESOURCE_ATTRIBUTES": "",
+    "OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE": "delta",
+    "OTEL_METRIC_EXPORT_INTERVAL": "5000",
+    "OTEL_LOGS_EXPORT_INTERVAL": "1000",
+    "OTEL_TRACES_EXPORT_INTERVAL": "1000",
+    "OTEL_METRICS_INCLUDE_VERSION": "true",
+    "OTEL_LOG_USER_PROMPTS": "0",
+    "OTEL_LOG_ASSISTANT_RESPONSES": "0",
+    "OTEL_LOG_TOOL_DETAILS": "0",
+    "OTEL_LOG_TOOL_CONTENT": "0",
+    "OTEL_LOG_RAW_API_BODIES": "0",
+    "OTEL_EXPORTER_OTLP_ENDPOINT": "http://127.0.0.1:4318",
+    "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT": "http://127.0.0.1:4318/v1/metrics",
+    "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT": "http://127.0.0.1:4318/v1/logs",
+    "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT": "http://127.0.0.1:4318/v1/traces"
+  },
+  "scenarios": [
+    {
+      "name": "headless-tools-subagent",
+      "session_id": "f4f4dd94-c1a5-43c7-8d2c-51ccbed4df42",
+      "description": "Isolated capture (--setting-sources project,local, --strict-mcp-config, no auto memory, no claude.ai connectors, synthetic project CLAUDE.md). claude -p with Haiku: Read of an existing file and of a missing one (PostToolUseFailure), Bash ls allowed, a file write that is not allowed (PermissionRequest, denied in -p), an Explore subagent. http hooks plus an async command hook for SessionStart; metrics, events and traces on.",
+      "files": [
+        "hooks/headless-tools-subagent.jsonl",
+        "otlp/headless-tools-subagent/metrics.jsonl",
+        "otlp/headless-tools-subagent/logs.jsonl",
+        "otlp/headless-tools-subagent/traces.jsonl"
+      ]
+    },
+    {
+      "name": "headless-edit-commit-tasks",
+      "session_id": "56c47de8-5ba4-4d63-a803-50ae373a4e7d",
+      "description": "Isolated capture (--setting-sources project,local, --strict-mcp-config, no auto memory, no claude.ai connectors, synthetic project CLAUDE.md). claude -p: TaskCreate/TaskUpdate (TaskCreated, TaskCompleted), Write, Edit, git add and git commit in the workspace's own repository (lines_of_code, code_edit_tool.decision, commit.count).",
+      "files": [
+        "hooks/headless-edit-commit-tasks.jsonl",
+        "otlp/headless-edit-commit-tasks/metrics.jsonl",
+        "otlp/headless-edit-commit-tasks/logs.jsonl",
+        "otlp/headless-edit-commit-tasks/traces.jsonl"
+      ]
+    },
+    {
+      "name": "headless-api-error",
+      "session_id": "bd5f3300-c99e-4695-ba75-706cea910293",
+      "description": "Isolated capture (--setting-sources project,local, --strict-mcp-config, no auto memory, no claude.ai connectors, synthetic project CLAUDE.md). claude -p with an unknown model: StopFailure (error model_not_found) and the api_error event.",
+      "files": [
+        "hooks/headless-api-error.jsonl",
+        "otlp/headless-api-error/metrics.jsonl",
+        "otlp/headless-api-error/logs.jsonl",
+        "otlp/headless-api-error/traces.jsonl"
+      ]
+    },
+    {
+      "name": "headless-sessionstart-http-ignored",
+      "session_id": "c65fe9e1-7fe9-4bd8-ac70-c220e9609a90",
+      "description": "Isolated capture (--setting-sources project,local, --strict-mcp-config, no auto memory, no claude.ai connectors, synthetic project CLAUDE.md). SessionStart configured as an http hook (not supported): no SessionStart arrives and nothing is reported; the other events use http hooks.",
+      "files": [
+        "hooks/headless-sessionstart-http-ignored.jsonl"
+      ]
+    },
+    {
+      "name": "headless-async-command-transport",
+      "session_id": "b30e170c-9085-4404-a450-36a84069cecd",
+      "description": "Isolated capture (--setting-sources project,local, --strict-mcp-config, no auto memory, no claude.ai connectors, synthetic project CLAUDE.md). Every hook as an async command hook (curl, exec form). The Explore subagent ran in the background: PostToolUse(Agent) with status async_launched, the main Stop before the subagent finished, and the subagent's report arriving as UserPromptSubmit. Async delivery reordered events: PostToolUse(Agent) arrived before PreToolUse(Agent), and no SessionEnd arrived.",
+      "files": [
+        "hooks/headless-async-command-transport.jsonl",
+        "otlp/headless-async-command-transport/metrics.jsonl",
+        "otlp/headless-async-command-transport/logs.jsonl",
+        "otlp/headless-async-command-transport/traces.jsonl"
+      ]
+    },
+    {
+      "name": "interactive-permission-compact",
+      "session_id": "7c7c6a0f-6758-452b-9c0b-bab6c16fdde3",
+      "description": "Isolated capture (--setting-sources project,local, --strict-mcp-config, no auto memory, no claude.ai connectors, synthetic project CLAUDE.md). Interactive session in default permission mode driven through a pseudo-terminal: permission dialog approved (PermissionRequest, Notification permission_prompt about 6 s later), a second dialog denied with Esc (no closing hook event; telemetry tool_decision reject/user_reject), /compact (PreCompact, an internal SubagentStop and PostCompact, plus a SessionStart with source=compact delivered asynchronously, so its position varies), /exit (SessionEnd prompt_input_exit).",
+      "files": [
+        "hooks/interactive-permission-compact.jsonl",
+        "otlp/interactive-permission-compact/metrics.jsonl",
+        "otlp/interactive-permission-compact/logs.jsonl",
+        "otlp/interactive-permission-compact/traces.jsonl"
+      ]
+    },
+    {
+      "name": "interactive-elicitation-idle",
+      "session_id": "45f8c618-ce51-4b95-8ac2-045dcf4785a2",
+      "description": "Isolated capture (--setting-sources project,local, --strict-mcp-config, no auto memory, no claude.ai connectors, synthetic project CLAUDE.md). Interactive session: an MCP tool that requests elicitation, declined with Esc (Elicitation, Notification elicitation_dialog about 6 s later, ElicitationResult, Notification elicitation_response), then idle (Notification idle_prompt 60 s after Stop), then /exit.",
+      "files": [
+        "hooks/interactive-elicitation-idle.jsonl",
+        "otlp/interactive-elicitation-idle/metrics.jsonl",
+        "otlp/interactive-elicitation-idle/logs.jsonl",
+        "otlp/interactive-elicitation-idle/traces.jsonl"
+      ]
+    },
+    {
+      "name": "hooks-endpoint-down",
+      "session_id": "43388d78-5fae-4677-acc9-a2f6d791cb9e",
+      "description": "Isolated capture (--setting-sources project,local, --strict-mcp-config, no auto memory, no claude.ai connectors, synthetic project CLAUDE.md). http hooks pointing at a port with nothing listening: the session completes normally; hook_execution_complete reports num_non_blocking_error for each event. (In an exploratory run outside these fixtures, the transcript also got hook_non_blocking_error notices that were not sent to the model; see ADR 0011.)",
+      "files": [
+        "otlp/hooks-endpoint-down/metrics.jsonl",
+        "otlp/hooks-endpoint-down/logs.jsonl",
+        "otlp/hooks-endpoint-down/traces.jsonl"
+      ]
+    },
+    {
+      "name": "hooks-endpoint-timeout",
+      "session_id": "fb864447-5c82-447b-ae7a-b0a383e0dbd3",
+      "description": "Isolated capture (--setting-sources project,local, --strict-mcp-config, no auto memory, no claude.ai connectors, synthetic project CLAUDE.md). Hook server sleeping 10 s with a 1 s hook timeout: each http hook is cancelled after the timeout (hook_execution_complete num_cancelled, total_duration_ms about 1000).",
+      "files": [
+        "hooks/hooks-endpoint-timeout.jsonl",
+        "otlp/hooks-endpoint-timeout/metrics.jsonl",
+        "otlp/hooks-endpoint-timeout/logs.jsonl",
+        "otlp/hooks-endpoint-timeout/traces.jsonl"
+      ]
+    }
+  ]
+}

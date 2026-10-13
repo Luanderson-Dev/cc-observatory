@@ -1,11 +1,30 @@
 #!/usr/bin/env bash
-# Run `claude` as a fresh top-level session with telemetry sent to the capture collector.
+# Run `claude` as a fresh, isolated top-level session with telemetry sent to the capture
+# collector.
 #
 # COST: every run is a real Claude Code session that calls the Anthropic API, so it costs
 # a little money (cents with Haiku). Run it by hand only, never in CI.
 #
 # Usage: run_claude.sh <settings-file> <workspace> [claude args...]
 #
+# - Checks and prepares <workspace> with `python -m tools.capture.workspace prepare`
+#   (needs uv): it refuses a workspace inside a Claude Code scratchpad, under a
+#   CLAUDE.md, CLAUDE.local.md or .claude/ (on Windows your home has .claude/, so use a
+#   root outside it, such as C:/ccobs-capture/<run>; elsewhere /tmp/ccobs-capture/<run>),
+#   holding CLAUDE.local.md or .claude/, or inside a git repository other than its own;
+#   then it writes a synthetic CLAUDE.md so InstructionsLoaded still fires, as Project.
+#   A refused workspace (or a failure of that step) exits with status 3 before
+#   anything runs; other statuses are Claude Code's own.
+# - Isolates the session from your own Claude Code setup (CAPTURE_ISOLATION=1, the
+#   default): passes --setting-sources project,local (no user settings, hooks, plugins,
+#   CLAUDE.md, rules, skills or agents from ~/.claude), --strict-mcp-config (only the
+#   servers given with --mcp-config) and --no-chrome (no Claude in Chrome connection,
+#   which would add its own MCP server), and sets CLAUDE_CODE_DISABLE_AUTO_MEMORY=1 (auto
+#   memory loads whatever --setting-sources says) and ENABLE_CLAUDEAI_MCP_SERVERS=false
+#   (no claude.ai connectors). The --settings file below still loads: it is the
+#   command-line level of the settings, not one of the setting sources.
+#   CAPTURE_ISOLATION=0 loads your own setup and only refuses a scratchpad, for
+#   exploratory runs only; never turn such a run into fixtures.
 # - Unsets the CLAUDE* variables that a parent Claude Code session exports, so a run
 #   started from inside Claude Code is not treated as its child.
 # - Unsets the OTEL_LOG_* content flags, OTEL_RESOURCE_ATTRIBUTES (which could add
@@ -23,9 +42,40 @@ if [[ $# -lt 2 ]]; then
   exit 2
 fi
 
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+repo="$(cd "$here/../.." && pwd)"
 settings="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
-workspace="$2"
+workspace="$(cd "$2" && pwd -P)"
 shift 2
+native_workspace="$workspace"
+if command -v cygpath >/dev/null 2>&1; then
+  native_workspace="$(cygpath -w "$workspace")"
+fi
+
+# The odd expansions below keep empty arrays safe under `set -u` in bash 3.2 (macOS).
+isolation_args=()
+isolation_env=()
+case "${CAPTURE_ISOLATION:-1}" in
+  1)
+    prepare_args=(prepare "$native_workspace")
+    isolation_args=(--setting-sources project,local --strict-mcp-config --no-chrome)
+    isolation_env=(CLAUDE_CODE_DISABLE_AUTO_MEMORY=1 ENABLE_CLAUDEAI_MCP_SERVERS=false)
+    ;;
+  0)
+    prepare_args=(prepare --exploratory "$native_workspace")
+    echo "CAPTURE_ISOLATION=0: your own settings, hooks, plugins, memory and MCP servers" \
+      "load; do not turn this run into fixtures." >&2
+    ;;
+  *)
+    echo "CAPTURE_ISOLATION must be 1 (the default) or 0" >&2
+    exit 2
+    ;;
+esac
+
+refused=3  # The workspace was refused: nothing ran.
+if ! (cd "$repo" && uv run --quiet python -m tools.capture.workspace "${prepare_args[@]}"); then
+  exit "$refused"
+fi
 cd "$workspace"
 
 exec env \
@@ -64,4 +114,5 @@ exec env \
   OTEL_TRACES_EXPORT_INTERVAL=1000 \
   OTEL_METRICS_INCLUDE_VERSION=true \
   CLAUDE_CODE_OTEL_DIAG_STDERR=1 \
-  claude --settings "$settings" "$@"
+  ${isolation_env[@]+"${isolation_env[@]}"} \
+  claude --settings "$settings" ${isolation_args[@]+"${isolation_args[@]}"} "$@"
