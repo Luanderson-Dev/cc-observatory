@@ -49,11 +49,17 @@ GO_SERVICES: Final = frozenset({"otel-collector", "prometheus", "loki", "tempo",
 # debug override.
 BACKEND_ONLY: Final = frozenset({"prometheus", "loki", "tempo"})
 LOG_OPTIONS: Final = {"max-size": "10m", "max-file": "3"}
+# Above every daemon default seen (10 s upstream), so each service can shut down cleanly.
+MIN_STOP_GRACE_SECONDS: Final = 10
 # The pinned images are checked by repository and pin, not by version: Dependabot moves
 # their tags and digests (ADR 0020), never their repositories.
 # An exact version tag (x.y.z), with an optional v prefix and suffix such as -musl.
 VERSION_TAG: Final = re.compile(r"^v?\d+\.\d+\.\d+(?:-[a-z0-9]+)*$")
 LOKI_REPOSITORY: Final = "grafana/loki"
+TEMPO_REPOSITORY: Final = "grafana/tempo"
+# Optional services, by compose profile: Tempo, because tracing is a beta feature of
+# Claude Code and off by default (ADR 0003).
+OPTIONAL_SERVICES: Final = {"tempo": ["traces"]}
 BUSYBOX_REPOSITORY: Final = "busybox"
 CONTRIB_REPOSITORY: Final = "otel/opentelemetry-collector-contrib"
 # Prometheus stays on the 3.13 LTS line (ADR 0013); dependabot.yml lets only its patch
@@ -230,6 +236,18 @@ def test_service_has_a_healthcheck(name: str) -> None:
 @pytest.mark.parametrize("name", SERVICES)
 def test_service_restarts_unless_stopped(name: str) -> None:
     assert _services(COMPOSE)[name].get("restart") == "unless-stopped"
+
+
+@pytest.mark.parametrize("name", SERVICES)
+def test_service_has_an_explicit_stop_grace_period(name: str) -> None:
+    # Without it the Docker daemon's default-stop-timeout applies (10 s upstream, about
+    # 3 s measured on Docker Desktop 29.8), and a backend killed before it finishes
+    # replays its write-ahead log at the next start.
+    grace = _services(COMPOSE)[name].get("stop_grace_period")
+    assert isinstance(grace, str), f"{name} needs stop_grace_period"
+    match = re.fullmatch(r"(\d+)(s|m)", grace)
+    assert match, f"{name}: stop_grace_period {grace!r}"
+    assert int(match[1]) * {"s": 1, "m": 60}[match[2]] >= MIN_STOP_GRACE_SECONDS
 
 
 @pytest.mark.parametrize("name", SERVICES)
@@ -422,7 +440,7 @@ def test_built_service_uses_a_dockerfile_under_stack(name: str) -> None:
     assert (path / "Dockerfile").is_file()
 
 
-# What exists now (milestone 1, stage 7).
+# What exists now (milestone 1, stage 8).
 
 
 def test_compose_project_is_named_cc_observatory() -> None:
@@ -592,9 +610,64 @@ def test_debug_override_publishes_prometheus_on_loopback() -> None:
     assert _networks(override) == {"backend", "edge"}
 
 
+def test_compose_defines_tempo_from_the_pinned_image() -> None:
+    assert "tempo" in SERVICES
+    service = _services(COMPOSE)["tempo"]
+    _pinned_tag(service.get("image"), TEMPO_REPOSITORY, "tempo")
+    assert "build" not in service
+
+
+def test_tempo_reads_its_config_read_only_and_keeps_data_in_a_named_volume() -> None:
+    # /var/tempo is the image's data directory, owned by its user (10001), so the named
+    # volume starts with the right owner.
+    service = _services(COMPOSE)["tempo"]
+    assert service.get("volumes") == [
+        "./stack/tempo:/etc/ccobs/tempo:ro",
+        "tempo-data:/var/tempo",
+    ]
+    assert "tempo-data" in _mapping(_load(COMPOSE).get("volumes"), "volumes")
+    assert (STACK / "tempo" / "config.yaml").is_file()
+
+
+def test_tempo_healthcheck_uses_its_own_health_flag() -> None:
+    # The image has no shell or HTTP client; -health requests /ready on port 3200.
+    healthcheck = _mapping(_services(COMPOSE)["tempo"]["healthcheck"], "healthcheck")
+    assert healthcheck["test"] == ["CMD", "/tempo", "-health"]
+
+
+def test_tempo_memory_settings() -> None:
+    service = _services(COMPOSE)["tempo"]
+    assert service.get("mem_limit") == "512m"
+    assert _environment(service).get("GOMEMLIMIT") == "409MiB"
+
+
+def test_debug_override_publishes_tempo_on_loopback() -> None:
+    # Only the HTTP API (queries, /status/config and /ready); the OTLP receiver stays
+    # inside the backend network.
+    override = _services(COMPOSE_DEBUG)["tempo"]
+    assert override.get("ports") == ["127.0.0.1:${CCOBS_TEMPO_PORT:-4320}:3200"]
+    assert _networks(override) == {"backend", "edge"}
+
+
+@pytest.mark.parametrize("name", SERVICES)
+def test_only_the_optional_services_have_a_profile(name: str) -> None:
+    # `docker compose up -d` starts every other service.
+    profiles = _services(COMPOSE)[name].get("profiles")
+    assert (_strings(profiles, "profiles") if profiles else None) == OPTIONAL_SERVICES.get(name)
+
+
+@pytest.mark.parametrize("name", SERVICES)
+def test_no_service_depends_on_an_optional_service(name: str) -> None:
+    # Compose refuses to start a service whose dependency is in a profile that is off.
+    depends_on = _services(COMPOSE)[name].get("depends_on") or []
+    names = set(depends_on) if isinstance(depends_on, dict) else set(_strings(depends_on, name))
+    assert not names & set(OPTIONAL_SERVICES), f"{name} depends on {names}"
+
+
 def test_collector_starts_without_waiting_for_the_backends() -> None:
     # The collector is the OTLP entry point: it accepts telemetry at once and its
-    # exporters queue and retry while Prometheus and Loki start (ADR 0013, ADR 0015).
+    # exporters queue and retry while Prometheus, Loki and Tempo start (ADR 0013,
+    # ADR 0015), or drop traces while Tempo's profile is off.
     assert "depends_on" not in _services(COMPOSE)["otel-collector"]
 
 

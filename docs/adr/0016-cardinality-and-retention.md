@@ -86,11 +86,11 @@ metadata (ADR 0015).
 
 **Retention**, a default per backend, each changed through its variable:
 
-| Backend    | Default        | Variable                     | Applied by       |
-| ---------- | -------------- | ---------------------------- | ---------------- |
-| Prometheus | 90 days        | `CCOBS_PROMETHEUS_RETENTION` | TSDB retention   |
-| Loki       | 30 days (720h) | `CCOBS_LOKI_RETENTION`       | its compactor    |
-| Tempo      | 7 days         | `CCOBS_TEMPO_RETENTION`      | block retention  |
+| Backend    | Default          | Variable                     | Applied by         |
+| ---------- | ---------------- | ---------------------------- | ------------------ |
+| Prometheus | 90 days (`90d`)  | `CCOBS_PROMETHEUS_RETENTION` | TSDB retention     |
+| Loki       | 30 days (`720h`) | `CCOBS_LOKI_RETENTION`       | its compactor      |
+| Tempo      | 7 days (`168h`)  | `CCOBS_TEMPO_RETENTION`      | its backend worker |
 
 - Loki's retention lands with Loki: `retention_period` reads `CCOBS_LOKI_RETENTION`
   (`-config.expand-env=true`), which `compose.yaml` passes with the default `720h`.
@@ -98,10 +98,22 @@ metadata (ADR 0015).
   ([retention](https://grafana.com/docs/loki/latest/operations/storage/retention/)),
   but Loki 3.7.8 accepts other values without a warning, at `-verify-config` and at
   start; `.env.example` says so, and `ccobs doctor` (milestone 4) checks it.
-- The Prometheus and Tempo settings are configured when each backend joins the stack,
-  later in this milestone, with the value format each backend accepts. For Tempo, that
-  is its block retention (`block_retention`, default 336h); the exact key, which
-  depends on the Tempo version, is set when Tempo joins the stack.
+- Prometheus's retention is a flag: `compose.yaml` passes
+  `--storage.tsdb.retention.time=${CCOBS_PROMETHEUS_RETENTION:-90d}` on its command
+  line.
+- Tempo 3.1.0 applies retention in its backend worker, which runs the retention jobs
+  with `backend_worker.compaction.block_retention` (default 336h). The config sets it
+  to `${CCOBS_TEMPO_RETENTION:-168h}` (`-config.expand-env=true`), and `compose.yaml`
+  passes the variable. Tempo's configuration has a second copy of the key, under
+  `backend_scheduler.provider.compaction.compaction`, which only affects how the
+  scheduler selects compaction jobs and applies no retention; it stays unset. Tempo
+  runs only in the `traces` profile (ADR 0003).
+- Each variable takes its own backend's duration format, and `.env.example` says
+  which:
+    - Prometheus: its own units (`y`, `w`, `d`, `h`, `m`, `s`, `ms`), such as `90d`;
+    - Loki: a multiple of 24h, such as `720h` (above);
+    - Tempo: a Go duration, hours at most, such as `168h`. Tempo refuses `7d` while it
+      parses its configuration, and does not start.
 - Every variable has its default in the compose files and in `.env.example`, so
   setting one in `.env` is enough (ADR 0020). The app database's retention is separate
   ([ADR 0005](0005-sqlite-for-app-state.md), from v0.3.0).
@@ -116,8 +128,8 @@ metadata (ADR 0015).
   short `claude -p` sessions create many series. Retention bounds the total; a size cap
   for Prometheus is the next step if real use needs it.
 - Bad, because time-based retention does not bound disk for a very heavy user.
-- Bad, because the three variables accept different formats, and Loki's must be a
-  multiple of 24h.
+- Bad, because the three variables take different formats: Loki's must be a multiple
+  of 24h, and Tempo's a Go duration with no days, or Tempo does not start.
 - Neutral, because Loki deletes expired data some time after it expires: its compactor
   marks expired chunks every 15 minutes (`apply_retention_interval`) and deletes them 2
   hours later (`retention_delete_delay`).
@@ -133,8 +145,15 @@ metadata (ADR 0015).
   `.env.example` with the same value.
 - `tests/integration/test_stack_logs.py` reads Loki's `/config` and finds 30 days of
   retention, and finds no session, prompt, event or trace field among the index labels.
-- Tests for the Prometheus and Tempo retention settings arrive with those backends,
-  later in this milestone.
+- `tests/test_prometheus_config.py` checks that `--storage.tsdb.retention.time` comes
+  from `CCOBS_PROMETHEUS_RETENTION` with the default `90d`, and
+  `tests/test_tempo_config.py` that `backend_worker.compaction.block_retention` comes
+  from `CCOBS_TEMPO_RETENTION` with the default `168h`, a Go duration, and that the
+  config sets no other `block_retention`. The CI `stack` job runs Tempo's
+  `-config.verify=true` on its config.
+- `tests/integration/test_stack_metrics.py` finds `90d` in Prometheus's flags, and
+  `tests/integration/test_stack_traces.py` finds `168h0m0s` as the backend worker's
+  block retention in Tempo's `/status/config`.
 - CLI tests (milestone 4) check that `ccobs setup` never sets
   `OTEL_METRICS_INCLUDE_SESSION_ID=false` and that `ccobs doctor` warns when it is
   `false` and when `CCOBS_LOKI_RETENTION` is not a multiple of 24h.
@@ -148,7 +167,8 @@ metadata (ADR 0015).
 - Loki: [retention](https://grafana.com/docs/loki/latest/operations/storage/retention/)
   and [cardinality](https://grafana.com/docs/loki/latest/get-started/labels/cardinality/).
 - Tempo: [configuration](https://grafana.com/docs/tempo/latest/configuration/)
-  (`block_retention`).
+  (`backend_worker`, `block_retention`); in the 3.1.0 source, the worker's retention
+  job (`modules/backendworker/backendworker.go`) and `tempodb/retention.go`.
 - Claude Code [monitoring docs](https://code.claude.com/docs/en/monitoring-usage):
   `OTEL_METRICS_INCLUDE_SESSION_ID`.
 - Revisit if real use shows many more series per session than estimated, if users ask

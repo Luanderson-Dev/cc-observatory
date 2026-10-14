@@ -25,7 +25,7 @@ from typing import Final
 
 PROJECT: Final = "ccobs-it"
 COMPOSE_FILES: Final = ("compose.yaml", "compose.debug.yaml")
-# Profiles of optional services; a profile that no service uses yet is harmless.
+# Profiles of optional services: traces runs Tempo (ADR 0003).
 PROFILES: Final = ("traces",)
 ENV_FILE: Final = ".env.example"
 DEFAULT_PORTS: Final[Mapping[str, int]] = MappingProxyType(

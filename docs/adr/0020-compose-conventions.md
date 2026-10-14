@@ -96,6 +96,15 @@ works on the minimum Docker versions below and is handled by Dependabot.
   recommend; and the collector's `memory_limiter` processor, first in every pipeline
   and set as a percentage of the limit. The numbers are measured in a later stage of
   this milestone.
+- **Shutdown.** An explicit `stop_grace_period` on every service: 30 s, from the shared
+  settings, so that each one can stop cleanly after SIGTERM before Docker kills it.
+  Without it, the daemon's `default-stop-timeout` applies, which differs between
+  installs: 10 s upstream, about 3 s measured on Docker Desktop 29.8. A backend killed
+  mid-shutdown replays its write-ahead log at the next start. A service that exits
+  sooner does not wait. Tempo has 15 s, and its config shortens the backend worker's
+  `finish_on_shutdown_timeout` to 5 s: in Tempo 3.1.0 the worker keeps asking the
+  stopped scheduler for jobs until that timeout runs out, and the upstream 30 s would
+  outlast the grace period.
 - **Images.** Every image, in `compose.yaml` and in Dockerfile `FROM` lines, is
   `name:exact-tag@sha256:<multi-arch index digest>`. The tag says what runs and the
   digest makes it immutable, because a tag can be re-published upstream, as the
@@ -178,7 +187,9 @@ works on the minimum Docker versions below and is handled by Dependabot.
   `pull_policy: build`; pinned `FROM` lines in every Dockerfile, and the collector's
   derived image from the pinned contrib and busybox images; a memory limit, with
   `GOMEMLIMIT` at 70 to 90% of it in the Go services; a healthcheck; the log rotation
-  options; `no-new-privileges` and `cap_drop: [ALL]`; no `container_name`; read-only
+  options; an explicit `stop_grace_period`, with Tempo's above its
+  `finish_on_shutdown_timeout` (`tests/test_tempo_config.py`); `no-new-privileges` and
+  `cap_drop: [ALL]`; no `container_name`; read-only
   configuration directories under `stack/` and data on declared named volumes;
   `name: cc-observatory`; and a default for every variable, listed in `.env.example`
   with the same value.

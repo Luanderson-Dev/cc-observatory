@@ -39,6 +39,7 @@ ROOT: Final = Path(__file__).resolve().parents[1]
 CONFIG: Final = ROOT / "stack" / "otel-collector" / "config.yaml"
 COMPOSE: Final = ROOT / "compose.yaml"
 LOKI_CONFIG: Final = ROOT / "stack" / "loki" / "config.yaml"
+TEMPO_CONFIG: Final = ROOT / "stack" / "tempo" / "config.yaml"
 
 IDENTITY: Final = "transform/identity"
 CONTENT_FILTER: Final = "filter/content"
@@ -80,8 +81,16 @@ OTHER_PROMETHEUS_EXPORTERS: Final = frozenset(
 )
 # The pre-0.162.0 names, now deprecated aliases.
 DEPRECATED_TYPES: Final = frozenset({"deltatocumulative", "otlphttp"})
+# Traces go to Tempo's OTLP/HTTP receiver; the exporter appends /v1/traces. Tempo only
+# runs in the traces profile (ADR 0003).
+TEMPO_EXPORTER: Final = "otlp_http/tempo"
+TEMPO_ENDPOINT: Final = "http://tempo:4318"
+# While Tempo is off, the traces exporter drops what it gets within a minute and holds
+# at most this many requests, so traces never pile up in the collector's memory.
+MAX_TEMPO_QUEUE_REQUESTS: Final = 200
+MAX_TEMPO_RETRY_SECONDS: Final = 60
 # The exporters that push to the stack's backends over the internal network.
-BACKEND_EXPORTERS: Final = (LOKI_EXPORTER, PROMETHEUS_EXPORTER)
+BACKEND_EXPORTERS: Final = (LOKI_EXPORTER, PROMETHEUS_EXPORTER, TEMPO_EXPORTER)
 # Where the collector serves its own metrics (otelcol_*) for Prometheus to scrape: every
 # interface of its container, since Prometheus runs in another one; never published.
 TELEMETRY_ADDRESS: Final = "0.0.0.0:8888"
@@ -421,6 +430,73 @@ def test_delta_to_cumulative_is_only_in_metrics_pipelines() -> None:
             assert DELTA_TO_CUMULATIVE not in pipeline["processors"], name
 
 
+def _tempo_exporter() -> dict[str, object]:
+    exporters = _section("exporters")
+    assert TEMPO_EXPORTER in exporters, f"no {TEMPO_EXPORTER} exporter"
+    return exporters[TEMPO_EXPORTER]
+
+
+def _seconds(duration: object) -> float:
+    """A collector duration such as ``500ms``, ``30s`` or ``1m`` in seconds."""
+    assert isinstance(duration, str), f"expected a duration, got {duration!r}"
+    match = re.fullmatch(r"(\d+)(ms|s|m|h)", duration)
+    assert match, f"unexpected duration {duration!r}"
+    return int(match[1]) * {"ms": 0.001, "s": 1, "m": 60, "h": 3600}[match[2]]
+
+
+def test_traces_go_to_tempo_through_its_otlp_receiver() -> None:
+    traces = [name for name in PIPELINES if _signal(name) == "traces"]
+    assert traces == ["traces"]
+    assert _pipelines()["traces"]["exporters"] == [TEMPO_EXPORTER]
+    exporter = _tempo_exporter()
+    assert exporter.get("endpoint") == TEMPO_ENDPOINT
+    # The default traces path (<endpoint>/v1/traces) is Tempo's receiver path.
+    assert "traces_endpoint" not in exporter
+
+
+def test_tempo_endpoint_matches_the_compose_service_and_its_receiver() -> None:
+    endpoint = urlsplit(TEMPO_ENDPOINT)
+    compose = _mapping(yaml.safe_load(COMPOSE.read_text(encoding="utf-8")), "compose")
+    assert endpoint.hostname in _mapping(compose["services"], "services")
+    tempo = _mapping(yaml.safe_load(TEMPO_CONFIG.read_text(encoding="utf-8")), "tempo config")
+    distributor = _mapping(tempo.get("distributor"), "distributor")
+    receivers = _mapping(distributor.get("receivers"), "distributor.receivers")
+    protocols = _mapping(_mapping(receivers.get("otlp"), "otlp").get("protocols"), "protocols")
+    http = _mapping(protocols.get("http"), "otlp.protocols.http")
+    assert str(http.get("endpoint")).rsplit(":", 1)[-1] == str(endpoint.port)
+
+
+def test_tempo_exporter_is_only_in_traces_pipelines() -> None:
+    # Tempo only stores traces.
+    for name, pipeline in _pipelines().items():
+        if _signal(name) != "traces":
+            assert TEMPO_EXPORTER not in pipeline["exporters"], name
+
+
+def test_tempo_exporter_drops_traces_quickly_while_tempo_is_off() -> None:
+    # Tempo is optional (the traces profile). When it is not running the name tempo does
+    # not resolve, and traces must leave the collector soon instead of filling its memory.
+    exporter = _tempo_exporter()
+    queue = _mapping(exporter.get("sending_queue"), "sending_queue")
+    size = queue.get("queue_size")
+    assert isinstance(size, int)
+    assert 0 < size <= MAX_TEMPO_QUEUE_REQUESTS
+    retry = _mapping(exporter.get("retry_on_failure"), "retry_on_failure")
+    max_elapsed = _seconds(retry.get("max_elapsed_time"))
+    assert 0 < max_elapsed <= MAX_TEMPO_RETRY_SECONDS
+    assert _seconds(retry.get("max_interval")) <= max_elapsed
+    # A Tempo that accepts the connection and then hangs holds a consumer at most this
+    # long per attempt.
+    assert 0 < _seconds(exporter.get("timeout")) <= max_elapsed
+
+
+def test_every_exporter_is_used_by_a_pipeline() -> None:
+    # No leftover placeholder (the nop exporter held traces until Tempo arrived).
+    used = {name for pipeline in _pipelines().values() for name in pipeline["exporters"]}
+    assert set(_section("exporters")) == used
+    assert "nop" not in {_component_type(name) for name in _section("exporters")}
+
+
 def test_no_component_uses_a_deprecated_name() -> None:
     for section in ("receivers", "processors", "exporters", "extensions"):
         types = {_component_type(name) for name in _section(section)}
@@ -429,8 +505,9 @@ def test_no_component_uses_a_deprecated_name() -> None:
 
 @pytest.mark.parametrize("name", BACKEND_EXPORTERS)
 def test_backend_exporters_need_no_credentials_inside_the_backend_network(name: str) -> None:
-    # Loki and Prometheus run without authentication on the internal backend network:
-    # plain HTTP, no headers, no authenticator and no TLS settings to keep in step.
+    # Loki, Prometheus and Tempo run without authentication on the internal backend
+    # network: plain HTTP, no headers, no authenticator and no TLS settings to keep in
+    # step.
     exporter = _section("exporters").get(name)
     assert exporter is not None, f"no {name} exporter"
     assert not set(exporter) & {"headers", "auth", "tls"}

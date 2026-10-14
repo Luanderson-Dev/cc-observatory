@@ -1,6 +1,7 @@
 # cc-observatory: the local observability stack for Claude Code.
 #
 #   docker compose up -d
+#   docker compose --profile traces up -d    # also Tempo, for Claude Code's beta traces
 #
 # Every published port binds to 127.0.0.1 (ADR 0001) and can be moved with the
 # variable named next to it; copying .env.example to .env is optional. Storage
@@ -12,6 +13,11 @@ name: cc-observatory
 # Settings shared by every service.
 x-service: &service
   restart: unless-stopped
+  # Time to shut down cleanly after SIGTERM before Docker kills the container. Explicit,
+  # because the daemon's default differs (10 s upstream, about 3 s on Docker Desktop
+  # 29.8), and a backend killed mid-shutdown replays its write-ahead log at the next
+  # start. A service that exits sooner does not wait.
+  stop_grace_period: 30s
   security_opt:
     - no-new-privileges:true
   cap_drop:
@@ -128,6 +134,47 @@ services:
     networks:
       - backend
 
+  # Stores Claude Code's traces, pushed by the collector to Tempo's OTLP receiver. Only
+  # in the traces profile, since tracing is a beta feature of Claude Code and off by
+  # default (ADR 0003): docker compose --profile traces up -d. Only on the internal
+  # backend network, with no published port; compose.debug.yaml publishes its HTTP API
+  # on loopback.
+  tempo:
+    <<: *service
+    image: grafana/tempo:3.1.0@sha256:3076b8dcdfb32fd6bc5ccef85e7b7313e6199b9cb84366257fc17ecb696db5fd
+    profiles:
+      - traces
+    command:
+      - -config.file=/etc/ccobs/tempo/config.yaml
+      - -config.expand-env=true
+    volumes:
+      - ./stack/tempo:/etc/ccobs/tempo:ro
+      - tempo-data:/var/tempo
+    mem_limit: 512m
+    environment:
+      # About 80% of mem_limit, so the Go runtime collects garbage before the limit.
+      GOMEMLIMIT: 409MiB
+      # How long traces are kept, as a Go duration (168h is 7 days; ADR 0016).
+      CCOBS_TEMPO_RETENTION: ${CCOBS_TEMPO_RETENTION:-168h}
+    healthcheck:
+      # The image has no shell or HTTP client; -health requests /ready on port 3200,
+      # which answers once every module has started. The longer start_period leaves room
+      # to replay the write-ahead log.
+      test: ["CMD", "/tempo", "-health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+      start_interval: 2s
+    # Tempo exits cleanly on SIGTERM within about 5 s because its backend worker's
+    # finish_on_shutdown_timeout is short (stack/tempo/config.yaml); with the upstream
+    # default (30s) it would outlast a grace period and be killed (exit 137). Its own
+    # grace period, shorter than the shared one, stays well above that timeout.
+    stop_grace_period: 15s
+    networks:
+      - backend
+
 volumes:
   prometheus-data: {}
   loki-data: {}
+  tempo-data: {}

@@ -7,19 +7,22 @@ reads ``.env.example``, never the repository's ``.env``, and inherited ``CCOBS_*
 can move with ``CCOBS_IT_<NAME>``, such as ``CCOBS_IT_OTLP_HTTP_PORT=34318``.
 
 The project is removed with its volumes at the end of the session, unless
-``CCOBS_IT_KEEP=1``. Run with ``uv run pytest -m integration --no-cov``; Docker must be
-running.
+``CCOBS_IT_KEEP=1``; the next session then reuses its containers, and ``service_logs``
+only returns what they logged since that session started. Run with
+``uv run pytest -m integration --no-cov``; Docker must be running.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import warnings
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Final
 
@@ -42,15 +45,20 @@ WAIT_TIMEOUT: Final = 180
 UP_TIMEOUT: Final = 900
 DOWN_TIMEOUT: Final = 300
 COMMAND_TIMEOUT: Final = 120
+# A timestamp as `docker info` writes the daemon's time and `docker compose logs --since`
+# reads it.
+RFC3339: Final = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})")
 
 
 @dataclass(frozen=True)
 class Stack:
-    """The ``ccobs-it`` project and how to drive it."""
+    """The ``ccobs-it`` project and how to drive it. ``since`` is when the test session
+    started (RFC 3339), by the clock that stamps the container logs."""
 
     docker: str
     env: Mapping[str, str]
     ports: Mapping[str, int]
+    since: str
 
     def compose(
         self, *args: str, check: bool = True, timeout: float = COMMAND_TIMEOUT
@@ -78,8 +86,10 @@ class Stack:
         return result
 
     def logs(self, service: str) -> str:
-        """The container logs of ``service``."""
-        result = self.compose("logs", "--no-color", service)
+        """The container logs of ``service`` since the test session started. With
+        ``CCOBS_IT_KEEP=1``, `up` reuses the containers of an earlier session, whose
+        lines (errors from stopping a backend, say) would otherwise come back too."""
+        result = self.compose("logs", "--no-color", "--since", self.since, service)
         return result.stdout + result.stderr
 
     def health(self, service: str) -> str:
@@ -127,6 +137,24 @@ def _docker() -> str:
     return docker
 
 
+def _daemon_now(docker: str) -> str:
+    """Now by the Docker daemon's clock, which stamps the container logs: on Docker
+    Desktop it is the VM's clock, which can drift from this machine's (WSL2 clocks
+    drift after sleep). This machine's clock if the daemon gives no usable time."""
+    # S603: as in Stack.compose, the executable comes from shutil.which.
+    info = subprocess.run(  # noqa: S603
+        [docker, "info", "--format", "{{.SystemTime}}"],
+        capture_output=True,
+        text=True,
+        timeout=COMMAND_TIMEOUT,
+        check=False,
+    )
+    now = info.stdout.strip()
+    if info.returncode == 0 and RFC3339.fullmatch(now):
+        return now
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
 def _diagnostics(running: Stack) -> str:
     """``ps`` and ``logs`` of the project, for a failed start; never raises."""
     parts: list[str] = []
@@ -168,7 +196,13 @@ def stack() -> Iterator[Stack]:
         chosen = ports(os.environ)
     except ValueError as error:
         pytest.fail(f"invalid port override: {error}", pytrace=False)
-    running = Stack(docker=_docker(), env=compose_environment(os.environ, chosen), ports=chosen)
+    docker = _docker()
+    running = Stack(
+        docker=docker,
+        env=compose_environment(os.environ, chosen),
+        ports=chosen,
+        since=_daemon_now(docker),
+    )
     keep = os.environ.get(KEEP_VARIABLE) == "1"
     # Everything from `up` on is inside the try: a timeout or Ctrl+C during `up` still
     # removes the containers, which `restart: unless-stopped` would bring back forever.
@@ -204,7 +238,7 @@ def service_health(stack: Stack) -> Callable[[str], str]:
 
 @pytest.fixture(scope="session")
 def service_logs(stack: Stack) -> Callable[[str], str]:
-    """The container logs of a service."""
+    """The container logs of a service since the test session started."""
     return stack.logs
 
 

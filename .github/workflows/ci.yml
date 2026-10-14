@@ -123,7 +123,7 @@ jobs:
   # with `up --build` (tests/integration/conftest.py, ADR 0018).
   #
   # Images are pulled from Docker Hub without logging in: 100 pulls per 6 hours per IP
-  # address, about 4 per run. No Docker Hub token is stored; if pulls ever fail with
+  # address, about 5 per run. No Docker Hub token is stored; if pulls ever fail with
   # `toomanyrequests`, the images move to another registry instead.
   stack:
     name: Stack configs and integration tests
@@ -149,11 +149,14 @@ jobs:
           docker compose version
           docker buildx version
 
-      # No .env file, as in a fresh clone: every variable takes its default.
+      # No .env file, as in a fresh clone: every variable takes its default. With and
+      # without the traces profile, which adds Tempo.
       - name: Validate the compose files
         run: |
           docker compose config --quiet
+          docker compose --profile traces config --quiet
           docker compose -f compose.yaml -f compose.debug.yaml config --quiet
+          docker compose -f compose.yaml -f compose.debug.yaml --profile traces config --quiet
 
       # Builds the derived collector image (stack/otel-collector/Dockerfile) for the next
       # step; the integration tests' `up --build` then reuses it from the build cache.
@@ -188,7 +191,10 @@ jobs:
           check prometheus /bin/promtool check config /etc/ccobs/prometheus/prometheus.yaml
           check loki /usr/bin/loki -config.file=/etc/ccobs/loki/config.yaml -config.expand-env=true -verify-config
           check otel-collector /otelcol-contrib validate --config=/etc/ccobs/otel-collector/config.yaml
-          # Tempo and Grafana join in later stages of milestone 1: one `check` line each, here.
+          # Tempo's -config.* switches need an explicit =true; -config.verify also fails on
+          # Tempo's configuration warnings.
+          check tempo /tempo -config.file=/etc/ccobs/tempo/config.yaml -config.expand-env=true -config.verify=true
+          # Grafana joins in a later stage of milestone 1: one `check` line, here.
 
       - name: Install the project
         run: uv sync --locked

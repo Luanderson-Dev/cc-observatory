@@ -555,8 +555,10 @@ def test_prometheus_logs_no_errors(
 ) -> None:
     assert delta.runs
     assert cumulative.runs
+    # Only this session's lines. They can be none: Prometheus logs nothing while it works,
+    # and with CCOBS_IT_KEEP=1 the session reuses a container that started earlier. A
+    # failing `docker compose logs` fails the test.
     logs = service_logs(PROMETHEUS)
-    assert logs.strip(), "Prometheus logged nothing at all"
     errors = [line for line in logs.splitlines() if re.search(r"level=error", line, re.I)]
     assert not errors, "\n".join(errors[:5])
 
