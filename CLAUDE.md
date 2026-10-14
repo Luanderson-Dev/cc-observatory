@@ -56,8 +56,9 @@ tests, loosening ruff or mypy).
     - never rewrite published history or delete published tags;
     - force push only on your own feature branch, with `--force-with-lease`.
 - Merge through PRs with `gh`, not with `git flow ... finish`:
-    - feature → `develop`: **squash**. The PR title becomes the changelog line, so it
-      must describe the whole delivery in Conventional Commits (CI checks it);
+    - feature → `develop`: **squash**. The PR title becomes the commit on `develop`, and
+      `feat`, `fix`, `refactor` and `perf` titles become changelog lines, so it must
+      describe the whole delivery in Conventional Commits (CI checks it);
     - release → `main` and the back-merge `main` → `develop`: **merge commit**, never squash.
 - CI validates every PR title with `cz check --allowed-prefixes`: it must be a
   Conventional Commit, and the default bypass for `Merge`, `Revert`, `fixup!` and
@@ -77,11 +78,18 @@ tests, loosening ruff or mypy).
   `git switch develop && git pull`. Always pass `--subject`: without it, a
   single-commit PR is squashed with the commit message instead of the PR title.
 - Release:
-    1. `uv run cz bump --dry-run` to confirm the version suggested by the commits.
+    1. `git fetch --tags` and `git describe --tags --abbrev=0` (the latest tag must be
+       there, or Commitizen counts the whole history), then
+       `uv run cz bump --dry-run --yes` to confirm the version suggested by the commits
+       (`--yes` answers Commitizen's prompts, which crash without a TTY in Git Bash).
     2. `git flow release start X.Y.Z`, `uv version X.Y.Z`,
        `uv run cz changelog --incremental --unreleased-version vX.Y.Z`, commit
-       `bump: version X.Y.Z`.
-    3. PR to `main` with `gh pr create --base main --title "bump: version X.Y.Z"`,
+       `bump: version X.Y.Z`. On Windows, prefix the changelog command with
+       `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.eol GIT_CONFIG_VALUE_0=lf`, or Commitizen
+       writes CRLF line endings. In the same commit, update the Status section and the
+       roadmap row in both READMEs and the "Current:" line in this file.
+    3. `git push -u origin release/X.Y.Z`, then a PR to `main` with
+       `gh pr create --base main --title "bump: version X.Y.Z"`,
        green CI, `gh pr merge --merge`.
     4. On the updated `main`: `git tag -a vX.Y.Z -m "vX.Y.Z"`, push the tag (this runs
        `release.yml`, which publishes to PyPI by trusted publishing),
@@ -218,4 +226,4 @@ docs/adr/         architecture decision records (MADR)
 | 6         | v0.7.0  | Grafana dashboards and polish                                                          |
 | 7         | v1.0.0  | Distribution: GHCR multi-arch images, release hardening, contributor docs              |
 
-Current: milestone 0.
+Current: milestone 1 (milestone 0 released as v0.1.0).

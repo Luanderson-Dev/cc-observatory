@@ -6,25 +6,27 @@ and cost, on your own machine.
 [Leia em português](https://github.com/Luanderson-Dev/cc-observatory/blob/main/README.pt-BR.md)
 
 [![CI](https://github.com/Luanderson-Dev/cc-observatory/actions/workflows/ci.yml/badge.svg?branch=develop)](https://github.com/Luanderson-Dev/cc-observatory/actions/workflows/ci.yml?query=branch%3Adevelop)
+[![PyPI](https://img.shields.io/pypi/v/cc-observatory)](https://pypi.org/project/cc-observatory/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](https://github.com/Luanderson-Dev/cc-observatory/blob/main/LICENSE)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue)](https://www.python.org/downloads/)
 
 ## Status
 
-**Pre-alpha.** cc-observatory is in milestone 0 of 8 (foundation). There is nothing
-useful to install yet.
+**Pre-alpha.** v0.1.0 is the first release and closes milestone 0 of 8 (foundation).
+There is still nothing useful to install.
 
-What exists today:
+What v0.1.0 contains:
 
 - the repository foundation: the Python package `cc-observatory` (import package
-  `ccobs`) with a `ccobs` CLI that only prints its version;
+  `ccobs`), published to [PyPI](https://pypi.org/project/cc-observatory/), with a
+  `ccobs` CLI that only prints its version;
 - tooling: uv, ruff, mypy in strict mode, pytest with a coverage gate, pre-commit and
   Commitizen;
 - CI on GitHub Actions: lint, type checks and tests on Linux, macOS and Windows, a
   package build, a Conventional Commits check on PR titles, and a release workflow that
   publishes to PyPI with trusted publishing;
-- architecture decision records (ADRs) for the decisions made so far, including how
-  hooks reach the app
+- architecture decision records (ADRs) 0001 to 0012 for the decisions made so far,
+  including how hooks reach the app
   ([ADR 0011](https://github.com/Luanderson-Dev/cc-observatory/blob/main/docs/adr/0011-hook-delivery-http-plus-async-sessionstart.md))
   and what Claude Code 2.1.296 really sends in its telemetry and hooks
   ([ADR 0012](https://github.com/Luanderson-Dev/cc-observatory/blob/main/docs/adr/0012-observed-telemetry-and-hook-contract.md));
@@ -32,9 +34,8 @@ What exists today:
   sanitized test fixtures recorded from real, isolated Claude Code sessions
   (`tests/fixtures/`).
 
-What comes next: the first PyPI release (v0.1.0), which closes milestone 0, then the
-observability stack in Docker Compose with a provisioned Grafana (v0.2.0). The full plan
-is in the roadmap below.
+What comes next: milestone 1 (v0.2.0), the observability stack in Docker Compose with a
+provisioned Grafana. The full plan is in the roadmap below.
 
 Unless a section says otherwise, the rest of this README describes the planned design.
 
@@ -173,7 +174,7 @@ vulnerability.
 
 | Milestone | Release | Scope                                                                                  | Status      |
 | --------- | ------- | -------------------------------------------------------------------------------------- | ----------- |
-| 0         | v0.1.0  | Foundation, tooling, CI, ADRs, telemetry and hooks spike, fixtures, first PyPI release | In progress |
+| 0         | v0.1.0  | Foundation, tooling, CI, ADRs, telemetry and hooks spike, fixtures, first PyPI release | Released    |
 | 1         | v0.2.0  | Observability stack in compose, provisioned Grafana                                    | Planned     |
 | 2         | v0.3.0  | Hook ingestion, session state machine, SQLite, blocks, `/metrics`                      | Planned     |
 | 3         | v0.4.0  | Web UI (HTMX + SSE)                                                                    | Planned     |
@@ -197,7 +198,8 @@ uv run pre-commit run --all-files  # every check that the CI lint job runs
 - The project uses Gitflow. `develop` is the default branch: feature pull requests
   target `develop` and are squash-merged, and release pull requests go to `main` with
   merge commits.
-- The title of a feature pull request becomes its changelog line, so every PR title must
+- The title of a feature pull request becomes its commit on `develop` (and, for `feat`,
+  `fix`, `refactor` and `perf`, a changelog line), so every PR title must
   be a [Conventional Commit](https://www.conventionalcommits.org/) (for example,
   `feat: add the session state machine`). CI checks it.
 - A contributor guide comes with v1.0.0.

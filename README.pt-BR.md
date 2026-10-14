@@ -6,25 +6,27 @@ tokens e custo na sua própria máquina.
 [Read in English](README.md)
 
 [![CI](https://github.com/Luanderson-Dev/cc-observatory/actions/workflows/ci.yml/badge.svg?branch=develop)](https://github.com/Luanderson-Dev/cc-observatory/actions/workflows/ci.yml?query=branch%3Adevelop)
+[![PyPI](https://img.shields.io/pypi/v/cc-observatory)](https://pypi.org/project/cc-observatory/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue)](https://www.python.org/downloads/)
 
 ## Status
 
-**Pré-alfa.** O cc-observatory está no milestone 0 de 8 (fundação). Ainda não há nada
-útil para instalar.
+**Pré-alfa.** A v0.1.0 é a primeira release e fecha o milestone 0 de 8 (fundação).
+Ainda não há nada útil para instalar.
 
-O que já existe:
+O que a v0.1.0 traz:
 
 - a fundação do repositório: o pacote Python `cc-observatory` (pacote de importação
-  `ccobs`) com uma CLI `ccobs` que só mostra a própria versão;
+  `ccobs`), publicado no [PyPI](https://pypi.org/project/cc-observatory/), com uma CLI
+  `ccobs` que só mostra a própria versão;
 - o ferramental: uv, ruff, mypy em modo estrito, pytest com cobertura mínima, pre-commit
   e Commitizen;
 - CI no GitHub Actions: lint, checagem de tipos e testes em Linux, macOS e Windows, build
   do pacote, checagem de Conventional Commits nos títulos de PR e um workflow de release
   que publica no PyPI por trusted publishing;
-- registros de decisão de arquitetura (ADRs) para as decisões tomadas até agora,
-  incluindo como os hooks chegam ao app
+- os registros de decisão de arquitetura (ADRs) 0001 a 0012, com as decisões tomadas
+  até agora, incluindo como os hooks chegam ao app
   ([ADR 0011](docs/adr/0011-hook-delivery-http-plus-async-sessionstart.md), em inglês)
   e o que o Claude Code 2.1.296 realmente envia na telemetria e nos hooks
   ([ADR 0012](docs/adr/0012-observed-telemetry-and-hook-contract.md), em inglês);
@@ -32,9 +34,8 @@ O que já existe:
   pacote) e fixtures de teste sanitizadas, gravadas a partir de sessões reais e isoladas
   do Claude Code (`tests/fixtures/`).
 
-O que vem a seguir: a primeira release no PyPI (v0.1.0), que fecha o milestone 0, e,
-depois, a stack de observabilidade no Docker Compose com um Grafana provisionado
-(v0.2.0). O plano completo está no roteiro mais abaixo.
+O que vem a seguir: o milestone 1 (v0.2.0), a stack de observabilidade no Docker
+Compose com um Grafana provisionado. O plano completo está no roteiro mais abaixo.
 
 Salvo indicação em contrário, o restante deste README descreve o projeto planejado.
 
@@ -180,7 +181,7 @@ relatar uma vulnerabilidade.
 
 | Milestone | Release | Escopo                                                                                           | Status       |
 | --------- | ------- | ------------------------------------------------------------------------------------------------ | ------------ |
-| 0         | v0.1.0  | Fundação, ferramental, CI, ADRs, spike de telemetria e hooks, fixtures, primeira release no PyPI | Em andamento |
+| 0         | v0.1.0  | Fundação, ferramental, CI, ADRs, spike de telemetria e hooks, fixtures, primeira release no PyPI | Lançado      |
 | 1         | v0.2.0  | Stack de observabilidade no compose, Grafana provisionado                                        | Planejado    |
 | 2         | v0.3.0  | Ingestão de hooks, máquina de estados da sessão, SQLite, bloqueios, `/metrics`                   | Planejado    |
 | 3         | v0.4.0  | Interface web (HTMX + SSE)                                                                       | Planejado    |
@@ -205,8 +206,9 @@ uv run pre-commit run --all-files  # todas as checagens do job de lint do CI
 - O projeto usa Gitflow. `develop` é a branch padrão: os pull requests de feature têm
   `develop` como destino e são integrados com squash, e os pull requests de release vão
   para a `main` com merge commit.
-- O título de um pull request de feature vira a linha dele no changelog, então todo
-  título de PR precisa ser um
+- O título de um pull request de feature vira o commit dele na `develop` (e, para `feat`,
+  `fix`, `refactor` e `perf`, uma linha no changelog), então todo título de PR precisa
+  ser um
   [Conventional Commit](https://www.conventionalcommits.org/) (por exemplo,
   `feat: add the session state machine`). O CI confere isso.
 - Um guia para contribuidores chega com a v1.0.0.
