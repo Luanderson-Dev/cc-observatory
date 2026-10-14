@@ -1,6 +1,6 @@
 <!--
-The PR title becomes the squash commit and the changelog line: write it as a
-Conventional Commit that describes the whole change (CI checks it).
+The PR title becomes the squash commit (and, for feat/fix/refactor/perf, a changelog
+line): write it as a Conventional Commit that describes the whole change (CI checks it).
 -->
 
 ## Summary

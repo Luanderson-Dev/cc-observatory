@@ -20,9 +20,10 @@ following `CLAUDE.md` (and `CLAUDE.local.md` if it exists).
 - GitHub Actions: actions pinned to a full commit SHA with the version in a comment;
   least-privilege `permissions`; untrusted values (PR titles, branch names) passed
   through `env`, never interpolated into `run`.
-- Release: prepare it, don't publish it. Run `uv run cz bump --dry-run`,
-  `uv version X.Y.Z` and `uv run cz changelog --incremental --unreleased-version vX.Y.Z`
-  and return the files. The main context commits, opens and merges the PRs, tags and
+- Release: prepare it, don't publish it. Follow release steps 1 and 2 of `CLAUDE.md`
+  (`git fetch --tags`, `cz bump --dry-run --yes`, `uv version X.Y.Z`, `cz changelog` with
+  the `core.eol=lf` prefix on Windows, the README Status/roadmap and the "Current:"
+  line) and return the files. The main context commits, opens and merges the PRs, tags and
   creates the GitHub release, following the steps in `CLAUDE.md`.
 - Look up versions and syntax in the official docs instead of guessing.
 
