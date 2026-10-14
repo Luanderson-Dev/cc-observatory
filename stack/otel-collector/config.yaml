@@ -11,6 +11,9 @@
 # (resource., datapoint., log., span., spanevent.), as 0.162.0 expects, and an OTTL
 # string needs \\ for each backslash of a regular expression.
 #
+# Right after them, transform/host sets the stack's host label on every signal, from
+# CCOBS_HOST_LABEL (ADR 0022).
+#
 # Metrics are made cumulative and go to Prometheus's OTLP receiver (ADR 0013); events
 # (logs) go to Loki through its OTLP endpoint (ADR 0015); traces go to Tempo's OTLP
 # receiver, which only runs in the traces compose profile (ADR 0003). Never add a debug
@@ -153,6 +156,44 @@ processors:
           - delete_key(span.attributes, "error")
           - delete_key(span.attributes, "workspace.host_paths")
 
+  # The stack's host label (ADR 0022), after the privacy processors, so that host.name
+  # stays deleted. The resource attribute host gets the value of CCOBS_HOST_LABEL, which
+  # compose.yaml passes (default local; the default here applies when it is unset),
+  # replacing any host a client sent; Prometheus promotes it to a label on every series
+  # and Loki indexes it. A host on data points, log records, spans and span events,
+  # where Claude Code copies OTEL_RESOURCE_ATTRIBUTES, is deleted, so the resource's
+  # value is the only one. The value goes into an OTTL string literal: letters, digits,
+  # ".", "_" and "-" are supported (.env.example); a double quote or a backslash can stop
+  # the collector at start-up or change the value. Not a privacy filter: a statement
+  # error lets the batch through (error_mode: ignore, with the error logged) instead of
+  # losing it.
+  transform/host:
+    error_mode: ignore
+    metric_statements:
+      - context: resource
+        statements:
+          - set(resource.attributes["host"], "${env:CCOBS_HOST_LABEL:-local}")
+      - context: datapoint
+        statements:
+          - delete_key(datapoint.attributes, "host")
+    log_statements:
+      - context: resource
+        statements:
+          - set(resource.attributes["host"], "${env:CCOBS_HOST_LABEL:-local}")
+      - context: log
+        statements:
+          - delete_key(log.attributes, "host")
+    trace_statements:
+      - context: resource
+        statements:
+          - set(resource.attributes["host"], "${env:CCOBS_HOST_LABEL:-local}")
+      - context: span
+        statements:
+          - delete_key(span.attributes, "host")
+      - context: spanevent
+        statements:
+          - delete_key(spanevent.attributes, "host")
+
   # Turns Claude Code's delta sums (its default temporality) into the cumulative series
   # that Prometheus stores (ADR 0013); it runs after the privacy processors, so it never
   # keeps a deleted attribute. Gaps between deltas are fine. Cumulative points pass
@@ -243,13 +284,28 @@ service:
   pipelines:
     metrics:
       receivers: [otlp]
-      processors: [memory_limiter, transform/identity, transform/content, delta_to_cumulative]
+      processors:
+        - memory_limiter
+        - transform/identity
+        - transform/content
+        - transform/host
+        - delta_to_cumulative
       exporters: [otlp_http/prometheus]
     logs:
       receivers: [otlp]
-      processors: [memory_limiter, transform/identity, filter/content, transform/content]
+      processors:
+        - memory_limiter
+        - transform/identity
+        - filter/content
+        - transform/content
+        - transform/host
       exporters: [otlp_http/loki]
     traces:
       receivers: [otlp]
-      processors: [memory_limiter, transform/identity, filter/content, transform/content]
+      processors:
+        - memory_limiter
+        - transform/identity
+        - filter/content
+        - transform/content
+        - transform/host
       exporters: [otlp_http/tempo]

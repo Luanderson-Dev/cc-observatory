@@ -19,9 +19,11 @@ from tools.stack.isolated import (
     ENV_FILE,
     PROFILES,
     PROJECT,
+    RFC3339,
     compose_command,
     compose_environment,
     ports,
+    started_since,
 )
 
 ROOT: Final = Path(__file__).resolve().parents[2]
@@ -119,3 +121,34 @@ def test_compose_command_names_the_project_env_file_files_and_profiles() -> None
 
 def test_cleanup_command_removes_the_project_with_its_volumes() -> None:
     assert CLEANUP_COMMAND == "docker compose -p ccobs-it down -v --remove-orphans"
+
+
+# When a container started, against the start of the test session.
+
+
+@pytest.mark.parametrize(
+    ("started_at", "since", "expected"),
+    [
+        # docker inspect writes nanoseconds in UTC; docker info writes the daemon's zone.
+        ("2026-10-14T12:00:01.000000001Z", "2026-10-14T12:00:00.5Z", True),
+        ("2026-10-14T12:00:00.5Z", "2026-10-14T12:00:01.000000001Z", False),
+        ("2026-10-14T12:00:00Z", "2026-10-14T12:00:00Z", True),
+        ("2026-10-14T12:00:00Z", "2026-10-14T09:00:01-03:00", False),
+        ("2026-10-14T12:00:01Z", "2026-10-14T09:00:00.999999-03:00", True),
+        # A container that never started.
+        ("0001-01-01T00:00:00Z", "2026-10-14T12:00:00Z", False),
+    ],
+)
+def test_started_since_compares_daemon_timestamps(
+    started_at: str, since: str, expected: bool
+) -> None:
+    assert started_since(started_at, since) is expected
+
+
+@pytest.mark.parametrize("value", ["", "2026-10-14", "2026-10-14 12:00:00Z", "12:00:00Z", "now"])
+def test_started_since_refuses_what_is_not_rfc_3339(value: str) -> None:
+    assert not RFC3339.fullmatch(value)
+    with pytest.raises(ValueError, match="RFC 3339"):
+        started_since(value, "2026-10-14T12:00:00Z")
+    with pytest.raises(ValueError, match="RFC 3339"):
+        started_since("2026-10-14T12:00:00Z", value)

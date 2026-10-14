@@ -8,15 +8,15 @@ can move with ``CCOBS_IT_<NAME>``, such as ``CCOBS_IT_OTLP_HTTP_PORT=34318``.
 
 The project is removed with its volumes at the end of the session, unless
 ``CCOBS_IT_KEEP=1``; the next session then reuses its containers, and ``service_logs``
-only returns what they logged since that session started. Run with
-``uv run pytest -m integration --no-cov``; Docker must be running.
+only returns what they logged since that session started (``service_started`` tells
+whether a container started in this session, so its start-up lines are among them).
+Run with ``uv run pytest -m integration --no-cov``; Docker must be running.
 """
 
 from __future__ import annotations
 
 import json
 import os
-import re
 import shutil
 import subprocess
 import warnings
@@ -32,9 +32,11 @@ from tools.stack.isolated import (
     CLEANUP_COMMAND,
     KEEP_VARIABLE,
     PROJECT,
+    RFC3339,
     compose_command,
     compose_environment,
     ports,
+    started_since,
 )
 
 ROOT: Final = Path(__file__).resolve().parents[2]
@@ -45,9 +47,6 @@ WAIT_TIMEOUT: Final = 180
 UP_TIMEOUT: Final = 900
 DOWN_TIMEOUT: Final = 300
 COMMAND_TIMEOUT: Final = 120
-# A timestamp as `docker info` writes the daemon's time and `docker compose logs --since`
-# reads it.
-RFC3339: Final = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})")
 
 
 @dataclass(frozen=True)
@@ -91,6 +90,25 @@ class Stack:
         lines (errors from stopping a backend, say) would otherwise come back too."""
         result = self.compose("logs", "--no-color", "--since", self.since, service)
         return result.stdout + result.stderr
+
+    def started(self, service: str) -> bool:
+        """Whether the container of ``service`` started (or restarted) after the test
+        session started, so that ``logs`` holds its start-up lines. False for a
+        container that ``CCOBS_IT_KEEP=1`` reused from an earlier session."""
+        output = self.compose("ps", "--all", "--quiet", service).stdout
+        containers = [line.strip() for line in output.splitlines() if line.strip()]
+        assert len(containers) == 1, f"expected one {service} container, got {output!r}"
+        # S603: as in compose, docker comes from shutil.which and the arguments are fixed.
+        result = subprocess.run(  # noqa: S603
+            [self.docker, "inspect", "--format", "{{.State.StartedAt}}", containers[0]],
+            capture_output=True,
+            text=True,
+            timeout=COMMAND_TIMEOUT,
+            check=False,
+        )
+        if result.returncode != 0:
+            pytest.fail(f"`docker inspect` of {service} failed:\n{result.stderr}")
+        return started_since(result.stdout.strip(), self.since)
 
     def health(self, service: str) -> str:
         """The health status of ``service`` (``healthy``, ``starting``, ...)."""
@@ -240,6 +258,12 @@ def service_health(stack: Stack) -> Callable[[str], str]:
 def service_logs(stack: Stack) -> Callable[[str], str]:
     """The container logs of a service since the test session started."""
     return stack.logs
+
+
+@pytest.fixture(scope="session")
+def service_started(stack: Stack) -> Callable[[str], bool]:
+    """Whether a service's container started after the test session started."""
+    return stack.started
 
 
 @pytest.fixture(scope="session")

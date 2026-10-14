@@ -4,7 +4,8 @@
 # /loki), close to the upstream local example. The collector pushes events to Loki's
 # native OTLP endpoint, /otlp/v1/logs (ADR 0015):
 #   - index labels: only the resource attributes service.name (stored as service_name)
-#     and host. Every other resource attribute, every log record attribute (session.id,
+#     and host, the stack's host label, which the collector sets on every resource (ADR
+#     0022). Every other resource attribute, every log record attribute (session.id,
 #     event.name, prompt.id, ...) and the trace and span IDs become structured metadata,
 #     with dots turned into underscores (session_id, event_name, trace_id, ...). Session
 #     IDs never reach the index (ADR 0016).

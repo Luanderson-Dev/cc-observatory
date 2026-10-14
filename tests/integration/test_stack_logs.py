@@ -3,9 +3,10 @@
 Needs Docker: ``uv run pytest -m integration --no-cov``. The log records of every
 fixture scenario are replayed through the collector with fresh session IDs and read
 back from Loki on its debug port (ADR 0015): every record is stored once, only
-``service_name`` is an index label, and the session, event and trace fields come back
-as structured metadata that LogQL can filter on. The last test stops Loki and checks
-that the collector keeps what it receives meanwhile and delivers it once Loki is back.
+``service_name`` and ``host`` (ADR 0022) are index labels, and the session, event and
+trace fields come back as structured metadata that LogQL can filter on. The last test
+stops Loki and checks that the collector keeps what it receives meanwhile and delivers
+it once Loki is back.
 """
 
 from __future__ import annotations
@@ -23,6 +24,7 @@ from urllib.parse import urlencode, urlsplit
 import pytest
 import yaml
 
+from ccobs.domain.telemetry import DEFAULT_HOST, HOST_LABEL
 from tools.capture.jsontypes import JSON, JSONObject
 from tools.stack.replay import (
     LOG_CONTENT_CANARY_KEYS,
@@ -49,8 +51,8 @@ HTTP_TIMEOUT: Final = 10.0
 # Loki's default cap on the entries one query returns; every scenario has fewer records.
 QUERY_LIMIT: Final = 5000
 NANOS_PER_SECOND: Final = 1_000_000_000
-# The index labels Loki may have: service_name now, host from a later stage (ADR 0015).
-ALLOWED_LABELS: Final = frozenset({"service_name", "host"})
+# Loki's index labels: service_name and the stack's host label (ADR 0015, ADR 0022).
+INDEX_LABELS: Final = frozenset({"service_name", HOST_LABEL})
 # Per-session, per-event and per-span fields, as Loki names them: never index labels.
 SESSION_FIELDS: Final = ("session_id", "prompt_id", "event_name", "trace_id", "span_id")
 # Structured metadata keys that queries rely on (ADR 0015).
@@ -273,15 +275,16 @@ def test_only_service_name_and_host_are_index_labels(
 ) -> None:
     assert stored
     labels = set(map(str, _list(_data(loki_url, "/loki/api/v1/labels", _window(replay)), "")))
-    assert "service_name" in labels
-    assert labels <= ALLOWED_LABELS, f"unexpected index labels {sorted(labels - ALLOWED_LABELS)}"
+    assert labels == INDEX_LABELS, f"index labels {sorted(labels)}"
     assert not labels & set(SESSION_FIELDS)
     values = _data(loki_url, "/loki/api/v1/label/service_name/values", _window(replay))
     assert SERVICE in _list(values, "service_name values")
+    hosts = _data(loki_url, f"/loki/api/v1/label/{HOST_LABEL}/values", _window(replay))
+    assert _list(hosts, "host values") == [DEFAULT_HOST]
     for entries in stored.values():
         for entry in entries:
-            assert entry.labels.get("service_name") == SERVICE
-            assert set(entry.labels) <= ALLOWED_LABELS
+            assert entry.labels == {"service_name": SERVICE, HOST_LABEL: DEFAULT_HOST}
+            assert HOST_LABEL not in entry.metadata
 
 
 def test_session_event_and_trace_fields_are_structured_metadata(

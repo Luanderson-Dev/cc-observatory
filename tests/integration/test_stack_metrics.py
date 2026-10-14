@@ -28,6 +28,7 @@ from urllib.parse import urlencode, urlsplit
 
 import pytest
 
+from ccobs.domain.telemetry import DEFAULT_HOST, HOST_LABEL
 from tools.capture.jsontypes import JSONObject
 from tools.stack.replay import (
     CANARY_PREFIX,
@@ -144,6 +145,16 @@ def _label(key: str) -> str:
     """The Prometheus label of an OTel attribute: every character that is not a letter,
     a digit or an underscore becomes ``_`` (``session.id`` -> ``session_id``)."""
     return re.sub(r"[^A-Za-z0-9_]", "_", key)
+
+
+def _attribute_labels(labels: Mapping[str, str]) -> dict[str, str]:
+    """A stored series' labels without ``__name__``, ``job`` and the host label with the
+    value .env.example gives it (ADR 0022): its data point attributes, as the replayer
+    keys a series. Any other host value stays, so it shows up as a wrong series."""
+    rest = {key: value for key, value in labels.items() if key not in ("__name__", "job")}
+    if rest.get(HOST_LABEL) == DEFAULT_HOST:
+        del rest[HOST_LABEL]
+    return rest
 
 
 def _key(series: SeriesKey) -> Key:
@@ -275,8 +286,7 @@ def _stored(base: str, run: Prepared, template: str) -> Totals:
     for name in sorted({PROMETHEUS_NAMES[series.metric] for series in run.expected}):
         selector = _selector(name, {"job": JOB, "session_id": run.session_id})
         for labels, value in _query(base, template.format(selector=selector)):
-            rest = {key: item for key, item in labels.items() if key not in ("__name__", "job")}
-            found[(name, frozenset(rest.items()))] = value
+            found[(name, frozenset(_attribute_labels(labels).items()))] = value
     return found
 
 
@@ -429,8 +439,7 @@ def test_delta_totals_are_exact_for_every_series(
             found = _query(prometheus_url, promql)
             assert len(found) == 1, f"{promql} gave {found}"
             stored, value = found[0]
-            rest = {key: item for key, item in stored.items() if key not in ("__name__", "job")}
-            assert rest == dict(labels), promql
+            assert _attribute_labels(stored) == dict(labels), promql
             assert _close(value, float(total)), f"{promql} = {value!r}, expected {total!r}"
 
 
@@ -528,8 +537,9 @@ def test_metric_names_and_labels_are_the_translated_attributes(
     params = [("match[]", matcher), ("start", f"{end - RANGE_SECONDS:.3f}"), ("end", f"{end:.3f}")]
     names = _list(_get(prometheus_url, "/api/v1/label/__name__/values", params), "names")
     assert set(map(str, names)) == EXPECTED_NAMES
-    # Every label is a data point attribute with dots turned into underscores, plus job:
-    # no instance, no otel_scope_* and no resource attribute.
+    # Every label is a data point attribute with dots turned into underscores, plus job
+    # and the host label, the one promoted resource attribute (ADR 0022): no instance, no
+    # otel_scope_* and no other resource attribute.
     attributes = {
         _label(key)
         for run in delta.runs.values()
@@ -538,7 +548,8 @@ def test_metric_names_and_labels_are_the_translated_attributes(
     }
     for series in _series(prometheus_url, matcher):
         assert series.get("job") == JOB
-        assert set(series) - {"__name__", "job"} <= attributes, series
+        assert series.get(HOST_LABEL) == DEFAULT_HOST, series
+        assert set(series) - {"__name__", "job", HOST_LABEL} <= attributes, series
 
 
 def test_resource_attributes_stay_on_target_info(prometheus_url: str, delta: Replay) -> None:
@@ -551,14 +562,20 @@ def test_resource_attributes_stay_on_target_info(prometheus_url: str, delta: Rep
 
 
 def test_prometheus_logs_no_errors(
-    service_logs: Callable[[str], str], delta: Replay, cumulative: Replay
+    service_logs: Callable[[str], str],
+    service_started: Callable[[str], bool],
+    delta: Replay,
+    cumulative: Replay,
 ) -> None:
     assert delta.runs
     assert cumulative.runs
-    # Only this session's lines. They can be none: Prometheus logs nothing while it works,
-    # and with CCOBS_IT_KEEP=1 the session reuses a container that started earlier. A
-    # failing `docker compose logs` fails the test.
+    # Only this session's lines. Prometheus logs nothing while it works, so they can be
+    # none when CCOBS_IT_KEEP=1 reuses a container that started earlier; a container
+    # that started in this session has at least its start-up lines, so empty logs then
+    # mean the logs were not read. A failing `docker compose logs` fails the test.
     logs = service_logs(PROMETHEUS)
+    if service_started(PROMETHEUS):
+        assert logs.strip(), "Prometheus logged nothing since it started"
     errors = [line for line in logs.splitlines() if re.search(r"level=error", line, re.I)]
     assert not errors, "\n".join(errors[:5])
 

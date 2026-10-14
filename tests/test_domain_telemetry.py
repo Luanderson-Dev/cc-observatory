@@ -2,8 +2,9 @@
 
 They compare the constants with the OTLP fixtures (ADR 0012) and with the translation
 Prometheus applied to them (ADR 0013), the privacy lists with the replayer's canaries and
-the keys the collector config deletes (ADR 0021), and check the PromQL that
-``total_query`` builds. ``tests/integration/test_metric_names.py`` compares the same
+the keys the collector config deletes (ADR 0021), and the host label with the configs
+that set, promote and index it (ADR 0022), and check the PromQL that ``total_query``
+builds. ``tests/integration/test_metric_names.py`` compares the same
 constants with what a running stack stores.
 """
 
@@ -31,8 +32,10 @@ from ccobs.domain.telemetry import (
     CONTENT_SPAN_EVENT,
     COST_USAGE,
     DATA_POINT_CONTENT_KEYS,
+    DEFAULT_HOST,
     EVENT_BODY_PREFIX,
     EVENTS,
+    HOST_LABEL,
     IDENTITY_KEYS,
     IDENTITY_PREFIXES,
     JOB_LABEL,
@@ -42,6 +45,7 @@ from ccobs.domain.telemetry import (
     LOKI_OPTIONAL_METADATA,
     METRICS,
     OPTIONAL_COMMON_LABELS,
+    PROMOTED_LABELS,
     PULL_REQUEST_COUNT,
     RESOURCE_CONTENT_KEYS,
     SERVICE_NAME,
@@ -60,7 +64,14 @@ from tools.stack import replay
 ROOT: Final = Path(__file__).resolve().parents[1]
 DOMAIN: Final = ROOT / "src" / "ccobs" / "domain"
 COLLECTOR_CONFIG: Final = ROOT / "stack" / "otel-collector" / "config.yaml"
+PROMETHEUS_CONFIG: Final = ROOT / "stack" / "prometheus" / "prometheus.yaml"
+LOKI_CONFIG: Final = ROOT / "stack" / "loki" / "config.yaml"
 OTLP_FIXTURES: Final = replay.DEFAULT_FIXTURES / "otlp"
+# The collector statement that sets the host label from CCOBS_HOST_LABEL (ADR 0022).
+HOST_SET: Final = re.compile(
+    r'^set\(resource\.attributes\["(?P<key>[^"]+)"\], '
+    r'"\$\{env:CCOBS_HOST_LABEL:-(?P<default>[^}"]+)\}"\)$'
+)
 
 # A classic Prometheus label name, which PromQL needs no quotes for.
 LABEL_NAME: Final = re.compile(r"[a-zA-Z_][a-zA-Z0-9_]*")
@@ -230,8 +241,10 @@ def test_labels_are_valid_and_split_into_always_and_optional(metric: Metric) -> 
     assert not any(label.startswith("__") for label in metric.all_labels)
     assert not metric.labels & metric.optional_labels
     assert metric.all_labels == {JOB_LABEL} | metric.labels | metric.optional_labels
-    # Every metric carries the standard attributes (ADR 0012).
+    # Every metric carries the standard attributes (ADR 0012) and the host label that
+    # Prometheus promotes from the resource (ADR 0022).
     assert metric.labels >= COMMON_LABELS
+    assert metric.labels >= PROMOTED_LABELS
     assert metric.optional_labels >= OPTIONAL_COMMON_LABELS
     # job comes from service.name, never from a data point attribute.
     assert JOB_LABEL not in metric.labels | metric.optional_labels
@@ -243,6 +256,24 @@ def test_common_labels() -> None:
     assert {"app_version"} == OPTIONAL_COMMON_LABELS
     assert JOB_LABEL == "job"
     assert SERVICE_NAME == "claude-code"
+
+
+def test_the_host_label() -> None:
+    # A constant the user can change through CCOBS_HOST_LABEL, never the machine's
+    # hostname, which is personal data (ADR 0021, ADR 0022).
+    assert HOST_LABEL == "host"
+    assert DEFAULT_HOST == "local"
+    assert re.fullmatch(r"[A-Za-z0-9._-]+", DEFAULT_HOST)
+    # The only resource attribute Prometheus promotes (ADR 0013), on every series of
+    # every metric, and on target_info too; and one of Loki's two index labels.
+    assert {HOST_LABEL} == PROMOTED_LABELS
+    assert all(HOST_LABEL in metric.labels for metric in METRICS)
+    assert HOST_LABEL in TARGET_INFO_LABELS
+    assert HOST_LABEL in LOKI_INDEX_LABELS
+    assert not is_identity_key(HOST_LABEL)
+    # The attribute comes from the collector, never from a data point or a record.
+    assert HOST_LABEL not in COMMON_LABELS | OPTIONAL_COMMON_LABELS
+    assert HOST_LABEL not in LOKI_METADATA | LOKI_OPTIONAL_METADATA
 
 
 def test_the_fixtures_carry_every_metric_but_pull_request_count() -> None:
@@ -259,7 +290,10 @@ def test_the_fixtures_carry_every_metric_but_pull_request_count() -> None:
 def test_units_and_labels_are_those_of_the_fixtures(metric: Metric) -> None:
     fixture = FIXTURE_METRICS[metric.otel_name]
     assert fixture.units == {metric.unit}
-    always, anywhere = fixture.labels()
+    # The data point attributes, plus the host label Prometheus promotes from the
+    # resource, which the collector sets (ADR 0022).
+    on_points, on_any_point = fixture.labels()
+    always, anywhere = on_points | PROMOTED_LABELS, on_any_point | PROMOTED_LABELS
     # Optional labels are those some points lack, plus the standard attributes that
     # depend on a setting (the capture turned app.version on).
     assert always == metric.labels | (always & OPTIONAL_COMMON_LABELS)
@@ -292,7 +326,9 @@ def test_the_observed_names() -> None:
 def test_target_info_holds_the_other_resource_attributes() -> None:
     assert TARGET_INFO == "target_info"
     resource = _resource_keys("metrics") - {SERVICE_NAME_ATTRIBUTE}
-    assert {JOB_LABEL} | {_label(key) for key in resource} == TARGET_INFO_LABELS
+    # The promoted host label stays on target_info as well (ADR 0022).
+    labels = {JOB_LABEL} | {_label(key) for key in resource} | PROMOTED_LABELS
+    assert labels == TARGET_INFO_LABELS
     # No instance: Claude Code sends no service.instance.id.
     assert "instance" not in TARGET_INFO_LABELS
 
@@ -300,9 +336,9 @@ def test_target_info_holds_the_other_resource_attributes() -> None:
 # Loki.
 
 
-def test_loki_indexes_only_the_service_name() -> None:
-    # host joins with the stage that sets it (ADR 0015).
-    assert {"service_name"} == LOKI_INDEX_LABELS
+def test_loki_indexes_the_service_name_and_the_host() -> None:
+    # One stream per machine (ADR 0015), told apart by the host label (ADR 0022).
+    assert {"service_name", HOST_LABEL} == LOKI_INDEX_LABELS
     assert not LOKI_INDEX_LABELS & (LOKI_METADATA | LOKI_OPTIONAL_METADATA)
 
 
@@ -507,6 +543,36 @@ def test_collector_drops_the_domain_content_events() -> None:
         assert match, condition
         span_events.add(match["name"])
     assert span_events == {CONTENT_SPAN_EVENT}
+
+
+def test_the_stack_sets_promotes_and_indexes_the_domain_host_label() -> None:
+    # The collector sets the resource attribute on every signal with the domain's
+    # default (ADR 0022), Prometheus promotes exactly it, and Loki indexes it.
+    statements = [
+        statement
+        for signal in STATEMENTS.values()
+        for group in _objects(_processor("transform/host").get(signal))
+        if group.get("context") == "resource"
+        for statement in _strings(group.get("statements"))
+    ]
+    assert len(statements) == len(STATEMENTS), statements
+    for statement in statements:
+        match = HOST_SET.fullmatch(statement)
+        assert match, statement
+        assert (match["key"], match["default"]) == (HOST_LABEL, DEFAULT_HOST)
+    prometheus = _mapping(yaml.safe_load(PROMETHEUS_CONFIG.read_text(encoding="utf-8")))
+    promoted = _mapping(prometheus.get("otlp")).get("promote_resource_attributes")
+    assert promoted == sorted(PROMOTED_LABELS)
+    loki: object = yaml.safe_load(LOKI_CONFIG.read_text(encoding="utf-8"))
+    for key in ("limits_config", "otlp_config", "resource_attributes"):
+        loki = _mapping(loki).get(key)
+    indexed = {
+        _label(str(attribute))
+        for rule in _objects(_mapping(loki).get("attributes_config"))
+        if rule.get("action") == "index_label"
+        for attribute in _strings(rule.get("attributes"))
+    }
+    assert indexed == LOKI_INDEX_LABELS
 
 
 # PromQL.

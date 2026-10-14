@@ -11,6 +11,8 @@
 #     sum_over_time() (ADR 0013).
 #   - --storage.tsdb.retention.time comes from CCOBS_PROMETHEUS_RETENTION, 90 days by
 #     default (ADR 0016).
+# The host label is not an external label: Prometheus adds external_labels only to data
+# that leaves it, never to its own storage (ADR 0022).
 # There is no remote_write, remote_read or alerting: nothing leaves Prometheus.
 
 global:
@@ -30,8 +32,11 @@ storage:
 # OTLP translation keeps its defaults (translation_strategy UnderscoreEscapingWithSuffixes):
 # claude_code.cost.usage becomes claude_code_cost_usage_USD_total, session.id becomes
 # session_id and service.name becomes job="claude-code"; the other resource attributes
-# stay on the target_info series. No resource attribute is promoted to a label.
-otlp: {}
+# stay on the target_info series. One resource attribute is promoted to a label on every
+# series: host, the stack's host label that the collector sets (ADR 0022), which stays
+# on target_info too.
+otlp:
+  promote_resource_attributes: [host]
 
 scrape_configs:
   # Prometheus's own metrics, such as the OTLP requests it refused

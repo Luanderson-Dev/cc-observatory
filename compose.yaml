@@ -55,6 +55,9 @@ services:
     environment:
       # About 80% of mem_limit, so the Go runtime collects garbage before the limit.
       GOMEMLIMIT: 204MiB
+      # The host label on every metric, event and trace (ADR 0022); never the machine's
+      # hostname unless you set it to that.
+      CCOBS_HOST_LABEL: ${CCOBS_HOST_LABEL:-local}
     healthcheck:
       test: ["CMD", "/busybox", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:13133/"]
       interval: 30s

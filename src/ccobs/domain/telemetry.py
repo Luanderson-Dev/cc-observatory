@@ -10,7 +10,8 @@ dashboards and ``ccobs doctor`` take names from here, never from guesses.
 Every Claude Code metric is a monotonic sum, stored as a Prometheus counter whose name
 ends in ``_total``. Totals follow ADR 0013, ``increase(<name>{...}[<window>] anchored)``
 summed by the labels needed, which ``total_query`` builds. The privacy lists of ADR 0021
-are here too, as the domain's copy of what the collector deletes.
+are here too, as the domain's copy of what the collector deletes, and the host label
+that the collector sets on every signal (ADR 0022).
 
 Data and string building only: no I/O.
 """
@@ -26,15 +27,25 @@ from typing import Final
 # service_name index label.
 SERVICE_NAME: Final = "claude-code"
 
+# The stack's host label (ADR 0022): the collector sets the resource attribute host on
+# every signal from CCOBS_HOST_LABEL, this default when it is unset. Never the machine's
+# hostname by default: that is personal data, and the collector deletes host.name (ADR
+# 0021). Prometheus promotes it to a label and Loki indexes it.
+HOST_LABEL: Final = "host"
+DEFAULT_HOST: Final = "local"
+
 # Prometheus (ADR 0013).
 
 # The label Prometheus derives from service.name, on every series of Claude Code's
 # metrics. There is no instance label: Claude Code sends no service.instance.id.
 JOB_LABEL: Final = "job"
-# The series that holds the other resource attributes, and its labels.
+# The resource attributes Prometheus promotes to a label on every series: only host.
+PROMOTED_LABELS: Final = frozenset({HOST_LABEL})
+# The series that holds the other resource attributes, and its labels; the promoted
+# host label stays on it too.
 TARGET_INFO: Final = "target_info"
 TARGET_INFO_LABELS: Final = frozenset(
-    {JOB_LABEL, "service_version", "os_type", "os_version", "host_arch"}
+    {JOB_LABEL, "service_version", "os_type", "os_version", "host_arch"} | PROMOTED_LABELS
 )
 # Standard attributes on every data point: session.id (gone only if the user sets
 # OTEL_METRICS_INCLUDE_SESSION_ID=false, which ccobs setup never does, ADR 0016) and
@@ -50,8 +61,9 @@ class Metric:
     none), its Prometheus name, and the labels of its series besides ``job``.
 
     ``labels`` are on every series and ``optional_labels`` only on some, depending on
-    the request or on a setting; both include the standard attributes. Attributes a user
-    adds through ``OTEL_RESOURCE_ATTRIBUTES`` can add labels that are not listed."""
+    the request or on a setting; both include the standard attributes, and ``labels``
+    the promoted host label. Attributes a user adds through ``OTEL_RESOURCE_ATTRIBUTES``
+    can add labels that are not listed."""
 
     otel_name: str
     name: str
@@ -77,7 +89,7 @@ def _metric(
         otel_name,
         name,
         unit,
-        COMMON_LABELS | frozenset(labels),
+        COMMON_LABELS | PROMOTED_LABELS | frozenset(labels),
         OPTIONAL_COMMON_LABELS | frozenset(optional),
     )
 
@@ -139,9 +151,8 @@ METRICS: Final = (
 
 # Loki (ADR 0015).
 
-# Index labels: one stream per machine. The host label of ADR 0015 joins this set with
-# the stage of this milestone that sets it.
-LOKI_INDEX_LABELS: Final = frozenset({"service_name"})
+# Index labels: one stream per machine, told apart by the host label (ADR 0022).
+LOKI_INDEX_LABELS: Final = frozenset({"service_name", HOST_LABEL})
 # Structured metadata on every entry: the attributes on every event, the resource
 # attributes other than service.name, and the fields Loki adds (detected_level is
 # "unknown", since Claude Code sends no severity).

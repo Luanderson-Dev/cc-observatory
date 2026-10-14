@@ -29,8 +29,10 @@ import pytest
 
 from ccobs.domain.telemetry import (
     COMMIT_COUNT,
+    DEFAULT_HOST,
     EVENT_BODY_PREFIX,
     EVENTS,
+    HOST_LABEL,
     JOB_LABEL,
     LOG_CONTENT_KEYS,
     LOKI_INDEX_LABELS,
@@ -425,6 +427,8 @@ def test_each_metric_carries_the_domain_labels(metric: Metric, stored_series: li
     for labels in series:
         names = set(labels) - {"__name__"}
         assert labels.get(JOB_LABEL) == SERVICE_NAME
+        # The value .env.example gives the host label (ADR 0022).
+        assert labels.get(HOST_LABEL) == DEFAULT_HOST
         missing = ({JOB_LABEL} | metric.labels) - names
         assert not missing, f"{labels} lacks {sorted(missing)}"
         seen |= names
@@ -440,6 +444,7 @@ def test_target_info_carries_the_other_resource_attributes(
     assert found, f"no {TARGET_INFO} series for {SERVICE_NAME}"
     for labels in found:
         assert set(labels) - {"__name__"} == TARGET_INFO_LABELS, labels
+        assert labels.get(HOST_LABEL) == DEFAULT_HOST, labels
 
 
 def test_prometheus_has_no_metadata_for_otlp_metrics(
@@ -508,6 +513,7 @@ def test_loki_index_labels_are_the_domain_labels(
         for entry in entries:
             assert set(entry.labels) == LOKI_INDEX_LABELS
             assert entry.labels.get("service_name") == SERVICE_NAME
+            assert entry.labels.get(HOST_LABEL) == DEFAULT_HOST
 
 
 def test_loki_metadata_is_the_domain_keys_plus_the_event_attributes(

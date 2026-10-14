@@ -1,11 +1,11 @@
 """Static checks of the OpenTelemetry Collector config (ADR 0003, ADR 0006, ADR 0013,
-ADR 0015, ADR 0021).
+ADR 0015, ADR 0021, ADR 0022).
 
 Unit tests: they parse ``stack/otel-collector/config.yaml`` and the OTTL statements of
 its privacy processors, and compare the keys and events they delete with the canaries
 that ``tools.stack.replay`` plants, so that every planted canary is covered by a filter.
-They also check where each signal goes. The integration tests send the canaries through
-a running collector.
+They also check the processor that sets the stack's host label and where each signal
+goes. The integration tests send the canaries through a running collector.
 """
 
 from __future__ import annotations
@@ -21,6 +21,7 @@ from urllib.parse import urlsplit
 import pytest
 import yaml
 
+from ccobs.domain.telemetry import DEFAULT_HOST, HOST_LABEL
 from tools.stack.replay import (
     CONTENT_EVENT_NAMES,
     CONTENT_SPAN_EVENT,
@@ -44,6 +45,22 @@ TEMPO_CONFIG: Final = ROOT / "stack" / "tempo" / "config.yaml"
 IDENTITY: Final = "transform/identity"
 CONTENT_FILTER: Final = "filter/content"
 CONTENT_TRANSFORM: Final = "transform/content"
+# The processors that delete personal data, in pipeline order where present (ADR 0021).
+PRIVACY_TRANSFORMS: Final = (IDENTITY, CONTENT_TRANSFORM)
+# The stack's host label (ADR 0022): the resource attribute host, set from
+# CCOBS_HOST_LABEL with the default local, right after the privacy processors.
+HOST_PROCESSOR: Final = "transform/host"
+HOST_VARIABLE: Final = "CCOBS_HOST_LABEL"
+HOST_SET: Final = (
+    f'set(resource.attributes["{HOST_LABEL}"], "${{env:{HOST_VARIABLE}:-{DEFAULT_HOST}}}")'
+)
+# Where Claude Code copies OTEL_RESOURCE_ATTRIBUTES, so a client's host could arrive, per
+# signal: the host step deletes it there, and the resource's value is the only one.
+HOST_DELETE_CONTEXTS: Final = {
+    "metrics": ("datapoint",),
+    "logs": ("log",),
+    "traces": ("span", "spanevent"),
+}
 # The OTTL statement lists of the transform processor, per signal.
 STATEMENTS: Final = {
     "metrics": "metric_statements",
@@ -108,6 +125,7 @@ KEPT_KEYS: Final = (
     "enduser_id",
     "xuser.id",
     "superuser.id",
+    "host",
     "host.arch",
     "host.id",
     "organization",
@@ -296,13 +314,17 @@ def test_content_processors_are_in_the_pipelines_that_carry_content(pipeline: st
 
 
 @pytest.mark.parametrize("pipeline", PIPELINES)
-def test_privacy_processors_run_in_order_before_any_other_processor(pipeline: str) -> None:
+def test_privacy_processors_then_the_host_label_run_before_any_other_processor(
+    pipeline: str,
+) -> None:
     # memory_limiter, transform/identity, then the content processors where present
-    # (filter first, so the transform skips dropped records), then anything else.
+    # (filter first, so the transform skips dropped records), then the host label, so
+    # that it is set on what the privacy processors leave, then anything else.
     processors = _pipelines()[pipeline]["processors"]
     content = [name for name in (CONTENT_FILTER, CONTENT_TRANSFORM) if name in processors]
-    expected = ["memory_limiter", IDENTITY, *content]
+    expected = ["memory_limiter", IDENTITY, *content, HOST_PROCESSOR]
     assert processors[: len(expected)] == expected
+    assert processors.count(HOST_PROCESSOR) == 1
 
 
 @pytest.mark.parametrize("pipeline", PIPELINES)
@@ -410,11 +432,13 @@ def test_prometheus_exporter_is_only_in_metrics_pipelines() -> None:
 
 
 def test_metrics_are_made_cumulative_after_the_privacy_processors() -> None:
-    # Claude Code sends delta sums by default; Prometheus stores cumulative series.
+    # Claude Code sends delta sums by default; Prometheus stores cumulative series. The
+    # host label is set before, so each stream is identified with it.
     assert _pipelines()["metrics"]["processors"] == [
         "memory_limiter",
         IDENTITY,
         CONTENT_TRANSFORM,
+        HOST_PROCESSOR,
         DELTA_TO_CUMULATIVE,
     ]
 
@@ -622,10 +646,9 @@ def test_content_attributes_are_deleted_exactly() -> None:
 def test_every_planted_canary_is_deleted_by_its_pipeline(pipeline: str) -> None:
     signal = _signal(pipeline)
     transforms = [
-        name
-        for name in _pipelines()[pipeline]["processors"]
-        if _component_type(name) == "transform"
+        name for name in _pipelines()[pipeline]["processors"] if name in PRIVACY_TRANSFORMS
     ]
+    assert transforms == list(PRIVACY_TRANSFORMS), pipeline
     for context, keys in PLANTED[signal].items():
         levels = [_deletions(name, signal).get(context, Deletions()) for name in transforms]
         kept = [key for key in keys if not any(level.deletes(key) for level in levels)]
@@ -667,3 +690,44 @@ def test_metadata_attributes_survive(processor: str) -> None:
         for context, deletions in _deletions(processor, signal).items():
             deleted = [key for key in METADATA_KEYS if deletions.deletes(key)]
             assert not deleted, f"{processor} {signal} {context} deletes {deleted}"
+
+
+# The host label (ADR 0022).
+
+
+def _host_statements(signal: str) -> dict[str, list[str]]:
+    """The statements of the host processor for ``signal``, per OTTL context."""
+    processor = _section("processors").get(HOST_PROCESSOR)
+    assert processor is not None, f"no {HOST_PROCESSOR} processor"
+    groups = processor.get(STATEMENTS[signal])
+    assert isinstance(groups, list), f"{HOST_PROCESSOR} {STATEMENTS[signal]}"
+    found: dict[str, list[str]] = {}
+    for group in groups:
+        mapping = _mapping(group, f"{HOST_PROCESSOR} {STATEMENTS[signal]} entry")
+        context = str(mapping.get("context"))
+        assert context not in found, f"{HOST_PROCESSOR} {signal}: two {context} groups"
+        found[context] = _strings(mapping.get("statements"), f"{HOST_PROCESSOR} {context}")
+    return found
+
+
+def test_host_processor_lets_data_through_on_a_statement_error() -> None:
+    # Not a privacy filter: an error must not cost the batch, which goes on (with the
+    # error logged) as the privacy processors left it.
+    processor = _section("processors").get(HOST_PROCESSOR)
+    assert processor is not None, f"no {HOST_PROCESSOR} processor"
+    assert processor.get("error_mode") == "ignore"
+    assert set(processor) == {"error_mode", *STATEMENTS.values()}
+
+
+@pytest.mark.parametrize("signal", sorted(STATEMENTS))
+def test_host_label_is_set_on_the_resource_and_deleted_everywhere_else(signal: str) -> None:
+    # The resource's host comes from CCOBS_HOST_LABEL (local by default) and replaces any
+    # value a client sent; a host on data points, log records, spans or span events,
+    # where Claude Code copies OTEL_RESOURCE_ATTRIBUTES, is deleted, so the resource's
+    # value is the only one. Nothing else: the host step never sets host.name, which
+    # transform/identity deletes (ADR 0021).
+    expected = {"resource": [HOST_SET]} | {
+        context: [f'delete_key({context}.attributes, "{HOST_LABEL}")']
+        for context in HOST_DELETE_CONTEXTS[signal]
+    }
+    assert _host_statements(signal) == expected

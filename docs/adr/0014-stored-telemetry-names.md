@@ -59,10 +59,11 @@ would make every query quote its names.
 
 - **Executable form.** `src/ccobs/domain/telemetry.py` holds the names and labels below
   as constants, the privacy lists of [ADR 0021](0021-collector-privacy-filters.md) as
-  the domain's copy, and `total_query` and `selector`, which build PromQL from them. It
-  is the executable form of this ADR: tests compare it with the fixtures, the collector
-  config and the running stack (see Confirmation), and a change of a name there changes
-  this ADR.
+  the domain's copy, the host label of [ADR 0022](0022-the-host-label.md) (`HOST_LABEL`
+  and its default, `DEFAULT_HOST`), and `total_query` and `selector`, which build PromQL
+  from them. It is the executable form of this ADR: tests compare it with the fixtures,
+  the collector config and the running stack (see Confirmation), and a change of a name
+  there changes this ADR.
 - **How the names were observed.** On 2026-10-14,
   `tests/integration/test_metric_names.py` replayed the 8 fixture scenarios that carry
   telemetry (ADR 0012) through the stack of this milestone (collector contrib 0.162.0,
@@ -85,18 +86,21 @@ would make every query quote its names.
 | `claude_code.commit.count`            | none     | `claude_code_commit_count_total`            |                                               |                                                  |
 | `claude_code.pull_request.count`      | none     | `claude_code_pull_request_count_total`      |                                               |                                                  |
 
-- **Every series** also has `job="claude-code"` (from `service.name`), `session_id` and
-  `terminal_type`, and optionally `app_version`.
+- **Every series** also has `job="claude-code"` (from `service.name`), `host` (ADR
+  0022, `local` by default), `session_id` and `terminal_type`, and optionally
+  `app_version`.
 - **Names** follow the observed translation (`UnderscoreEscapingWithSuffixes`): the
   name's words joined by underscores, a `total` word moved to the end, the unit added as
   a word (`s` becomes `seconds`, `tokens` and `USD` stay as they are, case included, and
   no unit adds nothing), then `_total`, since every Claude Code metric is a monotonic
   sum, stored as a counter.
 - **Labels** are the data point attributes with dots turned into underscores
-  (`session.id` becomes `session_id`). There is no `instance` label, since Claude Code
-  sends no `service.instance.id`, and no `otel_scope_*` labels. Identity attributes
-  never become labels (ADR 0021).
-- **On every series** means on every data point of that metric in the fixtures.
+  (`session.id` becomes `session_id`), plus `job` and `host`, which come from the
+  resource. There is no `instance` label, since Claude Code sends no
+  `service.instance.id`, and no `otel_scope_*` labels. Identity attributes never become
+  labels (ADR 0021).
+- **On every series** means on every data point of that metric in the fixtures, plus
+  `host`, which the collector sets on every resource.
   `session_id` is absent only if the user sets `OTEL_METRICS_INCLUDE_SESSION_ID=false`,
   which `ccobs setup` never does
   ([ADR 0016](0016-cardinality-and-retention.md)).
@@ -111,16 +115,18 @@ would make every query quote its names.
   their results.
 - **`target_info`.** The resource attributes other than `service.name` stay on one
   `target_info{job="claude-code"}` series with `service_version`, `os_type`,
-  `os_version` and `host_arch`, shared by every session on the machine (ADR 0013).
+  `os_version`, `host_arch` and `host`, shared by every session on the machine (ADR
+  0013); `host` stays there although it is promoted.
 - **No metadata.** `/api/v1/metadata` returns nothing for any of these metrics, so their
   types and units come from this ADR and ADR 0012, not from Prometheus.
-- **`host`.** The `host` label of [ADR 0001](0001-local-single-machine-scope.md) is
-  added to both backends by a later stage of this milestone, which extends these lists.
+- **`host`.** The `host` label of [ADR 0001](0001-local-single-machine-scope.md) is the
+  only promoted resource attribute: the collector sets it on every resource from
+  `CCOBS_HOST_LABEL` and deletes it from data points (ADR 0022).
 
 ### Events in Loki
 
-- **Index label:** `service_name="claude-code"` only (ADR 0015); `host` joins it with
-  the stage that sets it.
+- **Index labels:** `service_name="claude-code"` and `host` (ADR 0015, ADR 0022): one
+  stream per machine.
 - **Structured metadata on every entry:** `session_id`, `event_name`, `event_sequence`,
   `event_timestamp` and `terminal_type`; the resource attributes `service_version`,
   `host_arch`, `os_type` and `os_version`; and the fields Loki adds, `scope_name`,
@@ -178,17 +184,19 @@ would make every query quote its names.
   names, units, labels on every point and on some, resource attributes, event names and
   lines), the translation rule above, that every label is a valid Prometheus label name
   and none is an identity or content key, that the privacy lists equal the replayer's
-  canary lists and what `stack/otel-collector/config.yaml` deletes, the PromQL of
-  `total_query` and `selector` with their escaping and validation, and that
-  `ccobs.domain` imports nothing that does I/O.
+  canary lists and what `stack/otel-collector/config.yaml` deletes, that the host label
+  and its default are those the collector sets, Prometheus promotes and Loki indexes,
+  the PromQL of `total_query` and `selector` with their escaping and validation, and
+  that `ccobs.domain` imports nothing that does I/O.
 - `tests/integration/test_metric_names.py` replays every fixture scenario and the
   synthetic `claude_code.pull_request.count` point with fresh session IDs, then checks
   that Prometheus stores exactly the module's metric names; that each metric's series
-  carry the labels on every series and no label outside the module's list, and that
-  every listed label shows up; the `target_info` labels; that `/api/v1/metadata` is
-  empty for each metric; that `total_query` gives each session's replayed totals and
-  that its escaped values parse; and that Loki's index labels, structured metadata keys
-  (each entry against its own event's attributes) and event names match the module.
+  carry the labels on every series (with `host="local"`) and no label outside the
+  module's list, and that every listed label shows up; the `target_info` labels; that
+  `/api/v1/metadata` is empty for each metric; that `total_query` gives each session's
+  replayed totals and that its escaped values parse; and that Loki's index labels,
+  structured metadata keys (each entry against its own event's attributes) and event
+  names match the module.
 - The `reviewer` subagent checks that consumers take metric, label and event names from
   `ccobs.domain.telemetry` and build totals with `total_query` or the same form.
 
@@ -205,5 +213,5 @@ would make every query quote its names.
   `claude_code.pull_request.count`, `OTEL_METRICS_INCLUDE_VERSION` and
   `OTEL_METRICS_INCLUDE_SESSION_ID`.
 - Revisit when Claude Code changes its metrics, attributes or events (a recapture, ADR
-  0012), when Prometheus changes its OTLP translation or its default strategy, when Loki
-  changes its OTLP mapping, and when the `host` label lands.
+  0012), when Prometheus changes its OTLP translation or its default strategy, and when
+  Loki changes its OTLP mapping.

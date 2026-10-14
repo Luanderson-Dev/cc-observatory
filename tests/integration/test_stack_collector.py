@@ -82,12 +82,17 @@ def test_every_scenario_replays_with_canaries(replayed: list[Replayed]) -> None:
 
 
 def test_collector_logs_hold_no_canary(
-    service_logs: Callable[[str], str], replayed: list[Replayed]
+    service_logs: Callable[[str], str],
+    service_started: Callable[[str], bool],
+    replayed: list[Replayed],
 ) -> None:
-    # Only this session's lines. They can be none: the collector logs nothing while it
-    # works, and with CCOBS_IT_KEEP=1 the session reuses a container that started
-    # earlier. A failing `docker compose logs` fails the test.
+    # Only this session's lines. The collector logs nothing while it works, so they can
+    # be none when CCOBS_IT_KEEP=1 reuses a container that started earlier; a container
+    # that started in this session has at least its start-up lines, so empty logs then
+    # mean the logs were not read. A failing `docker compose logs` fails the test.
     logs = service_logs(COLLECTOR)
+    if service_started(COLLECTOR):
+        assert logs.strip(), "the collector logged nothing since it started"
     markers = {item.prepared.canary_marker for item in replayed}
     assert markers
     assert CANARY_PREFIX not in logs

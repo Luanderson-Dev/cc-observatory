@@ -17,6 +17,8 @@ from typing import Final
 import pytest
 import yaml
 
+from ccobs.domain.telemetry import DEFAULT_HOST
+
 ROOT: Final = Path(__file__).resolve().parents[1]
 COMPOSE: Final = ROOT / "compose.yaml"
 COMPOSE_DEBUG: Final = ROOT / "compose.debug.yaml"
@@ -39,6 +41,7 @@ BARE_VARIABLE: Final = re.compile(r"(?<!\$)\$(?P<name>[A-Za-z_][A-Za-z0-9_]*)")
 # Variables in the configs under stack/: ${VAR}, ${VAR:-default} and the collector's
 # ${env:VAR} and ${env:VAR:-default}.
 CONFIG_VARIABLE: Final = re.compile(r"\$\{(?:env:)?(?P<name>[A-Z][A-Z0-9_]*)(?::-[^}]*)?\}")
+CONFIG_DEFAULT: Final = re.compile(r"\$\{(?:env:)?(?P<name>[A-Z][A-Z0-9_]*):-(?P<default>[^}]*)\}")
 ENV_ASSIGNMENT: Final = re.compile(r"^(?P<name>[A-Z][A-Z0-9_]*)=(?P<value>.*)$")
 
 LOOPBACK: Final = "127.0.0.1"
@@ -71,6 +74,10 @@ COLLECTOR_LOCAL_REPOSITORY: Final = "cc-observatory-otel-collector"
 COLLECTOR_DOCKERFILE: Final = STACK / "otel-collector" / "Dockerfile"
 COLLECTOR_CONFIG: Final = STACK / "otel-collector" / "config.yaml"
 CONTRIB_MENTION: Final = re.compile(r"\bcontrib (?P<version>v?\d+(?:\.\d+)+)")
+# The stack's host label (ADR 0022): the variable the collector reads, and the characters
+# .env.example allows in its value.
+HOST_VARIABLE: Final = "CCOBS_HOST_LABEL"
+HOST_VALUE: Final = re.compile(r"[A-Za-z0-9._-]+")
 _UNITS: Final = {"b": 1, "k": 1024, "m": 1024**2, "g": 1024**3}
 _GO_UNITS: Final = {"B": 1, "KiB": 1024, "MiB": 1024**2, "GiB": 1024**3}
 
@@ -392,6 +399,23 @@ def test_env_example_defaults_match_compose() -> None:
                 assert assigned.get(match["name"]) == match["default"], match["name"]
 
 
+def test_every_stack_config_variable_has_the_default_of_env_example() -> None:
+    # The configs keep their own default, for a run outside compose (such as the CI
+    # checks of each config); it must be the value compose and .env.example give, so
+    # each default is one value wherever it is written.
+    assigned = _env_example()
+    found = 0
+    for path in _stack_configs():
+        text = path.read_text(encoding="utf-8")
+        variables = [match[0] for match in CONFIG_VARIABLE.finditer(text)]
+        defaults = list(CONFIG_DEFAULT.finditer(text))
+        assert [match[0] for match in defaults] == variables, f"{path}: a variable has no default"
+        for match in defaults:
+            assert assigned.get(match["name"]) == match["default"], f"{path}: {match[0]}"
+        found += len(defaults)
+    assert found
+
+
 def test_env_example_works_as_an_env_file() -> None:
     # The integration tests pass it to compose with --env-file: only comments, blank
     # lines and NAME=value, with no quotes, spaces or inline comments in the value.
@@ -525,6 +549,32 @@ def test_collector_memory_settings() -> None:
     service = _services(COMPOSE)["otel-collector"]
     assert service.get("mem_limit") == "256m"
     assert _environment(service).get("GOMEMLIMIT") == "204MiB"
+
+
+def test_collector_gets_the_host_label_with_its_default() -> None:
+    # The collector sets it on every signal (ADR 0022): local unless .env says otherwise,
+    # never the machine's hostname, which is personal data (ADR 0021).
+    environment = _environment(_services(COMPOSE)["otel-collector"])
+    assert environment.get(HOST_VARIABLE) == f"${{{HOST_VARIABLE}:-{DEFAULT_HOST}}}"
+    assert _env_example().get(HOST_VARIABLE) == DEFAULT_HOST
+    assert HOST_VALUE.fullmatch(DEFAULT_HOST)
+    # Only the collector reads it.
+    others = [
+        name
+        for name, service in _services(COMPOSE).items()
+        if name != "otel-collector" and HOST_VARIABLE in _environment(service)
+    ]
+    assert not others, others
+
+
+def test_env_example_documents_the_host_label() -> None:
+    # What it is, that it is stored (so a hostname would be too) and what it may hold.
+    lines = ENV_EXAMPLE.read_text(encoding="utf-8").splitlines()
+    index = lines.index(f"{HOST_VARIABLE}={DEFAULT_HOST}")
+    above = itertools.takewhile(lambda line: line.startswith("#"), reversed(lines[:index]))
+    comment = " ".join(line.lstrip("# ") for line in reversed(list(above))).lower()
+    for words in ("host label", "hostname", "letters", "digits"):
+        assert words in comment, f"the comment above {HOST_VARIABLE} does not say {words!r}"
 
 
 def test_compose_defines_loki_from_the_pinned_image() -> None:

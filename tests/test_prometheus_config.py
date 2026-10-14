@@ -1,5 +1,5 @@
 """Static checks of the Prometheus config and its command line (ADR 0013, ADR 0016,
-ADR 0018).
+ADR 0018, ADR 0022).
 
 Unit tests: they parse ``stack/prometheus/prometheus.yaml`` and the Prometheus service in
 ``compose.yaml``; Docker is not needed. ``tests/integration/test_stack_metrics.py`` runs
@@ -40,6 +40,8 @@ FORBIDDEN_FLAGS: Final = (
 # Required: without it, concurrent sessions lose whole requests (ADR 0013).
 OUT_OF_ORDER_WINDOW: Final = "30m"
 DEFAULT_TRANSLATION: Final = "UnderscoreEscapingWithSuffixes"
+# The only resource attribute promoted to a label: the stack's host label (ADR 0022).
+PROMOTED: Final = ["host"]
 # Sections that would send data out of Prometheus or read it from elsewhere.
 OUTBOUND_SECTIONS: Final = ("remote_write", "remote_read", "alerting")
 # Keys a scrape job may use: static targets over plain HTTP, no service discovery.
@@ -197,14 +199,19 @@ def test_retention_is_set_only_on_the_command_line() -> None:
 # OTLP translation.
 
 
-def test_otlp_translation_keeps_its_defaults_and_promotes_nothing() -> None:
+def test_otlp_translation_keeps_its_defaults_and_promotes_only_host() -> None:
     # claude_code.cost.usage -> claude_code_cost_usage_USD_total, session.id -> session_id,
-    # service.name -> job; the other resource attributes stay on target_info.
+    # service.name -> job; host, which the collector sets (ADR 0022), becomes a label on
+    # every series; the other resource attributes stay on target_info.
     otlp = _mapping(_config().get("otlp"), "otlp")
-    assert "promote_resource_attributes" not in otlp
+    assert otlp.get("promote_resource_attributes") == PROMOTED
     assert "promote_all_resource_attributes" not in otlp
-    assert set(otlp) <= {"translation_strategy"}, f"unexpected otlp keys {sorted(otlp)}"
+    assert "ignore_resource_attributes" not in otlp
+    allowed = {"translation_strategy", "promote_resource_attributes"}
+    assert set(otlp) <= allowed, f"unexpected otlp keys {sorted(set(otlp) - allowed)}"
     assert otlp.get("translation_strategy", DEFAULT_TRANSLATION) == DEFAULT_TRANSLATION
+    # Not an external label, which Prometheus adds only to data that leaves it.
+    assert "external_labels" not in _mapping(_config().get("global"), "global")
 
 
 # Nothing leaves Prometheus (ADR 0006, ADR 0018).

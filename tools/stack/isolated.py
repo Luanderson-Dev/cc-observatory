@@ -13,12 +13,17 @@ stack. It is kept apart from the developer's environment:
   ``CCOBS_IT_OTLP_HTTP_PORT=34318`` for ``CCOBS_OTLP_HTTP_PORT``, when a 24xxx port is
   taken or falls in a Windows excluded port range.
 
+``started_since`` tells whether a container started after the test session did, by the
+Docker daemon's timestamps, so that its start-up lines are among the logs read since.
+
 Developer tool, standard library only; not part of the published package.
 """
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
+from datetime import datetime, timedelta
 from pathlib import Path
 from types import MappingProxyType
 from typing import Final
@@ -44,6 +49,14 @@ KEEP_VARIABLE: Final = "CCOBS_IT_KEEP"
 DROPPED_PREFIXES: Final = ("CCOBS_", "COMPOSE_")
 CLEANUP_COMMAND: Final = f"docker compose -p {PROJECT} down -v --remove-orphans"
 _MAX_PORT: Final = 65535
+# A timestamp as the Docker daemon writes it (`docker info`'s SystemTime, `docker
+# inspect`'s State.StartedAt) and `docker compose logs --since` reads it: RFC 3339, with
+# up to nanoseconds.
+RFC3339: Final = re.compile(
+    r"(?P<whole>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(?P<fraction>\d+))?"
+    r"(?P<zone>Z|[+-]\d{2}:\d{2})"
+)
+_MICROSECOND_DIGITS: Final = 6
 
 
 def override_variable(name: str) -> str:
@@ -92,3 +105,21 @@ def compose_command(docker: str, root: Path, *args: str) -> list[str]:
     for profile in PROFILES:
         command += ["--profile", profile]
     return [*command, *args]
+
+
+def _instant(text: str) -> datetime:
+    """An RFC 3339 timestamp as an aware datetime, truncated to microseconds."""
+    match = RFC3339.fullmatch(text)
+    if match is None:
+        raise ValueError(f"{text!r} is not an RFC 3339 timestamp")
+    zone = "+00:00" if match["zone"] == "Z" else match["zone"]
+    fraction = (match["fraction"] or "")[:_MICROSECOND_DIGITS].ljust(_MICROSECOND_DIGITS, "0")
+    return datetime.fromisoformat(match["whole"] + zone) + timedelta(microseconds=int(fraction))
+
+
+def started_since(started_at: str, since: str) -> bool:
+    """Whether a container that started at ``started_at`` (``docker inspect``'s
+    ``State.StartedAt``) started at or after ``since``. Both are RFC 3339 timestamps by
+    the Docker daemon's clock, with any zone; a container that never started has
+    ``0001-01-01T00:00:00Z``. Raises ``ValueError`` on a timestamp that is not RFC 3339."""
+    return _instant(started_at) >= _instant(since)

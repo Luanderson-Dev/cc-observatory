@@ -49,3 +49,4 @@ the ADR wins.
 | [0019](0019-restart-unless-stopped.md)                       | The stack restarts unless stopped                                            | Accepted |
 | [0020](0020-compose-conventions.md)                          | Compose conventions for a no-extra-steps start on Linux, macOS and Windows   | Accepted |
 | [0021](0021-collector-privacy-filters.md)                    | Privacy filters in the collector (extends ADR 0006)                          | Accepted |
+| [0022](0022-the-host-label.md)                               | A `host` label on every signal, set by the collector, `local` by default     | Accepted |
