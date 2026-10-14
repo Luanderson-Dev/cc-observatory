@@ -11,10 +11,10 @@
 # (resource., datapoint., log., span., spanevent.), as 0.162.0 expects, and an OTTL
 # string needs \\ for each backslash of a regular expression.
 #
-# Events (logs) go to Loki through its OTLP endpoint (ADR 0015). Metrics and traces
-# still end in the nop exporter, which discards them, until their backends join the
-# stack. Never add a debug or file exporter: they would copy content into the container
-# logs or onto disk.
+# Metrics are made cumulative and go to Prometheus's OTLP receiver (ADR 0013); events
+# (logs) go to Loki through its OTLP endpoint (ADR 0015). Traces still end in the nop
+# exporter, which discards them, until Tempo joins the stack. Never add a debug or file
+# exporter: they would copy content into the container logs or onto disk.
 
 extensions:
   # Answers the compose healthcheck (busybox wget from inside the container).
@@ -153,6 +153,18 @@ processors:
           - delete_key(span.attributes, "error")
           - delete_key(span.attributes, "workspace.host_paths")
 
+  # Turns Claude Code's delta sums (its default temporality) into the cumulative series
+  # that Prometheus stores (ADR 0013); it runs after the privacy processors, so it never
+  # keeps a deleted attribute. Gaps between deltas are fine. Cumulative points pass
+  # through untouched, so with the cumulative preference that ccobs setup sets it keeps
+  # no state. A stream idle for longer than max_stale, or a collector restart, starts
+  # again from zero: a counter reset, which increase(...[R] anchored) counts when the new
+  # stream starts after its previous sample. 24h keeps the running totals of a session
+  # that waits on a person for hours. max_streams keeps its default (no practical
+  # limit). The state shows in otelcol_deltatocumulative_*.
+  delta_to_cumulative:
+    max_stale: 24h
+
 exporters:
   # Loki's native OTLP endpoint; the exporter appends /v1/logs. Plain HTTP on the
   # internal backend network, where Loki runs single-tenant with no authentication.
@@ -172,16 +184,45 @@ exporters:
       max_interval: 30s
       max_elapsed_time: 5m
 
-  # Placeholder for metrics and traces until their backends arrive in later stages.
+  # Prometheus's native OTLP receiver (ADR 0013). metrics_endpoint is the full URL: the
+  # exporter would append /v1/metrics to a plain endpoint. Plain HTTP on the internal
+  # backend network; the receiver has no authentication. Prometheus answers 400 to a
+  # request with a sample it cannot store, and the exporter drops it without retrying,
+  # which is why Prometheus keeps an out-of-order window.
+  otlp_http/prometheus:
+    metrics_endpoint: http://prometheus:9090/api/v1/otlp/v1/metrics
+    # As for Loki: in memory and bounded, and a full queue refuses new data.
+    sending_queue:
+      enabled: true
+      num_consumers: 2
+      queue_size: 1000
+    retry_on_failure:
+      enabled: true
+      initial_interval: 1s
+      max_interval: 30s
+      max_elapsed_time: 5m
+
+  # Placeholder for traces until Tempo arrives in a later stage.
   nop:
 
 service:
   extensions: [health_check]
+  # The collector's own metrics (otelcol_*), in Prometheus format on port 8888, scraped
+  # by Prometheus over the backend network. 0.0.0.0 because Prometheus runs in another
+  # container; the port is never published on the host.
+  telemetry:
+    metrics:
+      readers:
+        - pull:
+            exporter:
+              prometheus:
+                host: 0.0.0.0
+                port: 8888
   pipelines:
     metrics:
       receivers: [otlp]
-      processors: [memory_limiter, transform/identity, transform/content]
-      exporters: [nop]
+      processors: [memory_limiter, transform/identity, transform/content, delta_to_cumulative]
+      exporters: [otlp_http/prometheus]
     logs:
       receivers: [otlp]
       processors: [memory_limiter, transform/identity, filter/content, transform/content]

@@ -1,9 +1,11 @@
-"""Static checks of the OpenTelemetry Collector config (ADR 0003, ADR 0006, ADR 0021).
+"""Static checks of the OpenTelemetry Collector config (ADR 0003, ADR 0006, ADR 0013,
+ADR 0015, ADR 0021).
 
 Unit tests: they parse ``stack/otel-collector/config.yaml`` and the OTTL statements of
 its privacy processors, and compare the keys and events they delete with the canaries
 that ``tools.stack.replay`` plants, so that every planted canary is covered by a filter.
-The integration tests send the canaries through a running collector.
+They also check where each signal goes. The integration tests send the canaries through
+a running collector.
 """
 
 from __future__ import annotations
@@ -14,6 +16,7 @@ from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Final
+from urllib.parse import urlsplit
 
 import pytest
 import yaml
@@ -64,7 +67,25 @@ FORBIDDEN_EXPORTERS: Final = frozenset({"debug", "file", "logging"})
 # Events go to Loki's native OTLP endpoint; the exporter appends /v1/logs (ADR 0015).
 LOKI_EXPORTER: Final = "otlp_http/loki"
 LOKI_ENDPOINT: Final = "http://loki:3100/otlp"
-# Upper bound for the exporter's in-memory queue, in requests: enough to ride out a Loki
+# Metrics go to Prometheus's native OTLP receiver, made cumulative first (ADR 0013). The
+# exporter appends /v1/metrics to a plain endpoint, so the full URL is metrics_endpoint.
+PROMETHEUS_EXPORTER: Final = "otlp_http/prometheus"
+PROMETHEUS_METRICS_ENDPOINT: Final = "http://prometheus:9090/api/v1/otlp/v1/metrics"
+DELTA_TO_CUMULATIVE: Final = "delta_to_cumulative"
+# Streams of a session that waits on a person for hours keep their running totals.
+MAX_STALE: Final = "24h"
+# Exporters that would take metrics to Prometheus another way (ADR 0013).
+OTHER_PROMETHEUS_EXPORTERS: Final = frozenset(
+    {"prometheus", "prometheusremotewrite", "prometheus_remote_write"}
+)
+# The pre-0.162.0 names, now deprecated aliases.
+DEPRECATED_TYPES: Final = frozenset({"deltatocumulative", "otlphttp"})
+# The exporters that push to the stack's backends over the internal network.
+BACKEND_EXPORTERS: Final = (LOKI_EXPORTER, PROMETHEUS_EXPORTER)
+# Where the collector serves its own metrics (otelcol_*) for Prometheus to scrape: every
+# interface of its container, since Prometheus runs in another one; never published.
+TELEMETRY_ADDRESS: Final = "0.0.0.0:8888"
+# Upper bound for an exporter's in-memory queue, in requests: enough to ride out a backend
 # restart, small enough to stay well inside the collector's memory limit.
 MAX_QUEUE_REQUESTS: Final = 5000
 # Keys near the identity rule that must survive it.
@@ -336,15 +357,89 @@ def test_loki_exporter_is_only_in_logs_pipelines() -> None:
             assert LOKI_EXPORTER not in pipeline["exporters"], name
 
 
-def test_loki_exporter_needs_no_credentials_inside_the_backend_network() -> None:
-    # Loki is single-tenant on the internal backend network: plain HTTP, no headers,
-    # no authenticator and no TLS settings to keep in step.
-    exporter = _loki_exporter()
+def _prometheus_exporter() -> dict[str, object]:
+    exporters = _section("exporters")
+    assert PROMETHEUS_EXPORTER in exporters, f"no {PROMETHEUS_EXPORTER} exporter"
+    return exporters[PROMETHEUS_EXPORTER]
+
+
+def test_metrics_go_to_prometheus_through_its_otlp_receiver() -> None:
+    metrics = [name for name in PIPELINES if _signal(name) == "metrics"]
+    assert metrics == ["metrics"]
+    assert _pipelines()["metrics"]["exporters"] == [PROMETHEUS_EXPORTER]
+    exporter = _prometheus_exporter()
+    assert exporter.get("metrics_endpoint") == PROMETHEUS_METRICS_ENDPOINT
+    # With a plain endpoint the exporter would append /v1/metrics to it.
+    assert "endpoint" not in exporter
+
+
+def test_no_other_exporter_takes_metrics_to_prometheus() -> None:
+    types = {_component_type(name) for name in _section("exporters")}
+    assert not types & OTHER_PROMETHEUS_EXPORTERS
+
+
+def test_prometheus_endpoint_matches_the_compose_service_and_its_port() -> None:
+    endpoint = urlsplit(PROMETHEUS_METRICS_ENDPOINT)
+    compose = _mapping(yaml.safe_load(COMPOSE.read_text(encoding="utf-8")), "compose")
+    services = _mapping(compose["services"], "services")
+    assert endpoint.hostname in services
+    service = _mapping(services[endpoint.hostname], str(endpoint.hostname))
+    command = _strings(service.get("command"), "prometheus command")
+    # Prometheus keeps its default address (:9090), and serves the OTLP receiver at
+    # /api/v1/otlp/v1/metrics only with this flag.
+    assert endpoint.port == 9090
+    assert not [item for item in command if item.startswith("--web.listen-address")]
+    assert "--web.enable-otlp-receiver" in command
+    assert endpoint.path == "/api/v1/otlp/v1/metrics"
+
+
+def test_prometheus_exporter_is_only_in_metrics_pipelines() -> None:
+    # Prometheus's OTLP receiver only accepts metrics.
+    for name, pipeline in _pipelines().items():
+        if _signal(name) != "metrics":
+            assert PROMETHEUS_EXPORTER not in pipeline["exporters"], name
+
+
+def test_metrics_are_made_cumulative_after_the_privacy_processors() -> None:
+    # Claude Code sends delta sums by default; Prometheus stores cumulative series.
+    assert _pipelines()["metrics"]["processors"] == [
+        "memory_limiter",
+        IDENTITY,
+        CONTENT_TRANSFORM,
+        DELTA_TO_CUMULATIVE,
+    ]
+
+
+def test_delta_to_cumulative_keeps_streams_for_a_day() -> None:
+    # max_streams keeps its default (no practical limit): at most 18 series per session.
+    assert _section("processors")[DELTA_TO_CUMULATIVE] == {"max_stale": MAX_STALE}
+
+
+def test_delta_to_cumulative_is_only_in_metrics_pipelines() -> None:
+    for name, pipeline in _pipelines().items():
+        if _signal(name) != "metrics":
+            assert DELTA_TO_CUMULATIVE not in pipeline["processors"], name
+
+
+def test_no_component_uses_a_deprecated_name() -> None:
+    for section in ("receivers", "processors", "exporters", "extensions"):
+        types = {_component_type(name) for name in _section(section)}
+        assert not types & DEPRECATED_TYPES, f"{section}: {sorted(types & DEPRECATED_TYPES)}"
+
+
+@pytest.mark.parametrize("name", BACKEND_EXPORTERS)
+def test_backend_exporters_need_no_credentials_inside_the_backend_network(name: str) -> None:
+    # Loki and Prometheus run without authentication on the internal backend network:
+    # plain HTTP, no headers, no authenticator and no TLS settings to keep in step.
+    exporter = _section("exporters").get(name)
+    assert exporter is not None, f"no {name} exporter"
     assert not set(exporter) & {"headers", "auth", "tls"}
 
 
-def test_loki_exporter_queue_and_retries_are_bounded() -> None:
-    exporter = _loki_exporter()
+@pytest.mark.parametrize("name", BACKEND_EXPORTERS)
+def test_backend_exporter_queues_and_retries_are_bounded(name: str) -> None:
+    exporter = _section("exporters").get(name)
+    assert exporter is not None, f"no {name} exporter"
     queue = _mapping(exporter.get("sending_queue"), "sending_queue")
     assert queue.get("enabled") is True
     size = queue.get("queue_size")
@@ -372,6 +467,23 @@ def test_receivers_bind_the_otlp_container_ports() -> None:
     http = _mapping(protocols.get("http"), "http")
     assert grpc.get("endpoint") == "0.0.0.0:4317"
     assert http.get("endpoint") == "0.0.0.0:4318"
+
+
+def test_internal_telemetry_is_served_for_prometheus_to_scrape() -> None:
+    # One pull reader in Prometheus format, and no push (periodic) reader: nothing else
+    # receives the collector's own metrics.
+    service = _mapping(_config().get("service"), "service")
+    telemetry = _mapping(service.get("telemetry"), "service.telemetry")
+    metrics = _mapping(telemetry.get("metrics"), "service.telemetry.metrics")
+    readers = metrics.get("readers")
+    assert isinstance(readers, list), "service.telemetry.metrics.readers must be a list"
+    assert len(readers) == 1, readers
+    reader = _mapping(readers[0], "reader")
+    assert set(reader) == {"pull"}
+    exporter = _mapping(_mapping(reader["pull"], "pull").get("exporter"), "pull.exporter")
+    assert set(exporter) == {"prometheus"}
+    prometheus = _mapping(exporter["prometheus"], "pull.exporter.prometheus")
+    assert f"{prometheus.get('host')}:{prometheus.get('port')}" == TELEMETRY_ADDRESS
 
 
 def test_health_check_extension_answers_the_compose_healthcheck() -> None:

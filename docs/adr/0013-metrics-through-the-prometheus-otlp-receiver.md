@@ -86,11 +86,11 @@ state's expiry, a Prometheus restart, and windows that start mid-session.
 
 Chosen option: "C1: `delta_to_cumulative` in the collector, then `otlp_http` to
 Prometheus's native OTLP receiver", because it is the only option that was exact in
-every criterion while keeping state in one configurable, observable place and using
-standard components. A1 stores wrong totals, A2 depends on scrape timing and keeps state
-twice, C2 keeps state that cannot be configured and loses it on restarts and idle gaps,
-C3 is too early and changes every query, and remote write needs the same processor for
-a longer path.
+every criterion of the spike (see the limit under Temporality) while keeping state in
+one configurable, observable place and using standard components. A1 stores wrong
+totals, A2 depends on scrape timing and keeps state twice, C2 keeps state that cannot be
+configured and loses it on restarts and idle gaps, C3 is too early and changes every
+query, and remote write needs the same processor for a longer path.
 
 **Collector** (contrib 0.162.0):
 
@@ -152,8 +152,15 @@ a longer path.
   on one series, which failed in the spike; with delta it only worked because the points
   arrived strictly in order.
 - Delta stays supported for users who set it outside `ccobs setup`: totals remain exact
-  through `delta_to_cumulative` and `anchored`, and only per-session last values can
-  break after a collector restart or an idle gap beyond `max_stale`.
+  through `delta_to_cumulative` and `anchored`, with one limit found while building the
+  stack, after the spike. When the collector restarts and a series' next delta is
+  contiguous (its start time equals the previous point's time, as in about half of
+  Claude Code's consecutive deltas), the new stream's zero sample lands on the timestamp
+  of the last stored sample and Prometheus drops it as a duplicate; if the new running
+  total is not lower than the old one, `increase(... anchored)` loses the old total (a
+  probe on 3.13.4 returned 7 where 12 was expected). Per-session last values also break
+  after a collector restart or an idle gap beyond `max_stale`. Cumulative input, the
+  `ccobs setup` default, is not affected.
 
 **PromQL for totals:**
 
@@ -162,7 +169,7 @@ a longer path.
   for one session and
   `sum by (model) (increase(claude_code_token_usage_tokens_total[R] anchored))` across
   sessions. They were exact for single-export sessions, collector restarts (counter
-  resets), expired streams and Prometheus restarts.
+  resets; see the limit under Temporality), expired streams and Prometheus restarts.
 - Never plain `increase()` or `rate()` for totals, and never `sum_over_time()` over these
   cumulative series. Plain `increase()` was exact in no test: with the zero sample it
   gave 1.5 times the truth for single-export sessions and 1.167 times for the session
@@ -183,9 +190,11 @@ a longer path.
 
 - Good, because totals were exact in every scenario the spike ran: concurrent sessions
   with non-contiguous deltas, single-export sessions, collector and Prometheus restarts,
-  expired streams and windows that start mid-session.
-- Good, because it works whichever temporality Claude Code uses, and with the default
-  of `ccobs setup` the only running total is in Claude Code itself.
+  expired streams and windows that start mid-session (with delta input, a collector
+  restart has the limit under Temporality).
+- Good, because it works whichever temporality Claude Code uses (with delta, within the
+  limit under Temporality), and with the default of `ccobs setup` the only running
+  total is in Claude Code itself.
 - Good, because there is no scrape between the collector and Prometheus: no timing to
   tune, no second copy of the state, and no `instance` or `otel_scope_*` labels.
 - Bad, because `created-timestamp-zero-ingestion` and `promql-extended-range-selectors`
@@ -200,6 +209,9 @@ a longer path.
   first sample as an increase from zero.
 - Bad, because `delta_to_cumulative` is an alpha component. With `ccobs setup`'s
   cumulative setting it holds no state; it matters only for delta senders.
+- Bad, because with delta input a collector restart can undercount a series whose next
+  delta is contiguous (see Temporality). The cumulative default avoids it; `st-storage`
+  is the candidate fix once it works with `anchored`.
 - Bad, because the out-of-order window is a setting that must never be removed: without
   it, concurrent sessions lose data, and the loss shows only in metrics and logs (400
   responses in Prometheus, failed points in the collector's exporter).
@@ -232,13 +244,16 @@ a longer path.
   exporter.
 - A static test (a later stage of this milestone) over `compose.yaml` and the
   Prometheus configuration under `stack/prometheus/` checks `--web.enable-otlp-receiver`,
-  both feature names in `--enable-feature` and `out_of_order_time_window: 30m`;
-  `promtool check config` validates the configuration.
+  both feature names in `--enable-feature` and `out_of_order_time_window: 30m`.
+  `promtool check config` validates the configuration inside the running Prometheus
+  container, in `tests/integration/test_stack_metrics.py`, and the CI `stack` job will
+  run it too, from a later stage of this milestone.
 - An integration test in `tests/integration/` (stage 4 of this milestone) replays the
   fixtures through the stack and checks exact sums per series in the non-contiguous,
   concurrent scenario; exact `increase(... anchored)` for single-export sessions; exact
-  totals after a collector restart in the middle of a replay; and that no identity
-  label reaches Prometheus.
+  totals after a collector restart in the middle of a replay, at a split where no
+  continuing series is contiguous (a strict xfail test records the contiguous case);
+  and that no identity label reaches Prometheus.
 - The spike harness is not committed; its method and numbers are recorded here.
 - The `reviewer` subagent checks that queries for totals use `anchored`, never plain
   `increase()`, `rate()` or `sum_over_time()`.

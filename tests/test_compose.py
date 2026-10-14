@@ -58,6 +58,10 @@ BUSYBOX_IMAGE: Final = (
 LOKI_IMAGE: Final = (
     "grafana/loki:3.7.8@sha256:1107dd5274e0ada47e42472b7a7e71f3b2a2fe878878108f3e2f9e51528f0193"
 )
+PROMETHEUS_IMAGE: Final = (
+    "prom/prometheus:v3.13.4"
+    "@sha256:87861b8cf91579109319ebc300f3f1060e6da9c05d6ae8ad15a20c879e84e32e"
+)
 _UNITS: Final = {"b": 1, "k": 1024, "m": 1024**2, "g": 1024**3}
 _GO_UNITS: Final = {"B": 1, "KiB": 1024, "MiB": 1024**2, "GiB": 1024**3}
 
@@ -479,9 +483,52 @@ def test_debug_override_publishes_loki_on_loopback() -> None:
     assert _networks(override) == {"backend", "edge"}
 
 
-def test_collector_starts_without_waiting_for_loki() -> None:
+def test_compose_defines_prometheus_from_the_pinned_image() -> None:
+    assert "prometheus" in SERVICES
+    service = _services(COMPOSE)["prometheus"]
+    assert service.get("image") == PROMETHEUS_IMAGE
+    assert "build" not in service
+
+
+def test_prometheus_reads_its_config_read_only_and_keeps_data_in_a_named_volume() -> None:
+    service = _services(COMPOSE)["prometheus"]
+    assert service.get("volumes") == [
+        "./stack/prometheus:/etc/ccobs/prometheus:ro",
+        "prometheus-data:/prometheus",
+    ]
+    assert "prometheus-data" in _mapping(_load(COMPOSE).get("volumes"), "volumes")
+    assert (STACK / "prometheus" / "prometheus.yaml").is_file()
+
+
+def test_prometheus_healthcheck_uses_busybox_wget_against_ready() -> None:
+    # The image is busybox-based; /-/ready answers once Prometheus serves queries and
+    # writes, after replaying its write-ahead log.
+    healthcheck = _mapping(_services(COMPOSE)["prometheus"]["healthcheck"], "healthcheck")
+    assert healthcheck["test"] == [
+        "CMD",
+        "/bin/wget",
+        "-q",
+        "-O",
+        "/dev/null",
+        "http://127.0.0.1:9090/-/ready",
+    ]
+
+
+def test_prometheus_memory_settings() -> None:
+    service = _services(COMPOSE)["prometheus"]
+    assert service.get("mem_limit") == "512m"
+    assert _environment(service).get("GOMEMLIMIT") == "409MiB"
+
+
+def test_debug_override_publishes_prometheus_on_loopback() -> None:
+    override = _services(COMPOSE_DEBUG)["prometheus"]
+    assert override.get("ports") == ["127.0.0.1:${CCOBS_PROMETHEUS_PORT:-4390}:9090"]
+    assert _networks(override) == {"backend", "edge"}
+
+
+def test_collector_starts_without_waiting_for_the_backends() -> None:
     # The collector is the OTLP entry point: it accepts telemetry at once and its
-    # exporter queues and retries while Loki starts (ADR 0015).
+    # exporters queue and retry while Prometheus and Loki start (ADR 0013, ADR 0015).
     assert "depends_on" not in _services(COMPOSE)["otel-collector"]
 
 

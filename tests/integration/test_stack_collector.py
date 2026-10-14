@@ -1,8 +1,8 @@
 """The OpenTelemetry Collector in the isolated ``ccobs-it`` compose project.
 
-Needs Docker: ``uv run pytest -m integration --no-cov``. The collector has no backend in
-this stage (its exporter is ``nop``); later stages read the replayed data back from
-Prometheus, Loki and Tempo and search it for the canaries.
+Needs Docker: ``uv run pytest -m integration --no-cov``. These tests cover the collector
+itself (health, OTLP endpoints, accepting every scenario, logs free of canaries); the
+modules for each backend read the replayed data back from it.
 """
 
 from __future__ import annotations

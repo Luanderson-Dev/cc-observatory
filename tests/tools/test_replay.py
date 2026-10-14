@@ -40,6 +40,7 @@ from tools.stack.replay import (
     Scenario,
     SeriesKey,
     Signal,
+    contiguous_series,
     expected_totals,
     is_identity_key,
     load_scenario,
@@ -748,6 +749,73 @@ def test_expected_totals_refuse_cumulative_sums() -> None:
         expected_totals(prepared.metrics[1:])
 
     assert "last value" in str(error.value)
+
+
+def test_contiguous_series_are_those_that_go_on_with_no_gap() -> None:
+    prepared = prepare(synthetic(), now_ns=NOW)
+    sid = prepared.session_id
+    tokens = SeriesKey.of(
+        "claude_code.token.usage", {"session.id": sid, "model": "m", "type": "input"}
+    )
+    lines = SeriesKey.of("claude_code.lines_of_code.count", {"session.id": sid, "type": "added"})
+    cost = SeriesKey.of("claude_code.cost.usage", {"session.id": sid, "model": "m"})
+    metrics = prepared.metrics
+
+    # After the first request, the input tokens go on 10 s later (a gap), the lines go on
+    # at once, and the output tokens do not go on at all.
+    assert contiguous_series(metrics[:1], metrics[1:]) == (lines,)
+    # After the second, every continuing series goes on at once.
+    assert contiguous_series(metrics[:2], metrics[2:]) == tuple(sorted((tokens, lines, cost)))
+    assert contiguous_series([], metrics) == ()
+    assert contiguous_series(metrics, []) == ()
+
+
+def test_contiguous_series_compare_the_latest_point_before_with_the_earliest_after() -> None:
+    labels = {"type": "input"}
+    # Out of time order in both parts: the latest point before ends at 20 s, and the
+    # earliest point after starts at 20 s.
+    before = [
+        metrics_request(sum_metric("m", data_point(10, 20, 2, labels))),
+        metrics_request(sum_metric("m", data_point(0, 10, 1, labels))),
+    ]
+    after = [
+        metrics_request(sum_metric("m", data_point(30, 40, 4, labels))),
+        metrics_request(sum_metric("m", data_point(20, 30, 3, labels))),
+    ]
+
+    (key,) = contiguous_series(before, after)
+
+    assert key.label("type") == "input"
+    assert "user.email" not in key.label_dict()
+    assert contiguous_series(before[1:], after) == ()
+    assert contiguous_series(before, after[:1]) == ()
+
+
+def test_contiguous_series_refuse_cumulative_sums() -> None:
+    prepared = prepare(synthetic(), now_ns=NOW, temporality="cumulative")
+
+    with pytest.raises(ValueError, match="cumulative") as error:
+        contiguous_series(prepared.metrics[:1], prepared.metrics[1:])
+
+    assert "start time" in str(error.value)
+
+
+@pytest.mark.parametrize(
+    ("name", "split", "contiguous"),
+    [("interactive-permission-compact", 5, 0), ("headless-edit-commit-tasks", 1, 7)],
+)
+def test_real_fixture_restart_splits(name: str, split: int, contiguous: int) -> None:
+    # The splits of the integration tests' collector restarts (ADR 0013): one where no
+    # continuing series is contiguous, one where every continuing series is.
+    prepared = prepare(load_scenario(name), now_ns=NOW, canaries=True)
+    first, rest = prepared.metrics[:split], prepared.metrics[split:]
+
+    found = contiguous_series(first, rest)
+
+    continuing = set(expected_totals(first)) & set(expected_totals(rest))
+    assert len(found) == contiguous
+    assert set(found) <= continuing
+    assert continuing
 
 
 def test_expected_totals_skip_metrics_that_are_not_sums() -> None:

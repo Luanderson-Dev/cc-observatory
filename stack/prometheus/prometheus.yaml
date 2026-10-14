@@ -1,0 +1,47 @@
+# Prometheus 3.13 (LTS) for cc-observatory: stores Claude Code's metrics.
+#
+# The collector pushes metrics to Prometheus's native OTLP receiver,
+# /api/v1/otlp/v1/metrics, already made cumulative by its delta_to_cumulative processor
+# (ADR 0013). compose.yaml passes the settings this file cannot hold:
+#   - --web.enable-otlp-receiver turns the receiver on. It has no authentication, so
+#     Prometheus stays on the internal backend network (ADR 0018).
+#   - --enable-feature=created-timestamp-zero-ingestion,promql-extended-range-selectors
+#     stores a 0 sample at each stream's start time and enables the anchored modifier.
+#     Totals are increase(x[R] anchored): never plain increase(), rate() or
+#     sum_over_time() (ADR 0013).
+#   - --storage.tsdb.retention.time comes from CCOBS_PROMETHEUS_RETENTION, 90 days by
+#     default (ADR 0016).
+# There is no remote_write, remote_read or alerting: nothing leaves Prometheus.
+
+global:
+  # How often Prometheus scrapes the two jobs below; Claude Code's metrics are pushed.
+  scrape_interval: 15s
+
+storage:
+  tsdb:
+    # Required, never remove it. Concurrent sessions share one resource (Claude Code
+    # sends no service.instance.id), so their target_info samples interleave, and the
+    # exporter's queue can deliver requests out of order. Without the window, Prometheus
+    # answers 400 to a request with any out-of-order sample and rolls back all of it,
+    # and the collector drops the request: concurrent sessions lose whole requests.
+    # 30m is the value of Prometheus's OTLP guide.
+    out_of_order_time_window: 30m
+
+# OTLP translation keeps its defaults (translation_strategy UnderscoreEscapingWithSuffixes):
+# claude_code.cost.usage becomes claude_code_cost_usage_USD_total, session.id becomes
+# session_id and service.name becomes job="claude-code"; the other resource attributes
+# stay on the target_info series. No resource attribute is promoted to a label.
+otlp: {}
+
+scrape_configs:
+  # Prometheus's own metrics, such as the OTLP requests it refused
+  # (prometheus_http_requests_total{handler="/api/v1/otlp/v1/metrics",code="400"}).
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+  # The collector's own metrics (otelcol_*): exporter failures and the state of
+  # delta_to_cumulative (otelcol_deltatocumulative_*), served on port 8888 inside the
+  # stack's networks (service.telemetry in stack/otel-collector/config.yaml).
+  - job_name: otel-collector
+    static_configs:
+      - targets: ["otel-collector:8888"]

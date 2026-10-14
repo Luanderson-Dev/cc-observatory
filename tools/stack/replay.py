@@ -533,16 +533,11 @@ def expected_totals(requests: Iterable[JSONObject]) -> Mapping[SeriesKey, Number
     Raises ``ValueError`` on a sum that is not delta: for cumulative input, the total of a
     subset is the last value of each series, not a sum of its points."""
     requests = list(requests)
-    for request in requests:
-        for _, metric in _entries(request, "metrics"):
-            data = metric.get("sum")
-            temporality = data.get("aggregationTemporality") if isinstance(data, dict) else _DELTA
-            if temporality != _DELTA:
-                raise ValueError(
-                    f"expected totals need delta sums, but {metric.get('name')} has "
-                    f"aggregationTemporality {temporality} (2 is cumulative): for cumulative "
-                    "sums, the total of a subset is the last value of each series"
-                )
+    _require_delta(
+        requests,
+        "expected totals",
+        "for cumulative sums, the total of a subset is the last value of each series",
+    )
     totals: dict[SeriesKey, Number] = {}
     for found in _delta_sum_points(requests):
         value = _point_value(found.point)
@@ -550,6 +545,60 @@ def expected_totals(requests: Iterable[JSONObject]) -> Mapping[SeriesKey, Number
             key = SeriesKey.of(found.metric, _labels(found.point))
             totals[key] = totals.get(key, 0) + value
     return MappingProxyType(totals)
+
+
+def contiguous_series(
+    first: Iterable[JSONObject], rest: Iterable[JSONObject]
+) -> tuple[SeriesKey, ...]:
+    """The series of ``first`` that go on in ``rest`` with no gap, sorted: their earliest
+    point in ``rest`` starts at the time of their latest point in ``first``.
+
+    ``first`` and ``rest`` are the parts of a run's metric requests sent around a
+    collector restart. ``delta_to_cumulative`` then starts each continuing series again
+    at its next point's start time; for these series that is the time of the last sample
+    Prometheus stored, so Prometheus drops the new stream's zero sample as a duplicate,
+    and if the new running total is not lower than the old one, ``increase(...
+    anchored)`` loses the old total (ADR 0013). Keys are those of ``expected_totals``.
+
+    Raises ``ValueError`` on a sum that is not delta: a cumulative stream keeps one start
+    time for its whole life."""
+    first, rest = list(first), list(rest)
+    _require_delta(
+        [*first, *rest],
+        "contiguous series",
+        "a cumulative stream keeps one start time for its whole life",
+    )
+    ends: dict[SeriesKey, int] = {}
+    for found in _delta_sum_points(first):
+        key = SeriesKey.of(found.metric, _labels(found.point))
+        ends[key] = max(ends.get(key, 0), _nanos(found.point.get("timeUnixNano", 0)))
+    # Per series of rest: (time, start time) of its earliest point.
+    nexts: dict[SeriesKey, tuple[int, int]] = {}
+    for found in _delta_sum_points(rest):
+        key = SeriesKey.of(found.metric, _labels(found.point))
+        point = (
+            _nanos(found.point.get("timeUnixNano", 0)),
+            _nanos(found.point.get("startTimeUnixNano", 0)),
+        )
+        if key not in nexts or point[0] < nexts[key][0]:
+            nexts[key] = point
+    return tuple(
+        sorted(key for key, (_, start) in nexts.items() if key in ends and start == ends[key])
+    )
+
+
+def _require_delta(requests: Iterable[JSONObject], purpose: str, reason: str) -> None:
+    """Raise ``ValueError`` if a sum in ``requests`` is not delta, naming ``purpose``
+    and why it needs delta."""
+    for request in requests:
+        for _, metric in _entries(request, "metrics"):
+            data = metric.get("sum")
+            temporality = data.get("aggregationTemporality") if isinstance(data, dict) else _DELTA
+            if temporality != _DELTA:
+                raise ValueError(
+                    f"{purpose} need delta sums, but {metric.get('name')} has "
+                    f"aggregationTemporality {temporality} (2 is cumulative): {reason}"
+                )
 
 
 def _attribute_identity(owner: JSON) -> list[str]:

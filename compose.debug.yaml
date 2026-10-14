@@ -10,6 +10,14 @@
 # added here by the stage that brings it.
 
 services:
+  # Prometheus's HTTP API and UI: queries, /api/v1/status and /-/ready.
+  prometheus:
+    ports:
+      - "127.0.0.1:${CCOBS_PROMETHEUS_PORT:-4390}:9090"
+    networks:
+      - backend
+      - edge
+
   # Loki's HTTP API: queries, /config and /ready.
   loki:
     ports:
