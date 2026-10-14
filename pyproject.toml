@@ -77,7 +77,9 @@ ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 addopts = "-ra --strict-markers --strict-config -m 'not integration' --cov=ccobs --cov-report=term-missing"
-markers = ["integration: needs the docker compose stack running"]
+markers = [
+  "integration: starts an isolated docker compose project (ccobs-it) and talks to it",
+]
 # The repository root goes on sys.path so tests can import the `tools` package.
 pythonpath = ["."]
 testpaths = ["tests"]
@@ -107,5 +109,7 @@ dev = [
   "pre-commit>=4.7.0",
   "pytest>=9.1.1",
   "pytest-cov>=7.1.0",
+  "pyyaml>=6.0.3",
   "ruff>=0.17.0",
+  "types-pyyaml>=6.0.12.20260906",
 ]

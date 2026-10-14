@@ -8,7 +8,7 @@ sessions. ``prepare`` turns one scenario into requests that look fresh:
 - ``session.id`` becomes a new UUID, and trace and span IDs get fresh random values
   through one mapping per run, so log records still point at their spans;
 - optionally, the delta sums become cumulative, and canary values are planted where the
-  collector must delete or drop them (identity and content attributes, ADR 0006).
+  collector must delete or drop them (identity and content attributes, ADR 0021).
 
 It also computes the total each metric series should reach once stored. ``post_otlp`` and
 ``send`` deliver the requests. Run it from the repository root::
@@ -54,21 +54,15 @@ MAX_ERROR_BODY: Final = 300
 # Bytes of a response body read at most.
 _MAX_REPLY_BYTES: Final = 64 * 1024
 
-# Attributes the collector deletes as personal data: the identity attributes of ADR 0006
-# (``user.email``, ``user.id``, ``user.account_uuid``, ``user.account_id``,
-# ``organization.id``, ``user.groups``, ``identity.source``), widened in milestone 1
-# (decision D14) to every ``user.*`` and ``enduser.*`` key and ``host.name``. ADR 0021
-# (milestone 1), "privacy filters in the collector", records the full rule.
+# Attributes the collector always deletes as personal data (ADR 0021): every ``user.*``
+# and ``enduser.*`` key, plus ``organization.id``, ``identity.source`` and ``host.name``.
 IDENTITY_KEYS: Final = frozenset({"organization.id", "identity.source", "host.name"})
 IDENTITY_PREFIXES: Final = ("user.", "enduser.")
 
 # Canaries: values planted where the collector must delete or drop them. Later stages
 # search the stored data for the run's marker to prove that nothing got through. The
-# lists hold what ADR 0006 has the collector drop, plus the extension approved for
-# milestone 1 (decision D14): ``host.name`` and ``enduser.*`` among the identity
-# attributes, and content attributes that Claude Code's monitoring docs name but the
-# fixtures never showed. ADR 0021 (milestone 1), "privacy filters in the collector",
-# records them.
+# lists are the identity and content lists of ADR 0021, including the names that only
+# Claude Code's monitoring docs mention (the fixtures never showed them).
 CANARY_PREFIX: Final = "ccobs-canary-"
 IDENTITY_CANARY_KEYS: Final = (
     "user.email",
@@ -91,6 +85,7 @@ LOG_CONTENT_CANARY_KEYS: Final = (
     "error",
     "body",
     "body_ref",
+    "hook_definitions",
     "workspace.host_paths",
 )
 SPAN_CONTENT_CANARY_KEYS: Final = (
@@ -101,6 +96,8 @@ SPAN_CONTENT_CANARY_KEYS: Final = (
     "user_system_prompt",
     "response.model_output",
     "tool_input",
+    "full_command",
+    "file_path",
     "hook_definitions",
     "error",
 )
@@ -237,8 +234,8 @@ def load_scenario(name: str, fixtures_dir: Path = DEFAULT_FIXTURES) -> Scenario:
 
 
 def is_identity_key(key: str) -> bool:
-    """Whether the collector deletes the attribute ``key`` as personal data (ADR 0006,
-    widened in milestone 1; see ``IDENTITY_KEYS``)."""
+    """Whether the collector deletes the attribute ``key`` as personal data (ADR 0021;
+    see ``IDENTITY_KEYS``)."""
     return key in IDENTITY_KEYS or key.startswith(IDENTITY_PREFIXES)
 
 
@@ -258,7 +255,8 @@ def label_value(value: JSON) -> str:
 
 def _labels(owner: JSONObject) -> dict[str, str]:
     """The attributes of ``owner`` as text, without identity attributes and data point
-    canary keys (the collector drops both while content capture is off)."""
+    canary keys (the collector always drops identity, and drops the content keys while
+    content capture is off)."""
     labels: dict[str, str] = {}
     for attribute in _objects(owner.get("attributes")):
         key = attribute.get("key")

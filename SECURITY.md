@@ -63,6 +63,9 @@ to each part from the release that ships it.
   Planned defences, in the app from v0.3.0: a `Host` header allowlist (`localhost`,
   `127.0.0.1`, `[::1]`); a hook endpoint that ignores any request whose `Content-Type`
   is not `application/json` (still answering with an empty 2xx); and no permissive CORS.
+  The collector's OTLP/HTTP receiver (port 4318, from v0.2.0) accepts any `Host` header,
+  so a DNS rebinding page could post fake telemetry to it; it cannot read anything back
+  through it, and a plain cross-site POST of JSON fails the CORS preflight.
 - **Do not expose it.** Do not publish the ports on other interfaces, and do not put the
   stack behind a reverse proxy, tunnel or port forward without adding authentication in
   front of it.
@@ -85,10 +88,12 @@ to each part from the release that ships it.
   and the app; without it, the collector drops content even if Claude Code sends it.
   Captured content can include source code, file contents and any secret that shows up
   in a prompt or a tool's output.
-- **Personal attributes.** The collector deletes `user.email`, `user.id` (on gateway
-  sessions it is the identity provider subject), `user.account_uuid`, `user.account_id`
-  and `organization.id` (and `user.groups` and `identity.source` on gateway sessions)
-  from the telemetry before it is stored.
+- **Personal attributes.** The collector always deletes every attribute whose name
+  starts with `user.` or `enduser.` (such as `user.email`, `user.id`, which on gateway
+  sessions is the identity provider subject, `user.account_uuid`, `user.account_id` and
+  `user.groups`), plus `organization.id`, `identity.source` and `host.name`, from the
+  telemetry before it is stored, including any you add through
+  `OTEL_RESOURCE_ATTRIBUTES` ([ADR 0021](docs/adr/0021-collector-privacy-filters.md)).
 - **No outbound traffic.** At runtime, nothing leaves your machine except the optional
   Discord webhook, and only if you configure one; alerts sent through it leave your
   machine. This is a requirement of the bundled stack: from v0.2.0 its configs turn off

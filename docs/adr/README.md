@@ -41,3 +41,7 @@ the ADR wins.
 | [0010](0010-mit-license.md)                                | MIT license                                                                  | Accepted |
 | [0011](0011-hook-delivery-http-plus-async-sessionstart.md) | Hook delivery: http hooks plus an async command hook for SessionStart        | Accepted |
 | [0012](0012-observed-telemetry-and-hook-contract.md)       | Observed telemetry and hook contract of Claude Code 2.1.296                  | Accepted |
+| [0018](0018-ports-networks-and-exposure.md)                | Ports and networks: minimal exposure in a dedicated port block               | Accepted |
+| [0019](0019-restart-unless-stopped.md)                     | The stack restarts unless stopped                                            | Accepted |
+| [0020](0020-compose-conventions.md)                        | Compose conventions for a no-extra-steps start on Linux, macOS and Windows   | Accepted |
+| [0021](0021-collector-privacy-filters.md)                  | Privacy filters in the collector (extends ADR 0006)                          | Accepted |

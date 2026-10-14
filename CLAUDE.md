@@ -147,11 +147,11 @@ a new ADR supersedes it, and only the old one's status line changes.
 - The collector also drops content-bearing telemetry (attributes such as `prompt`,
   `response` and `tool_input`, the raw API body and system prompt events, `tool.output`
   span events, `workspace.host_paths`) while the opt-in is off, even if `OTEL_LOG_*`
-  flags were set outside `ccobs setup` (ADR 0006).
-- The collector deletes personal attributes (`user.email`, `user.id` (the identity
-  provider subject on gateway sessions), `user.account_uuid`, `user.account_id`,
-  `organization.id`, and `user.groups` and `identity.source` on gateway sessions) by
-  default.
+  flags were set outside `ccobs setup` (ADRs 0006 and 0021).
+- The collector always deletes personal attributes: every key that starts with `user.`
+  or `enduser.` (such as `user.email`, `user.id` (the identity provider subject on
+  gateway sessions), `user.account_uuid`, `user.account_id` and `user.groups`), plus
+  `organization.id`, `identity.source` and `host.name` (ADR 0021).
 - Paths in hook payloads (`cwd`, `transcript_path`, ...) contain the OS username;
   treat them as personal data.
 - Test fixtures come from real sessions but are sanitized; a guard test fails if

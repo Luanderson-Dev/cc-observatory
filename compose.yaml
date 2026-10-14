@@ -1,0 +1,61 @@
+# cc-observatory: the local observability stack for Claude Code.
+#
+#   docker compose up -d
+#
+# Every published port binds to 127.0.0.1 (ADR 0001) and can be moved with the
+# variable named next to it; copying .env.example to .env is optional. Storage
+# services stay on the internal `backend` network; compose.debug.yaml publishes
+# them on loopback for debugging.
+
+name: cc-observatory
+
+# Settings shared by every service.
+x-service: &service
+  restart: unless-stopped
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  logging:
+    driver: json-file
+    options:
+      max-size: 10m
+      max-file: "3"
+
+networks:
+  # No egress: services only on this network cannot reach the internet or other
+  # networks.
+  backend:
+    internal: true
+  # Normal bridge network, for services that publish ports.
+  edge: {}
+
+services:
+  # OTLP entry point: removes identity and content attributes (ADR 0006), then routes
+  # each signal to its store. The image is the pinned upstream collector plus a static
+  # busybox for the healthcheck (stack/otel-collector/Dockerfile).
+  otel-collector:
+    <<: *service
+    build: stack/otel-collector
+    image: cc-observatory-otel-collector:0.162.0
+    pull_policy: build
+    command: ["--config=/etc/ccobs/otel-collector/config.yaml"]
+    volumes:
+      - ./stack/otel-collector:/etc/ccobs/otel-collector:ro
+    ports:
+      - "127.0.0.1:${CCOBS_OTLP_GRPC_PORT:-4317}:4317"
+      - "127.0.0.1:${CCOBS_OTLP_HTTP_PORT:-4318}:4318"
+    mem_limit: 256m
+    environment:
+      # About 80% of mem_limit, so the Go runtime collects garbage before the limit.
+      GOMEMLIMIT: 204MiB
+    healthcheck:
+      test: ["CMD", "/busybox", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:13133/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+      start_interval: 2s
+    networks:
+      - backend
+      - edge

@@ -1,0 +1,173 @@
+# OpenTelemetry Collector (contrib 0.162.0) for cc-observatory.
+#
+# The single OTLP entry point of the stack (ADR 0003). Every pipeline starts with
+# memory_limiter and then removes personal data before anything leaves the collector
+# (ADR 0006, ADR 0021):
+#   - transform/identity always deletes identity attributes;
+#   - filter/content and transform/content drop content while content capture is off.
+#     Milestone 4 turns the opt-in on by taking these two out of the pipelines.
+# The privacy processors fail closed (error_mode: propagate): a statement error refuses
+# the batch instead of passing it on unfiltered. OTTL paths carry their context prefix
+# (resource., datapoint., log., span., spanevent.), as 0.162.0 expects, and an OTTL
+# string needs \\ for each backslash of a regular expression.
+#
+# There is no backend yet: every pipeline ends in the nop exporter, which discards the
+# data. Never add a debug or file exporter: they would copy content into the container
+# logs or onto disk.
+
+extensions:
+  # Answers the compose healthcheck (busybox wget from inside the container).
+  health_check:
+    endpoint: 127.0.0.1:13133
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  # Percentages of the container's memory limit (mem_limit in compose.yaml).
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 80
+    spike_limit_percentage: 25
+
+  # Identity, always deleted at every level: every user.* and enduser.* key, plus
+  # organization.id, identity.source and host.name.
+  transform/identity:
+    error_mode: propagate
+    metric_statements:
+      - context: resource
+        statements:
+          - delete_matching_keys(resource.attributes, "^(user|enduser)\\.")
+          - delete_key(resource.attributes, "organization.id")
+          - delete_key(resource.attributes, "identity.source")
+          - delete_key(resource.attributes, "host.name")
+      - context: datapoint
+        statements:
+          - delete_matching_keys(datapoint.attributes, "^(user|enduser)\\.")
+          - delete_key(datapoint.attributes, "organization.id")
+          - delete_key(datapoint.attributes, "identity.source")
+          - delete_key(datapoint.attributes, "host.name")
+    log_statements:
+      - context: resource
+        statements:
+          - delete_matching_keys(resource.attributes, "^(user|enduser)\\.")
+          - delete_key(resource.attributes, "organization.id")
+          - delete_key(resource.attributes, "identity.source")
+          - delete_key(resource.attributes, "host.name")
+      - context: log
+        statements:
+          - delete_matching_keys(log.attributes, "^(user|enduser)\\.")
+          - delete_key(log.attributes, "organization.id")
+          - delete_key(log.attributes, "identity.source")
+          - delete_key(log.attributes, "host.name")
+    trace_statements:
+      - context: resource
+        statements:
+          - delete_matching_keys(resource.attributes, "^(user|enduser)\\.")
+          - delete_key(resource.attributes, "organization.id")
+          - delete_key(resource.attributes, "identity.source")
+          - delete_key(resource.attributes, "host.name")
+      - context: span
+        statements:
+          - delete_matching_keys(span.attributes, "^(user|enduser)\\.")
+          - delete_key(span.attributes, "organization.id")
+          - delete_key(span.attributes, "identity.source")
+          - delete_key(span.attributes, "host.name")
+      - context: spanevent
+        statements:
+          - delete_matching_keys(spanevent.attributes, "^(user|enduser)\\.")
+          - delete_key(spanevent.attributes, "organization.id")
+          - delete_key(spanevent.attributes, "identity.source")
+          - delete_key(spanevent.attributes, "host.name")
+
+  # Content, whole records: the events that only carry content (Claude Code sets
+  # event.name to the bare name and the body to claude_code.<name>; event_name covers
+  # the OTLP field, which Claude Code leaves empty today) and tool.output span events.
+  # log_conditions and trace_conditions take their context from the path prefix: log.
+  # drops log records, spanevent. drops span events and keeps their spans.
+  filter/content:
+    error_mode: propagate
+    log_conditions:
+      - log.attributes["event.name"] == "api_request_body"
+      - log.attributes["event.name"] == "api_response_body"
+      - log.attributes["event.name"] == "system_prompt"
+      - log.event_name == "api_request_body"
+      - log.event_name == "api_response_body"
+      - log.event_name == "system_prompt"
+      - log.body == "claude_code.api_request_body"
+      - log.body == "claude_code.api_response_body"
+      - log.body == "claude_code.system_prompt"
+    trace_conditions:
+      - spanevent.name == "tool.output"
+
+  # Content, attributes: prompts, responses, tool inputs and parameters, commands, file
+  # paths, hook definitions, free-text errors, request bodies and host paths (which
+  # contain the OS username).
+  transform/content:
+    error_mode: propagate
+    metric_statements:
+      - context: resource
+        statements:
+          - delete_key(resource.attributes, "workspace.host_paths")
+      - context: datapoint
+        statements:
+          - delete_key(datapoint.attributes, "workspace.host_paths")
+    log_statements:
+      - context: resource
+        statements:
+          - delete_key(resource.attributes, "workspace.host_paths")
+      - context: log
+        statements:
+          - delete_key(log.attributes, "prompt")
+          - delete_key(log.attributes, "prompt_text")
+          - delete_key(log.attributes, "response")
+          - delete_key(log.attributes, "tool_parameters")
+          - delete_key(log.attributes, "tool_input")
+          - delete_key(log.attributes, "error")
+          - delete_key(log.attributes, "body")
+          - delete_key(log.attributes, "body_ref")
+          - delete_key(log.attributes, "hook_definitions")
+          - delete_key(log.attributes, "workspace.host_paths")
+    trace_statements:
+      - context: resource
+        statements:
+          - delete_key(resource.attributes, "workspace.host_paths")
+      - context: span
+        statements:
+          - delete_key(span.attributes, "user_prompt")
+          - delete_key(span.attributes, "new_context")
+          - delete_key(span.attributes, "system_reminders")
+          - delete_key(span.attributes, "system_prompt_preview")
+          - delete_key(span.attributes, "user_system_prompt")
+          - delete_key(span.attributes, "response.model_output")
+          - delete_key(span.attributes, "tool_input")
+          - delete_key(span.attributes, "full_command")
+          - delete_key(span.attributes, "file_path")
+          - delete_key(span.attributes, "hook_definitions")
+          - delete_key(span.attributes, "error")
+          - delete_key(span.attributes, "workspace.host_paths")
+
+exporters:
+  # Placeholder until the backends arrive in later stages.
+  nop:
+
+service:
+  extensions: [health_check]
+  pipelines:
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, transform/identity, transform/content]
+      exporters: [nop]
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, transform/identity, filter/content, transform/content]
+      exporters: [nop]
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, transform/identity, filter/content, transform/content]
+      exporters: [nop]

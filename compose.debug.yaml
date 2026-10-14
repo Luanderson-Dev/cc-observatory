@@ -1,0 +1,12 @@
+# Debug override: publishes the storage services on 127.0.0.1, for debugging only.
+#
+#   docker compose -f compose.yaml -f compose.debug.yaml up -d
+#
+# compose.yaml keeps Prometheus, Loki and Tempo on the internal `backend` network
+# with no published port. This override publishes each one on loopback (ports set by
+# CCOBS_PROMETHEUS_PORT, CCOBS_LOKI_PORT and CCOBS_TEMPO_PORT) and attaches it to the
+# `edge` network, because a service only on an internal network cannot publish ports.
+# The services are added by the stages that bring them; until then this file adds
+# nothing.
+
+services: {}

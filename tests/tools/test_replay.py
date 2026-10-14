@@ -889,6 +889,16 @@ def test_canary_key_lists_cover_every_level() -> None:
     assert host_paths in LOG_CONTENT_CANARY_KEYS
 
 
+def test_content_canaries_include_the_names_only_the_monitoring_docs_give() -> None:
+    # hook_definitions on hook_execution_start/complete events, and full_command and
+    # file_path on claude_code.tool spans, all set by OTEL_LOG_TOOL_DETAILS (ADR 0021).
+    assert "hook_definitions" in LOG_CONTENT_CANARY_KEYS
+    assert {"full_command", "file_path", "hook_definitions"} <= set(SPAN_CONTENT_CANARY_KEYS)
+    metadata = {"skill_name", "subagent_type", "workflow.name", "vcs.repository.name"}
+    metadata |= {"managed_settings.helper.path"}
+    assert not metadata & {*LOG_CONTENT_CANARY_KEYS, *SPAN_CONTENT_CANARY_KEYS}
+
+
 def test_host_path_canaries_reach_resources_points_records_and_spans() -> None:
     prepared = prepare(synthetic(), now_ns=NOW, canaries=True)
     marker = prepared.canary_marker

@@ -142,10 +142,11 @@ not from the documentation alone.
   suffixes may be added), so code and dashboards use the names recorded in the ADRs,
   never guesses. [ADR 0012](adr/0012-observed-telemetry-and-hook-contract.md) records
   the names Claude Code sends; the translated names come with milestone 1.
-- **Personal attributes are dropped in the collector**: `user.email`, `user.id` (on
-  gateway sessions it is the identity provider subject), `user.account_uuid`,
-  `user.account_id`, `organization.id`, and `user.groups` and `identity.source` on
-  gateway sessions.
+- **Personal attributes are dropped in the collector**, always: every key that starts
+  with `user.` or `enduser.` (such as `user.email`, `user.id`, which on gateway sessions
+  is the identity provider subject, `user.account_uuid`, `user.account_id` and
+  `user.groups`), plus `organization.id`, `identity.source` and `host.name`
+  ([ADR 0021](adr/0021-collector-privacy-filters.md)).
 - **Metadata only by default.** Without the capture-content opt-in, prompts, tool inputs
   and outputs, assistant messages and error text are dropped before anything is stored.
   The opt-in has to be turned on in Claude Code's content variables, the collector and
