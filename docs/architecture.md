@@ -1,10 +1,12 @@
 # Architecture
 
 A short technical overview for contributors. cc-observatory is pre-alpha: today the
-repository holds only the Python package skeleton, a CLI that prints its version, and
-the tooling around them. Everything else on this page is the planned design, and each
-part names the milestone that brings it (milestones and releases are listed in the
-roadmap in the [README](../README.md)).
+repository holds the Python package skeleton, a CLI that prints its version, the tooling
+around them, the development-only fixture capture tooling (`tools/capture/`, not
+packaged) and sanitized fixtures recorded from real Claude Code sessions
+(`tests/fixtures/`). Everything else on this page is the planned design, and each part
+names the milestone that brings it (milestones and releases are listed in the roadmap in
+the [README](../README.md)).
 
 Decisions and their reasons are recorded as architecture decision records (ADRs, MADR
 format) in [`docs/adr/`](adr/README.md). When this page and an ADR disagree, the ADR
@@ -51,7 +53,7 @@ Claude Code's native OpenTelemetry support exports:
 - **events** (log records), such as `claude_code.api_request`, `claude_code.api_error`,
   `claude_code.tool_result` and `claude_code.tool_decision`;
 - **traces** (beta, opt-in), in which a subagent's API and tool spans nest under the
-  parent's tool span.
+  span of the Agent tool call that started it.
 
 Good for: tokens, cost (an estimate computed by Claude Code), API requests and errors,
 tool results, and the subagent hierarchy (from traces). Prometheus, Loki, Tempo and
@@ -74,8 +76,12 @@ Not good for: tokens and cost, which come from the telemetry. Hooks are point ev
 the app keeps the current state and the recent history it needs, and long-term analysis
 stays with the telemetry backends.
 
-The exact list of hook events that `ccobs setup` registers is decided in the hooks ADR,
-based on real payloads captured in milestone 0.
+How hooks reach the app is decided in
+[ADR 0011](adr/0011-hook-delivery-http-plus-async-sessionstart.md): `http` hooks with a
+1-second timeout, plus an async command hook that posts `SessionStart` with `curl`,
+because `SessionStart` does not accept `http` hooks. The exact list of hook events that
+`ccobs setup` registers is decided with the session state machine in milestone 2, from
+the payloads that [ADR 0012](adr/0012-observed-telemetry-and-hook-contract.md) records.
 
 ### Live state in `/metrics`
 
@@ -119,10 +125,14 @@ not from the documentation alone.
   `WorktreeRemove`, `PreModelSwitch`, `MessageDisplay`, `FileChanged`) are never
   registered.
 - **Claude Code keeps working with the stack down.** It treats a failed `http` hook as a
-  non-blocking error and carries on, but some events can show a hook-error notice in the
-  transcript. How cc-observatory handles that trade-off is recorded in the hooks ADR.
-- **`SessionStart` and `Setup` do not accept `http` hooks.** The app has to learn about
-  a new session from another event or another hook type; the hooks ADR decides which.
+  non-blocking error and carries on, but each event sent by an `http` hook then shows a
+  hook-error notice in the transcript (the notices are not sent to the model). How
+  cc-observatory handles that trade-off is recorded in
+  [ADR 0011](adr/0011-hook-delivery-http-plus-async-sessionstart.md).
+- **`SessionStart` and `Setup` do not accept `http` hooks.** `SessionStart` reaches the
+  app through an async command hook, which can arrive after later events or not at all,
+  so the app creates a session from whichever event arrives first
+  ([ADR 0011](adr/0011-hook-delivery-http-plus-async-sessionstart.md)).
 - **OpenTelemetry defaults need explicit settings.** Claude Code has no default OTLP
   protocol, so `ccobs setup` always sets one. Its default metrics temporality is delta,
   while Prometheus stores cumulative series; how the stack bridges the two is recorded
@@ -130,7 +140,8 @@ not from the documentation alone.
 - **Metric names change on the way to Prometheus.** OpenTelemetry names such as
   `claude_code.token.usage` are translated (dots become underscores, and unit and type
   suffixes may be added), so code and dashboards use the names recorded in the ADRs,
-  never guesses.
+  never guesses. [ADR 0012](adr/0012-observed-telemetry-and-hook-contract.md) records
+  the names Claude Code sends; the translated names come with milestone 1.
 - **Personal attributes are dropped in the collector**: `user.email`, `user.id` (on
   gateway sessions it is the identity provider subject), `user.account_uuid`,
   `user.account_id`, `organization.id`, and `user.groups` and `identity.source` on

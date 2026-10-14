@@ -127,9 +127,10 @@ a new ADR supersedes it, and only the old one's status line changes.
 - Never register `WorktreeCreate`, `WorktreeRemove`, `PreModelSwitch`,
   `MessageDisplay` or `FileChanged`: registering them changes Claude Code's behaviour.
 - `SessionStart` and `Setup` do not accept `http` hooks.
-- Claude Code must keep working normally with the stack down; this is tested. A down
-  stack can still produce hook-error notices on some events; how we handle that
-  trade-off is recorded in the hooks ADR.
+- Claude Code must keep working normally with the stack down; this is tested. With the
+  stack down, every event delivered by an `http` hook shows a hook-error notice in the
+  transcript (not sent to the model); how we handle that trade-off is recorded in ADR
+  0011.
 
 ### Privacy
 
@@ -197,6 +198,9 @@ uv run pytest tests/test_cli.py --no-cov    # one file (skip the coverage gate)
 ```text
 src/ccobs/        package (CLI entry point in cli.py)
 tests/            unit tests; integration tests are marked @pytest.mark.integration
+tests/fixtures/   sanitized real payloads (hooks and OTLP) captured from Claude Code
+tools/capture/    dev-only fixture capture tooling (not packaged; tests import it
+                  through `pythonpath = ["."]`); its `out/` holds raw data, never committed
 docs/adr/         architecture decision records (MADR)
 .claude/agents/   project subagents
 ```

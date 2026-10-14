@@ -66,11 +66,20 @@ select = ["E", "F", "W", "I", "B", "UP", "SIM", "N", "S", "RUF", "C4", "PT"]
 [tool.mypy]
 strict = true
 python_version = "3.12"
-files = ["src", "tests"]
+files = ["src", "tests", "tools"]
+
+# The capture tools import pywinpty (`winpty`) and the MCP SDK (`mcp`, which brings
+# `pydantic`) only when they run through `uv run --with ...`. They are not dev
+# dependencies, so mypy has neither the packages nor their stubs here.
+[[tool.mypy.overrides]]
+module = ["winpty", "mcp.*", "pydantic"]
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 addopts = "-ra --strict-markers --strict-config -m 'not integration' --cov=ccobs --cov-report=term-missing"
 markers = ["integration: needs the docker compose stack running"]
+# The repository root goes on sys.path so tests can import the `tools` package.
+pythonpath = ["."]
 testpaths = ["tests"]
 xfail_strict = true
 
