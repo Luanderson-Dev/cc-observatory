@@ -49,3 +49,55 @@ updates:
       pre-commit-hooks:
         patterns:
           - "*"
+
+  # Images in compose.yaml (Dependabot reads the compose*.yaml files in the directory).
+  # Each one is pinned as name:tag@sha256:<index digest> (ADR 0020), and Dependabot changes
+  # the tag and the digest together, fetching the new tag's digest from the registry
+  # (dependabot-core's docker update checker; GitHub's docs do not describe digests).
+  # Dependabot raises no security updates for images, so a release that fixes
+  # vulnerabilities may be applied by hand before the cooldown ends (ADR 0020).
+  # No group: each image gets a pull request of its own, so a breaking release of one
+  # service (say Loki) never holds back a patch of another (say Prometheus).
+  - package-ecosystem: docker-compose
+    directory: /
+    target-branch: develop
+    schedule:
+      interval: weekly
+    # Docker and Docker Compose accept only default-days (no semver-*-days).
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: build
+      include: scope
+    ignore:
+      # Prometheus stays on the 3.13 LTS line, supported until 2027-07-31 (ADR 0013): the
+      # stack relies on two experimental feature flags, which a minor release can change
+      # or remove, so moving to a newer line is done by hand, with the integration tests.
+      # Patch releases of 3.13 still come through here.
+      - dependency-name: prom/prometheus
+        update-types:
+          - "version-update:semver-minor"
+          - "version-update:semver-major"
+      # Built locally from stack/otel-collector and never pushed, so no registry has it.
+      # An entry without versions or update-types ignores every version (dependabot-core
+      # should then skip the registry lookup; check the first Dependabot job log). Its base
+      # images are updated by the docker entry below; its tag follows the contrib version,
+      # changed by hand in the same pull request.
+      - dependency-name: cc-observatory-otel-collector
+
+  # The collector's Dockerfile: the contrib image and the busybox image it copies from
+  # (both FROM lines, pinned like the compose images).
+  # No group either: a contrib release needs a commit by hand in its pull request (the
+  # local image tag in compose.yaml and the version in the collector config's header,
+  # which tests/test_compose.py checks) and can break the collector config, while a
+  # busybox release (only wget, for the healthcheck) passes on its own.
+  - package-ecosystem: docker
+    directory: /stack/otel-collector
+    target-branch: develop
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: build
+      include: scope

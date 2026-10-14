@@ -8,6 +8,7 @@ services; the explicit tests at the end pin what exists now.
 
 from __future__ import annotations
 
+import itertools
 import re
 from collections.abc import Iterator, Mapping
 from pathlib import Path
@@ -48,20 +49,22 @@ GO_SERVICES: Final = frozenset({"otel-collector", "prometheus", "loki", "tempo",
 # debug override.
 BACKEND_ONLY: Final = frozenset({"prometheus", "loki", "tempo"})
 LOG_OPTIONS: Final = {"max-size": "10m", "max-file": "3"}
-COLLECTOR_BASE_IMAGE: Final = (
-    "otel/opentelemetry-collector-contrib:0.162.0"
-    "@sha256:39923a8e431bd1f57be82411999d389fcfe40857492e4365456d97a4c1f74be6"
-)
-BUSYBOX_IMAGE: Final = (
-    "busybox:1.38.0-musl@sha256:ea2b9914a16a4ac1981994af97b318f7c7d4db76b580c56177f08bf76f4a0be8"
-)
-LOKI_IMAGE: Final = (
-    "grafana/loki:3.7.8@sha256:1107dd5274e0ada47e42472b7a7e71f3b2a2fe878878108f3e2f9e51528f0193"
-)
-PROMETHEUS_IMAGE: Final = (
-    "prom/prometheus:v3.13.4"
-    "@sha256:87861b8cf91579109319ebc300f3f1060e6da9c05d6ae8ad15a20c879e84e32e"
-)
+# The pinned images are checked by repository and pin, not by version: Dependabot moves
+# their tags and digests (ADR 0020), never their repositories.
+# An exact version tag (x.y.z), with an optional v prefix and suffix such as -musl.
+VERSION_TAG: Final = re.compile(r"^v?\d+\.\d+\.\d+(?:-[a-z0-9]+)*$")
+LOKI_REPOSITORY: Final = "grafana/loki"
+BUSYBOX_REPOSITORY: Final = "busybox"
+CONTRIB_REPOSITORY: Final = "otel/opentelemetry-collector-contrib"
+# Prometheus stays on the 3.13 LTS line (ADR 0013); dependabot.yml lets only its patch
+# releases in.
+PROMETHEUS_IMAGE: Final = re.compile(r"^prom/prometheus:v3\.13\.\d+@sha256:[0-9a-f]{64}$")
+# The derived collector image is built locally and tagged with the contrib version of its
+# Dockerfile; the collector config's header names the same version.
+COLLECTOR_LOCAL_REPOSITORY: Final = "cc-observatory-otel-collector"
+COLLECTOR_DOCKERFILE: Final = STACK / "otel-collector" / "Dockerfile"
+COLLECTOR_CONFIG: Final = STACK / "otel-collector" / "config.yaml"
+CONTRIB_MENTION: Final = re.compile(r"\bcontrib (?P<version>v?\d+(?:\.\d+)+)")
 _UNITS: Final = {"b": 1, "k": 1024, "m": 1024**2, "g": 1024**3}
 _GO_UNITS: Final = {"B": 1, "KiB": 1024, "MiB": 1024**2, "GiB": 1024**3}
 
@@ -155,6 +158,34 @@ def _environment(service: Mapping[str, object]) -> dict[str, str]:
         pairs = (str(item).partition("=") for item in environment)
         return {key: value for key, _, value in pairs}
     return {key: str(value) for key, value in _mapping(environment, "environment").items()}
+
+
+def _pinned_tag(image: object, repository: str, where: str) -> str:
+    """The tag of ``image``, which must be ``<repository>:<x.y.z>@sha256:<digest>``."""
+    assert isinstance(image, str), f"{where} needs an image"
+    match = PINNED_IMAGE.fullmatch(image)
+    assert match, f"{where}: {image!r} is not name:tag@sha256:<digest>"
+    assert match["name"] == repository, f"{where}: {image!r} is not from {repository}"
+    assert VERSION_TAG.fullmatch(match["tag"]), f"{where}: {image!r} has no exact version tag"
+    return match["tag"]
+
+
+def _collector_base_images() -> list[str]:
+    """The images of the collector Dockerfile's FROM lines, in order."""
+    return FROM_LINE.findall(COLLECTOR_DOCKERFILE.read_text(encoding="utf-8"))
+
+
+def _contrib_tag() -> str:
+    """The contrib version the derived collector image is built from (the last FROM)."""
+    images = _collector_base_images()
+    assert images, f"{COLLECTOR_DOCKERFILE} has no FROM"
+    return _pinned_tag(images[-1], CONTRIB_REPOSITORY, "collector Dockerfile, last FROM")
+
+
+def _header(path: Path) -> str:
+    """The comment lines at the top of ``path``."""
+    lines = path.read_text(encoding="utf-8").splitlines()
+    return "\n".join(itertools.takewhile(lambda line: line.startswith("#"), lines))
 
 
 SERVICES: Final = _service_names(COMPOSE)
@@ -405,10 +436,40 @@ def test_compose_defines_the_collector() -> None:
 def test_collector_is_built_from_the_pinned_upstream_image_plus_busybox() -> None:
     service = _services(COMPOSE)["otel-collector"]
     assert service.get("build") == "stack/otel-collector"
-    assert service.get("image") == "cc-observatory-otel-collector:0.162.0"
-    dockerfile = (STACK / "otel-collector" / "Dockerfile").read_text(encoding="utf-8")
-    assert FROM_LINE.findall(dockerfile) == [BUSYBOX_IMAGE, COLLECTOR_BASE_IMAGE]
+    images = _collector_base_images()
+    # The busybox stage first, then the contrib image that the final image is built on.
+    assert len(images) == 2, f"collector Dockerfile FROM lines: {images}"
+    busybox = _pinned_tag(images[0], BUSYBOX_REPOSITORY, "collector Dockerfile, first FROM")
+    # The musl build is one static binary, with no shared libraries to copy along.
+    assert busybox.endswith("-musl"), f"busybox:{busybox} is not the musl build"
+    _contrib_tag()
+    dockerfile = COLLECTOR_DOCKERFILE.read_text(encoding="utf-8")
     assert re.search(r"^COPY --from=busybox /bin/busybox /busybox$", dockerfile, re.M)
+
+
+def test_collector_local_image_is_tagged_with_the_contrib_version() -> None:
+    # Dependabot updates the Dockerfile but not this local name (dependabot.yml ignores
+    # it), so its pull request fails here until the tag is changed by hand.
+    contrib = _contrib_tag()
+    expected = f"{COLLECTOR_LOCAL_REPOSITORY}:{contrib}"
+    image = _services(COMPOSE)["otel-collector"].get("image")
+    assert image == expected, (
+        f"the collector Dockerfile builds on contrib {contrib}, but compose.yaml names the "
+        f"image {image!r}: set `image: {expected}` in compose.yaml"
+    )
+
+
+def test_collector_config_header_names_the_contrib_version() -> None:
+    contrib = _contrib_tag()
+    header = _header(COLLECTOR_CONFIG)
+    assert CONTRIB_MENTION.search(header), (
+        "the header of stack/otel-collector/config.yaml must name the contrib version"
+    )
+    for match in CONTRIB_MENTION.finditer(header):
+        assert match["version"] == contrib, (
+            f"the collector Dockerfile builds on contrib {contrib}, but the header of "
+            f"stack/otel-collector/config.yaml says {match[0]!r}: update it"
+        )
 
 
 def test_collector_reads_its_config_from_a_read_only_directory() -> None:
@@ -451,7 +512,7 @@ def test_collector_memory_settings() -> None:
 def test_compose_defines_loki_from_the_pinned_image() -> None:
     assert "loki" in SERVICES
     service = _services(COMPOSE)["loki"]
-    assert service.get("image") == LOKI_IMAGE
+    _pinned_tag(service.get("image"), LOKI_REPOSITORY, "loki")
     assert "build" not in service
 
 
@@ -486,7 +547,12 @@ def test_debug_override_publishes_loki_on_loopback() -> None:
 def test_compose_defines_prometheus_from_the_pinned_image() -> None:
     assert "prometheus" in SERVICES
     service = _services(COMPOSE)["prometheus"]
-    assert service.get("image") == PROMETHEUS_IMAGE
+    image = service.get("image")
+    assert isinstance(image, str), "prometheus needs an image"
+    assert PROMETHEUS_IMAGE.fullmatch(image), (
+        f"prometheus: {image!r} is not prom/prometheus:v3.13.<patch>@sha256:<digest>; the "
+        "stack stays on the 3.13 LTS line (ADR 0013)"
+    )
     assert "build" not in service
 
 
