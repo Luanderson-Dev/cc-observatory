@@ -1,0 +1,41 @@
+# Feature PRs are squash-merged into develop and the PR title becomes the commit message,
+# and so the changelog line. Release and back-merge PRs are merge commits, but their titles
+# are checked too, so every PR title is a Conventional Commit.
+#
+# Commitizen comes from uv.lock and reads [tool.commitizen] in pyproject.toml, like the
+# commit-msg hook. --allowed-prefixes with no values turns off Commitizen's default bypass
+# for titles starting with Merge, Revert, fixup!, squash! and similar.
+name: PR title
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+permissions:
+  contents: read
+
+# A newer title or push makes the run in progress for the same PR obsolete.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Conventional Commit title
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          enable-cache: true
+
+      - name: Check the PR title with Commitizen
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: uv run --locked cz check --allowed-prefixes --message "$PR_TITLE"

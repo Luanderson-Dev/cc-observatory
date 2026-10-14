@@ -1,0 +1,51 @@
+version: 2
+
+updates:
+  - package-ecosystem: uv
+    directory: /
+    target-branch: develop
+    schedule:
+      interval: weekly
+    # Wait a week before proposing a new release (version updates only; security
+    # updates are not delayed), so a compromised release has time to be yanked.
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: build
+      include: scope
+    groups:
+      python-packages:
+        patterns:
+          - "*"
+
+  - package-ecosystem: github-actions
+    directory: /
+    target-branch: develop
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: ci
+      include: scope
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+
+  # Remote hook repositories in .pre-commit-config.yaml (ruff, mypy and Commitizen are
+  # local hooks run through uv, so the uv entry above keeps them up to date).
+  - package-ecosystem: pre-commit
+    directory: /
+    target-branch: develop
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: build
+      include: scope
+    groups:
+      pre-commit-hooks:
+        patterns:
+          - "*"

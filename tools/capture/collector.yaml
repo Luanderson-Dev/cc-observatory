@@ -1,0 +1,47 @@
+# Collector for the fixture capture tool (a dev tool, not the product stack). It writes
+# every OTLP export request it receives, unchanged, to JSON-lines files in ./out.
+receivers:
+  otlp:
+    protocols:
+      # 0.0.0.0 inside the container so Docker can forward the ports; compose.yaml
+      # publishes them on 127.0.0.1 only.
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch: {}
+
+exporters:
+  debug:
+    verbosity: basic
+  # append: the default (false) truncates each file when the collector starts, which
+  # would throw away the export requests of earlier runs on a restart.
+  file/metrics:
+    path: /out/otlp-metrics.jsonl
+    append: true
+  file/logs:
+    path: /out/otlp-logs.jsonl
+    append: true
+  file/traces:
+    path: /out/otlp-traces.jsonl
+    append: true
+
+service:
+  telemetry:
+    metrics:
+      level: none
+  pipelines:
+    metrics:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [debug, file/metrics]
+    logs:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [debug, file/logs]
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [debug, file/traces]

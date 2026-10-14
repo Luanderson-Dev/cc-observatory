@@ -1,0 +1,21 @@
+# OpenTelemetry Collector for the fixture capture tool. A dev tool, not the product stack:
+#   docker compose -f tools/capture/compose.yaml up -d
+name: ccobs-capture
+services:
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.162.0
+    command: ["--config=/etc/otelcol/config.yaml"]
+    # The image runs as an unprivileged user that cannot write into the ./out bind mount
+    # (a host directory it does not own), so the file exporters would fail. Root is
+    # acceptable for this short-lived, local-only dev container. Create ./out before
+    # `up` (README step 1): if Docker creates it, root owns it, and on Linux the files
+    # (written 0644, so still readable) could not be deleted without sudo.
+    user: "0:0"
+    volumes:
+      - ./collector.yaml:/etc/otelcol/config.yaml:ro
+      - ./out:/out
+    ports:
+      - "127.0.0.1:4317:4317"
+      - "127.0.0.1:4318:4318"
+    # Keeps a runaway capture from eating the machine's memory.
+    mem_limit: 256m
