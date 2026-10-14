@@ -1,0 +1,71 @@
+# Loki 3.7 for cc-observatory: stores Claude Code's events (OTLP log records).
+#
+# Single binary, single tenant, filesystem storage in the loki-data volume (mounted at
+# /loki), close to the upstream local example. The collector pushes events to Loki's
+# native OTLP endpoint, /otlp/v1/logs (ADR 0015):
+#   - index labels: only the resource attributes service.name (stored as service_name)
+#     and host. Every other resource attribute, every log record attribute (session.id,
+#     event.name, prompt.id, ...) and the trace and span IDs become structured metadata,
+#     with dots turned into underscores (session_id, event_name, trace_id, ...). Session
+#     IDs never reach the index (ADR 0016).
+#   - retention: the compactor deletes data older than retention_period, which comes
+#     from CCOBS_LOKI_RETENTION (default 720h, 30 days; a multiple of 24h, the index
+#     period). compose.yaml passes the variable and starts Loki with
+#     -config.expand-env=true, which expands variables anywhere in this file, comments
+#     included: the dollar sign appears only in retention_period.
+
+auth_enabled: false
+
+server:
+  http_listen_port: 3100
+
+common:
+  instance_addr: 127.0.0.1
+  path_prefix: /loki
+  storage:
+    filesystem:
+      chunks_directory: /loki/chunks
+      rules_directory: /loki/rules
+  replication_factor: 1
+  ring:
+    kvstore:
+      store: inmemory
+
+schema_config:
+  configs:
+    # A date before the first release that stores events. A schema change adds a new
+    # entry that starts later; it never edits this one.
+    - from: 2026-10-01
+      store: tsdb
+      object_store: filesystem
+      schema: v13
+      index:
+        prefix: index_
+        period: 24h
+
+limits_config:
+  allow_structured_metadata: true
+  retention_period: ${CCOBS_LOKI_RETENTION:-720h}
+  # Stream sharding splits streams above 1.5 MB/s, which one machine never reaches;
+  # while it is on, the distributor logs an "empty ring" error at every start.
+  shard_streams:
+    enabled: false
+  otlp_config:
+    resource_attributes:
+      # Without this, Loki also indexes its default list (k8s.*, cloud.*, ...).
+      ignore_defaults: true
+      attributes_config:
+        - action: index_label
+          attributes:
+            - service.name
+            - host
+
+compactor:
+  working_directory: /loki/compactor
+  retention_enabled: true
+  # Retention needs a store for delete requests.
+  delete_request_store: filesystem
+
+# No usage reports (ADR 0006). The backend network has no egress either (ADR 0018).
+analytics:
+  reporting_enabled: false

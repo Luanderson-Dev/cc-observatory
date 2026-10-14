@@ -35,6 +35,7 @@ from tools.stack.replay import (
 ROOT: Final = Path(__file__).resolve().parents[1]
 CONFIG: Final = ROOT / "stack" / "otel-collector" / "config.yaml"
 COMPOSE: Final = ROOT / "compose.yaml"
+LOKI_CONFIG: Final = ROOT / "stack" / "loki" / "config.yaml"
 
 IDENTITY: Final = "transform/identity"
 CONTENT_FILTER: Final = "filter/content"
@@ -60,6 +61,12 @@ PLANTED: Final[Mapping[str, Mapping[str, tuple[str, ...]]]] = {
 HOST_PATHS: Final = "workspace.host_paths"
 # Exporters that would print telemetry, content included, into the container logs.
 FORBIDDEN_EXPORTERS: Final = frozenset({"debug", "file", "logging"})
+# Events go to Loki's native OTLP endpoint; the exporter appends /v1/logs (ADR 0015).
+LOKI_EXPORTER: Final = "otlp_http/loki"
+LOKI_ENDPOINT: Final = "http://loki:3100/otlp"
+# Upper bound for the exporter's in-memory queue, in requests: enough to ride out a Loki
+# restart, small enough to stay well inside the collector's memory limit.
+MAX_QUEUE_REQUESTS: Final = 5000
 # Keys near the identity rule that must survive it.
 KEPT_KEYS: Final = (
     "user",
@@ -293,6 +300,67 @@ def test_no_exporter_prints_telemetry() -> None:
 def test_privacy_processors_fail_closed(processor: str) -> None:
     # On a statement error the batch is refused, never passed on unfiltered.
     assert _section("processors")[processor].get("error_mode") == "propagate"
+
+
+# Exporters.
+
+
+def _loki_exporter() -> dict[str, object]:
+    exporters = _section("exporters")
+    assert LOKI_EXPORTER in exporters, f"no {LOKI_EXPORTER} exporter"
+    return exporters[LOKI_EXPORTER]
+
+
+def test_logs_go_to_loki_through_its_otlp_endpoint() -> None:
+    logs = [name for name in PIPELINES if _signal(name) == "logs"]
+    assert logs == ["logs"]
+    assert _pipelines()["logs"]["exporters"] == [LOKI_EXPORTER]
+    exporter = _loki_exporter()
+    assert exporter.get("endpoint") == LOKI_ENDPOINT
+    # The default logs path (<endpoint>/v1/logs) is Loki's /otlp/v1/logs.
+    assert "logs_endpoint" not in exporter
+
+
+def test_loki_endpoint_matches_the_compose_service_and_its_port() -> None:
+    compose = _mapping(yaml.safe_load(COMPOSE.read_text(encoding="utf-8")), "compose")
+    assert "loki" in _mapping(compose["services"], "services")
+    loki = _mapping(yaml.safe_load(LOKI_CONFIG.read_text(encoding="utf-8")), "loki config")
+    port = _mapping(loki.get("server"), "server").get("http_listen_port")
+    assert f"http://loki:{port}/otlp" == LOKI_ENDPOINT
+
+
+def test_loki_exporter_is_only_in_logs_pipelines() -> None:
+    # Loki's OTLP endpoint only accepts logs.
+    for name, pipeline in _pipelines().items():
+        if _signal(name) != "logs":
+            assert LOKI_EXPORTER not in pipeline["exporters"], name
+
+
+def test_loki_exporter_needs_no_credentials_inside_the_backend_network() -> None:
+    # Loki is single-tenant on the internal backend network: plain HTTP, no headers,
+    # no authenticator and no TLS settings to keep in step.
+    exporter = _loki_exporter()
+    assert not set(exporter) & {"headers", "auth", "tls"}
+
+
+def test_loki_exporter_queue_and_retries_are_bounded() -> None:
+    exporter = _loki_exporter()
+    queue = _mapping(exporter.get("sending_queue"), "sending_queue")
+    assert queue.get("enabled") is True
+    size = queue.get("queue_size")
+    assert isinstance(size, int)
+    assert 0 < size <= MAX_QUEUE_REQUESTS
+    # Requests, so the bound does not depend on how many records each one carries.
+    assert queue.get("sizer", "requests") == "requests"
+    # A full queue refuses new data instead of blocking the OTLP receiver, which would
+    # make Claude Code's exports time out.
+    assert queue.get("block_on_overflow", False) is False
+    retry = _mapping(exporter.get("retry_on_failure"), "retry_on_failure")
+    assert retry.get("enabled") is True
+    # 0 would retry forever.
+    max_elapsed = retry.get("max_elapsed_time")
+    assert isinstance(max_elapsed, str)
+    assert re.fullmatch(r"[1-9]\d*(s|m)", max_elapsed), max_elapsed
 
 
 # Receivers and health.

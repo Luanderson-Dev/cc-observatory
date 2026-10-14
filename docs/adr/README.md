@@ -42,6 +42,8 @@ the ADR wins.
 | [0011](0011-hook-delivery-http-plus-async-sessionstart.md)   | Hook delivery: http hooks plus an async command hook for SessionStart        | Accepted |
 | [0012](0012-observed-telemetry-and-hook-contract.md)         | Observed telemetry and hook contract of Claude Code 2.1.296                  | Accepted |
 | [0013](0013-metrics-through-the-prometheus-otlp-receiver.md) | Metrics through Prometheus's OTLP receiver, made cumulative in the collector | Accepted |
+| [0015](0015-loki-through-its-otlp-endpoint.md)               | Loki receives events over OTLP, with session fields as structured metadata   | Accepted |
+| [0016](0016-cardinality-and-retention.md)                    | Session IDs on metrics, not in Loki's index, and per-backend retention       | Accepted |
 | [0018](0018-ports-networks-and-exposure.md)                  | Ports and networks: minimal exposure in a dedicated port block               | Accepted |
 | [0019](0019-restart-unless-stopped.md)                       | The stack restarts unless stopped                                            | Accepted |
 | [0020](0020-compose-conventions.md)                          | Compose conventions for a no-extra-steps start on Linux, macOS and Windows   | Accepted |

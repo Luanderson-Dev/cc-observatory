@@ -209,6 +209,13 @@ def service_logs(stack: Stack) -> Callable[[str], str]:
 
 
 @pytest.fixture(scope="session")
+def compose(stack: Stack) -> Callable[..., subprocess.CompletedProcess[str]]:
+    """Run ``docker compose`` for the project, such as ``compose("stop", "loki")``; a
+    test that stops a service must start it again and wait until it is healthy."""
+    return stack.compose
+
+
+@pytest.fixture(scope="session")
 def otlp_http_url(stack: Stack) -> str:
     """Base URL of the collector's OTLP/HTTP receiver."""
     return stack.url("CCOBS_OTLP_HTTP_PORT")

@@ -55,6 +55,9 @@ COLLECTOR_BASE_IMAGE: Final = (
 BUSYBOX_IMAGE: Final = (
     "busybox:1.38.0-musl@sha256:ea2b9914a16a4ac1981994af97b318f7c7d4db76b580c56177f08bf76f4a0be8"
 )
+LOKI_IMAGE: Final = (
+    "grafana/loki:3.7.8@sha256:1107dd5274e0ada47e42472b7a7e71f3b2a2fe878878108f3e2f9e51528f0193"
+)
 _UNITS: Final = {"b": 1, "k": 1024, "m": 1024**2, "g": 1024**3}
 _GO_UNITS: Final = {"B": 1, "KiB": 1024, "MiB": 1024**2, "GiB": 1024**3}
 
@@ -384,7 +387,7 @@ def test_built_service_uses_a_dockerfile_under_stack(name: str) -> None:
     assert (path / "Dockerfile").is_file()
 
 
-# What exists now (milestone 1, stage 3).
+# What exists now (milestone 1, stage 7).
 
 
 def test_compose_project_is_named_cc_observatory() -> None:
@@ -439,6 +442,47 @@ def test_collector_memory_settings() -> None:
     service = _services(COMPOSE)["otel-collector"]
     assert service.get("mem_limit") == "256m"
     assert _environment(service).get("GOMEMLIMIT") == "204MiB"
+
+
+def test_compose_defines_loki_from_the_pinned_image() -> None:
+    assert "loki" in SERVICES
+    service = _services(COMPOSE)["loki"]
+    assert service.get("image") == LOKI_IMAGE
+    assert "build" not in service
+
+
+def test_loki_reads_its_config_read_only_and_keeps_data_in_a_named_volume() -> None:
+    service = _services(COMPOSE)["loki"]
+    assert service.get("volumes") == [
+        "./stack/loki:/etc/ccobs/loki:ro",
+        "loki-data:/loki",
+    ]
+    assert "loki-data" in _mapping(_load(COMPOSE).get("volumes"), "volumes")
+    assert (STACK / "loki" / "config.yaml").is_file()
+
+
+def test_loki_healthcheck_uses_its_own_health_flag() -> None:
+    # The image has no shell or HTTP client; -health requests /ready on port 3100.
+    healthcheck = _mapping(_services(COMPOSE)["loki"]["healthcheck"], "healthcheck")
+    assert healthcheck["test"] == ["CMD", "/usr/bin/loki", "-health"]
+
+
+def test_loki_memory_settings() -> None:
+    service = _services(COMPOSE)["loki"]
+    assert service.get("mem_limit") == "512m"
+    assert _environment(service).get("GOMEMLIMIT") == "409MiB"
+
+
+def test_debug_override_publishes_loki_on_loopback() -> None:
+    override = _services(COMPOSE_DEBUG)["loki"]
+    assert override.get("ports") == ["127.0.0.1:${CCOBS_LOKI_PORT:-4310}:3100"]
+    assert _networks(override) == {"backend", "edge"}
+
+
+def test_collector_starts_without_waiting_for_loki() -> None:
+    # The collector is the OTLP entry point: it accepts telemetry at once and its
+    # exporter queues and retries while Loki starts (ADR 0015).
+    assert "depends_on" not in _services(COMPOSE)["otel-collector"]
 
 
 def test_debug_override_is_a_valid_compose_mapping() -> None:

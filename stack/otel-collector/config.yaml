@@ -11,8 +11,9 @@
 # (resource., datapoint., log., span., spanevent.), as 0.162.0 expects, and an OTTL
 # string needs \\ for each backslash of a regular expression.
 #
-# There is no backend yet: every pipeline ends in the nop exporter, which discards the
-# data. Never add a debug or file exporter: they would copy content into the container
+# Events (logs) go to Loki through its OTLP endpoint (ADR 0015). Metrics and traces
+# still end in the nop exporter, which discards them, until their backends join the
+# stack. Never add a debug or file exporter: they would copy content into the container
 # logs or onto disk.
 
 extensions:
@@ -153,7 +154,25 @@ processors:
           - delete_key(span.attributes, "workspace.host_paths")
 
 exporters:
-  # Placeholder until the backends arrive in later stages.
+  # Loki's native OTLP endpoint; the exporter appends /v1/logs. Plain HTTP on the
+  # internal backend network, where Loki runs single-tenant with no authentication.
+  otlp_http/loki:
+    endpoint: http://loki:3100/otlp
+    # In memory and bounded, in requests: it rides out a Loki restart, and when it is
+    # full new data is refused (the receiver never blocks Claude Code's exports).
+    sending_queue:
+      enabled: true
+      num_consumers: 2
+      queue_size: 1000
+    # A request that still fails after 5 minutes is dropped, with an error in the
+    # collector's logs.
+    retry_on_failure:
+      enabled: true
+      initial_interval: 1s
+      max_interval: 30s
+      max_elapsed_time: 5m
+
+  # Placeholder for metrics and traces until their backends arrive in later stages.
   nop:
 
 service:
@@ -166,7 +185,7 @@ service:
     logs:
       receivers: [otlp]
       processors: [memory_limiter, transform/identity, filter/content, transform/content]
-      exporters: [nop]
+      exporters: [otlp_http/loki]
     traces:
       receivers: [otlp]
       processors: [memory_limiter, transform/identity, filter/content, transform/content]

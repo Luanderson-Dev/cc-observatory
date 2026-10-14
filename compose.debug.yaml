@@ -5,8 +5,15 @@
 # compose.yaml keeps Prometheus, Loki and Tempo on the internal `backend` network
 # with no published port. This override publishes each one on loopback (ports set by
 # CCOBS_PROMETHEUS_PORT, CCOBS_LOKI_PORT and CCOBS_TEMPO_PORT) and attaches it to the
-# `edge` network, because a service only on an internal network cannot publish ports.
-# The services are added by the stages that bring them; until then this file adds
-# nothing.
+# `edge` network, because a service only on an internal network cannot publish ports
+# (ADR 0018). While the override is in use, those services have egress. Each service is
+# added here by the stage that brings it.
 
-services: {}
+services:
+  # Loki's HTTP API: queries, /config and /ready.
+  loki:
+    ports:
+      - "127.0.0.1:${CCOBS_LOKI_PORT:-4310}:3100"
+    networks:
+      - backend
+      - edge
