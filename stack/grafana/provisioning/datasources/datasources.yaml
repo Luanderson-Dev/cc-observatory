@@ -1,0 +1,74 @@
+# Grafana 13.2's datasources for cc-observatory (ADR 0003).
+#
+# Provisioned at every start from this read-only directory, with fixed UIDs for the
+# dashboards and the app's links, and editable: false: changes go here, not in the UI.
+# Each URL is a service's name on the stack's internal backend network (ADR 0018), and
+# none of the stores has authentication, so there are no credentials.
+#
+# Grafana fills environment variables, written with a dollar sign, into the values of
+# this file; a doubled dollar sign stands for one, as in the link variable below.
+apiVersion: 1
+
+# Removes datasources this file provisioned earlier and no longer lists.
+prune: true
+
+datasources:
+  # Claude Code's metrics (ADR 0013).
+  - name: Prometheus
+    uid: prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+    jsonData:
+      # POST keeps long PromQL queries out of the URL.
+      httpMethod: POST
+      prometheusType: Prometheus
+      # The highest version Grafana 13.2 offers ("> 2.50.x"), which covers the stack's
+      # Prometheus 3.13: Grafana only checks for features older than that.
+      prometheusVersion: 2.50.1
+
+  # Claude Code's events (ADR 0015). The events that belong to a trace carry its ID in
+  # the trace_id structured metadata field, which Grafana shows among the labels; this
+  # field turns it into a link to the trace in Tempo.
+  - name: Loki
+    uid: loki
+    type: loki
+    access: proxy
+    url: http://loki:3100
+    editable: false
+    jsonData:
+      derivedFields:
+        - name: Trace
+          matcherType: label
+          matcherRegex: ^trace_id$
+          datasourceUid: tempo
+          url: $${__value.raw}
+          urlDisplayLabel: View trace
+
+  # Claude Code's traces. Tempo runs only with the traces profile (docker compose
+  # --profile traces up -d; ADR 0003); without it, queries to this datasource fail.
+  - name: Tempo
+    uid: tempo
+    type: tempo
+    access: proxy
+    url: http://tempo:3200
+    editable: false
+    jsonData:
+      # Tempo streams search results over HTTP (stream_over_http_enabled in
+      # stack/tempo/config.yaml). TraceQL metrics need Tempo's metrics generator, which
+      # the stack does not run, so their streaming stays off.
+      streamingEnabled:
+        search: true
+      # From a span to its events in Loki: the stream of the span's service.name and
+      # host, Loki's index labels, filtered on the trace_id field.
+      tracesToLogsV2:
+        datasourceUid: loki
+        tags:
+          - key: service.name
+            value: service_name
+          - key: host
+        filterByTraceID: true
+        spanStartTimeShift: -1m
+        spanEndTimeShift: 1m

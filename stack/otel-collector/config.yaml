@@ -1,0 +1,342 @@
+# OpenTelemetry Collector (contrib 0.162.0) for cc-observatory.
+#
+# The single OTLP entry point of the stack (ADR 0003). Every pipeline starts with
+# memory_limiter and then removes personal data before anything leaves the collector
+# (ADR 0006, ADR 0021):
+#   - transform/identity always deletes identity attributes;
+#   - filter/content and transform/content drop content while content capture is off.
+#     Milestone 4 turns the opt-in on by taking these two out of the pipelines.
+# The privacy processors fail closed (error_mode: propagate): a statement error refuses
+# the batch instead of passing it on unfiltered. OTTL paths carry their context prefix
+# (resource., datapoint., log., span., spanevent.), as 0.162.0 expects, and an OTTL
+# string needs \\ for each backslash of a regular expression.
+#
+# Right after them, transform/host sets the stack's host label on every signal, from
+# CCOBS_HOST_LABEL (ADR 0022).
+#
+# Metrics are made cumulative and go to Prometheus's OTLP receiver (ADR 0013); events
+# (logs) go to Loki through its OTLP endpoint (ADR 0015); traces go to Tempo's OTLP
+# receiver, which only runs in the traces compose profile (ADR 0003). Never add a debug
+# or file exporter: they would copy content into the container logs or onto disk.
+
+extensions:
+  # Answers the compose healthcheck (busybox wget from inside the container).
+  health_check:
+    endpoint: 127.0.0.1:13133
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  # Percentages of the container's memory limit (mem_limit in compose.yaml).
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 80
+    spike_limit_percentage: 25
+
+  # Identity, always deleted at every level: every user.* and enduser.* key, plus
+  # organization.id, identity.source and host.name.
+  transform/identity:
+    error_mode: propagate
+    metric_statements:
+      - context: resource
+        statements:
+          - delete_matching_keys(resource.attributes, "^(user|enduser)\\.")
+          - delete_key(resource.attributes, "organization.id")
+          - delete_key(resource.attributes, "identity.source")
+          - delete_key(resource.attributes, "host.name")
+      - context: datapoint
+        statements:
+          - delete_matching_keys(datapoint.attributes, "^(user|enduser)\\.")
+          - delete_key(datapoint.attributes, "organization.id")
+          - delete_key(datapoint.attributes, "identity.source")
+          - delete_key(datapoint.attributes, "host.name")
+    log_statements:
+      - context: resource
+        statements:
+          - delete_matching_keys(resource.attributes, "^(user|enduser)\\.")
+          - delete_key(resource.attributes, "organization.id")
+          - delete_key(resource.attributes, "identity.source")
+          - delete_key(resource.attributes, "host.name")
+      - context: log
+        statements:
+          - delete_matching_keys(log.attributes, "^(user|enduser)\\.")
+          - delete_key(log.attributes, "organization.id")
+          - delete_key(log.attributes, "identity.source")
+          - delete_key(log.attributes, "host.name")
+    trace_statements:
+      - context: resource
+        statements:
+          - delete_matching_keys(resource.attributes, "^(user|enduser)\\.")
+          - delete_key(resource.attributes, "organization.id")
+          - delete_key(resource.attributes, "identity.source")
+          - delete_key(resource.attributes, "host.name")
+      - context: span
+        statements:
+          - delete_matching_keys(span.attributes, "^(user|enduser)\\.")
+          - delete_key(span.attributes, "organization.id")
+          - delete_key(span.attributes, "identity.source")
+          - delete_key(span.attributes, "host.name")
+      - context: spanevent
+        statements:
+          - delete_matching_keys(spanevent.attributes, "^(user|enduser)\\.")
+          - delete_key(spanevent.attributes, "organization.id")
+          - delete_key(spanevent.attributes, "identity.source")
+          - delete_key(spanevent.attributes, "host.name")
+
+  # Content, whole records: the events that only carry content (Claude Code sets
+  # event.name to the bare name and the body to claude_code.<name>; event_name covers
+  # the OTLP field, which Claude Code leaves empty today) and tool.output span events.
+  # log_conditions and trace_conditions take their context from the path prefix: log.
+  # drops log records, spanevent. drops span events and keeps their spans.
+  filter/content:
+    error_mode: propagate
+    log_conditions:
+      - log.attributes["event.name"] == "api_request_body"
+      - log.attributes["event.name"] == "api_response_body"
+      - log.attributes["event.name"] == "system_prompt"
+      - log.event_name == "api_request_body"
+      - log.event_name == "api_response_body"
+      - log.event_name == "system_prompt"
+      - log.body == "claude_code.api_request_body"
+      - log.body == "claude_code.api_response_body"
+      - log.body == "claude_code.system_prompt"
+    trace_conditions:
+      - spanevent.name == "tool.output"
+
+  # Content, attributes: prompts, responses, tool inputs and parameters, commands, file
+  # paths, hook definitions, free-text errors, request bodies and host paths (which
+  # contain the OS username).
+  transform/content:
+    error_mode: propagate
+    metric_statements:
+      - context: resource
+        statements:
+          - delete_key(resource.attributes, "workspace.host_paths")
+      - context: datapoint
+        statements:
+          - delete_key(datapoint.attributes, "workspace.host_paths")
+    log_statements:
+      - context: resource
+        statements:
+          - delete_key(resource.attributes, "workspace.host_paths")
+      - context: log
+        statements:
+          - delete_key(log.attributes, "prompt")
+          - delete_key(log.attributes, "prompt_text")
+          - delete_key(log.attributes, "response")
+          - delete_key(log.attributes, "tool_parameters")
+          - delete_key(log.attributes, "tool_input")
+          - delete_key(log.attributes, "error")
+          - delete_key(log.attributes, "body")
+          - delete_key(log.attributes, "body_ref")
+          - delete_key(log.attributes, "hook_definitions")
+          - delete_key(log.attributes, "workspace.host_paths")
+    trace_statements:
+      - context: resource
+        statements:
+          - delete_key(resource.attributes, "workspace.host_paths")
+      - context: span
+        statements:
+          - delete_key(span.attributes, "user_prompt")
+          - delete_key(span.attributes, "new_context")
+          - delete_key(span.attributes, "system_reminders")
+          - delete_key(span.attributes, "system_prompt_preview")
+          - delete_key(span.attributes, "user_system_prompt")
+          - delete_key(span.attributes, "response.model_output")
+          - delete_key(span.attributes, "tool_input")
+          - delete_key(span.attributes, "full_command")
+          - delete_key(span.attributes, "file_path")
+          - delete_key(span.attributes, "hook_definitions")
+          - delete_key(span.attributes, "error")
+          - delete_key(span.attributes, "workspace.host_paths")
+      - context: spanevent
+        statements:
+          - delete_key(spanevent.attributes, "workspace.host_paths")
+
+  # The stack's host label (ADR 0022), after the privacy processors, so that host.name
+  # stays deleted. The resource attribute host gets the value of CCOBS_HOST_LABEL, which
+  # compose.yaml passes (default local; the default here applies when it is unset),
+  # replacing any host a client sent; Prometheus promotes it to a label on every series
+  # and Loki indexes it. A host on data points, log records, spans and span events,
+  # where Claude Code copies OTEL_RESOURCE_ATTRIBUTES, is deleted, so the resource's
+  # value is the only one. The value goes into an OTTL string literal: letters, digits,
+  # ".", "_" and "-" are supported (.env.example); a double quote or a backslash can stop
+  # the collector at start-up or change the value. Not a privacy filter: a statement
+  # error lets the batch through (error_mode: ignore, with the error logged) instead of
+  # losing it.
+  transform/host:
+    error_mode: ignore
+    metric_statements:
+      - context: resource
+        statements:
+          - set(resource.attributes["host"], "${env:CCOBS_HOST_LABEL:-local}")
+      - context: datapoint
+        statements:
+          - delete_key(datapoint.attributes, "host")
+    log_statements:
+      - context: resource
+        statements:
+          - set(resource.attributes["host"], "${env:CCOBS_HOST_LABEL:-local}")
+      - context: log
+        statements:
+          - delete_key(log.attributes, "host")
+    trace_statements:
+      - context: resource
+        statements:
+          - set(resource.attributes["host"], "${env:CCOBS_HOST_LABEL:-local}")
+      - context: span
+        statements:
+          - delete_key(span.attributes, "host")
+      - context: spanevent
+        statements:
+          - delete_key(spanevent.attributes, "host")
+
+  # Turns Claude Code's delta sums (its default temporality) into the cumulative series
+  # that Prometheus stores (ADR 0013); it runs after the privacy processors, so it never
+  # keeps a deleted attribute. Gaps between deltas are fine. Cumulative points pass
+  # through untouched, so with the cumulative preference that ccobs setup sets it keeps
+  # no state. A stream idle for longer than max_stale, or a collector restart, starts
+  # again from zero: a counter reset, which increase(...[R] anchored) counts when the new
+  # stream starts after its previous sample. 24h keeps the running totals of a session
+  # that waits on a person for hours. max_streams keeps its default (no practical
+  # limit). The state shows in otelcol_deltatocumulative_*.
+  delta_to_cumulative:
+    max_stale: 24h
+
+exporters:
+  # Each exporter queues requests in memory, bounded in requests (those in flight
+  # count), and refuses new data at once while its queue is full, so the receiver never
+  # blocks Claude Code's exports. Each queue has one consumer per request, so that the
+  # collector stops within compose's stop_grace_period (30 s, ADR 0020) even while a
+  # backend is down. At SIGTERM the collector stops its receivers, then its exporters
+  # one after another. Each stops retrying: the attempts in progress end, the requests
+  # waiting for their next retry are dropped, and every request no consumer has picked
+  # gets one last attempt. With fewer consumers than requests, a stop takes up to
+  # ceil(queue_size / num_consumers) rounds of attempts, each up to timeout (the name of
+  # a stopped backend took about 4 s to fail to resolve on Docker Desktop), so a few
+  # dozen requests queued for a down backend outlast the grace period and Docker kills
+  # the collector (exit 137). With one consumer per request, every request already has
+  # a consumer: at SIGTERM the attempts in progress end (5 s at most) and the requests
+  # waiting for their next retry are dropped at once, so a stop waits for one attempt
+  # per exporter at most (15 s if all three backends are down).
+  # tests/test_collector_config.py checks that bound against the grace period.
+
+  # Loki's native OTLP endpoint; the exporter appends /v1/logs. Plain HTTP on the
+  # internal backend network, where Loki runs single-tenant with no authentication.
+  otlp_http/loki:
+    endpoint: http://loki:3100/otlp
+    # Per attempt, and the longest a stop waits for this exporter (above).
+    timeout: 5s
+    # Claude Code exports a session's events every 5 seconds by default, so 100 requests
+    # ride out a Loki restart (about 16 s) for dozens of sessions, and 5 minutes of a
+    # Loki outage for one or two busy ones.
+    sending_queue:
+      enabled: true
+      num_consumers: 100
+      queue_size: 100
+    # A request that still fails after 5 minutes is dropped, with an error in the
+    # collector's logs.
+    retry_on_failure:
+      enabled: true
+      initial_interval: 1s
+      max_interval: 30s
+      max_elapsed_time: 5m
+
+  # Prometheus's native OTLP receiver (ADR 0013). metrics_endpoint is the full URL: the
+  # exporter would append /v1/metrics to a plain endpoint. Plain HTTP on the internal
+  # backend network; the receiver has no authentication. Prometheus answers 400 to a
+  # request with a sample it cannot store, and the exporter drops it without retrying,
+  # which is why Prometheus keeps an out-of-order window.
+  otlp_http/prometheus:
+    metrics_endpoint: http://prometheus:9090/api/v1/otlp/v1/metrics
+    # As for Loki.
+    timeout: 5s
+    # Claude Code exports a session's metrics every minute by default, so 100 requests
+    # hold 5 minutes of retries for some 20 sessions.
+    sending_queue:
+      enabled: true
+      num_consumers: 100
+      queue_size: 100
+    retry_on_failure:
+      enabled: true
+      initial_interval: 1s
+      max_interval: 30s
+      max_elapsed_time: 5m
+
+  # Tempo's OTLP/HTTP receiver; the exporter appends /v1/traces. Plain HTTP on the
+  # internal backend network, where Tempo runs single-tenant with no authentication.
+  # Tempo is optional (the traces profile), and Claude Code sends no traces unless its
+  # beta tracing is turned on, so this exporter is usually idle: with no traces it opens
+  # no connection and logs nothing. Traces that arrive while Tempo is not running (the
+  # name tempo does not resolve) are dropped when the retry gives up, 30 seconds after a
+  # consumer first tries them, with an info line per attempt and a "Dropping data" error
+  # per request (the collector samples its logs: about 10 identical lines per 10
+  # seconds). The queue holds at most 20 requests, so a stream of traces never takes
+  # much memory, and while it is full new traces are refused at once (HTTP 503, "sending
+  # queue is full", logged as a "Rejecting data" error). The 30 seconds of retries ride
+  # out a Tempo restart. A stop of the collector while Tempo is away waits 5 s at most
+  # for this exporter (above): the attempts in progress end, and the traces waiting for
+  # their next retry are dropped. The metrics and logs pipelines have exporters and
+  # queues of their own, which this one never holds back.
+  otlp_http/tempo:
+    endpoint: http://tempo:4318
+    # Per attempt (a Tempo that accepts the connection and then hangs), and the longest
+    # a stop waits for this exporter (above).
+    timeout: 5s
+    sending_queue:
+      enabled: true
+      num_consumers: 20
+      queue_size: 20
+    retry_on_failure:
+      enabled: true
+      initial_interval: 1s
+      max_interval: 5s
+      max_elapsed_time: 30s
+
+service:
+  extensions: [health_check]
+  # The collector's own metrics (otelcol_*), in Prometheus format on port 8888, scraped
+  # by Prometheus over the backend network. 0.0.0.0 because Prometheus runs in another
+  # container; the port is never published on the host.
+  telemetry:
+    metrics:
+      readers:
+        - pull:
+            exporter:
+              prometheus:
+                host: 0.0.0.0
+                port: 8888
+  pipelines:
+    metrics:
+      receivers: [otlp]
+      processors:
+        - memory_limiter
+        - transform/identity
+        - transform/content
+        - transform/host
+        - delta_to_cumulative
+      exporters: [otlp_http/prometheus]
+    logs:
+      receivers: [otlp]
+      processors:
+        - memory_limiter
+        - transform/identity
+        - filter/content
+        - transform/content
+        - transform/host
+      exporters: [otlp_http/loki]
+    traces:
+      receivers: [otlp]
+      processors:
+        - memory_limiter
+        - transform/identity
+        - filter/content
+        - transform/content
+        - transform/host
+      exporters: [otlp_http/tempo]

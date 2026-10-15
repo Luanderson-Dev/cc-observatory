@@ -51,18 +51,61 @@ below are still planned (see the roadmap in the [README](README.md)); this model
 to each part from the release that ships it.
 
 - **Local-only ports.** Every port that the compose stack publishes binds to
-  `127.0.0.1`, so nothing is published on your network interfaces.
+  `127.0.0.1`, so nothing is published on your network interfaces
+  ([ADR 0018](docs/adr/0018-ports-networks-and-exposure.md)). Only the collector's OTLP
+  receivers (4317 and 4318) and Grafana (4330) are published. Prometheus, Loki and
+  Tempo, which have no authentication of their own, publish no port and sit on an
+  internal Docker network; the debug override `compose.debug.yaml` publishes them on
+  `127.0.0.1` and gives them outbound access while you use it. On Linux, Docker Engine
+  releases older than 28.0 let hosts on the same local network segment (for example,
+  behind the same switch) reach ports published to `127.0.0.1`
+  ([Docker's port publishing docs](https://docs.docker.com/engine/network/port-publishing/)),
+  so use Docker Engine 28.0 or later there.
 - **No authentication.** Anyone with access to your user account, and any process that
   can reach localhost on your machine (including other users of a shared machine), can
   read the collected data and post events to the hook endpoint. Any local process can
-  inject fake hook events, so what the app shows is only as trustworthy as the software
-  running on your machine.
+  inject fake hook events or telemetry, so what the app and Grafana show is only as
+  trustworthy as the software running on your machine.
+- **Grafana has no login** (from v0.2.0,
+  [ADR 0017](docs/adr/0017-grafana-access-and-dns-rebinding.md)). Whoever opens it is an
+  Editor of its only organization: they can read all the data, run queries and save
+  dashboards, but cannot create, change or delete datasources, install plugins, manage
+  users or change server settings. There is no login form, no basic auth and no admin
+  account at all, so there is no default password. The datasources are provisioned
+  read-only from the repository, and Grafana's own Alerting and public dashboards (which
+  would share a dashboard with anyone who has its link) are off.
 - **Web pages in your browser.** Without a login, any web page you open can send
-  requests to `127.0.0.1`: a malicious page could post forged hook events through
-  cross-site requests, and a DNS rebinding attack could let it read the app or Grafana.
-  Planned defences, in the app from v0.3.0: a `Host` header allowlist (`localhost`,
-  `127.0.0.1`, `[::1]`); a hook endpoint that ignores any request whose `Content-Type`
-  is not `application/json` (still answering with an empty 2xx); and no permissive CORS.
+  requests to localhost: a malicious page could post forged events through cross-site
+  requests, and a DNS rebinding attack could let it read what answers there.
+    - Grafana (from v0.2.0) answers only as `localhost`: with `enforce_domain` and
+      `localhost` as its domain, it redirects any other `Host` header, `127.0.0.1`
+      included, so a DNS rebinding page reads only redirects. A few routes answer any
+      host name by Grafana's design (`/api/health`, its static files), none with Claude
+      Code data. With `csrf_always_check`, it refuses any request other than HEAD,
+      OPTIONS and TRACE whose `Origin` header names another host, a GET included, even
+      from an anonymous visitor. Its legacy datasource
+      proxy, which a cross-site GET could otherwise use to reach a store's own API
+      (Loki serves `GET /flush` and `GET /ingester/shutdown`, which stop its
+      ingester), is closed by a datasource proxy allowlist that matches no datasource
+      (`127.0.0.1:9`). Its `/metrics` endpoint, which a DNS rebinding page could read,
+      is off.
+    - Residual risk in Grafana: a simple cross-site GET, such as an `<img>` tag, carries
+      no `Origin` header, so it can still make Grafana query a datasource through
+      `/api/datasources/uid/<uid>/resources/*`. The page cannot read the answer, and
+      that route reaches no endpoint that changes or stops a store, but the page can
+      send expensive queries blindly, for example a long-range PromQL query, that could
+      push Prometheus to its memory limit; Docker then restarts it. Closing this would
+      need a proxy in front of Grafana that checks Fetch Metadata, which the stack does
+      not have. Pages served by other local software on another `localhost` port also
+      pass the `Origin` check, which compares host names only.
+    - The collector's OTLP/HTTP receiver (port 4318, from v0.2.0) accepts any `Host`
+      header, so a DNS rebinding page could post fake telemetry to it; it cannot read
+      anything back through it, and a plain cross-site POST of JSON fails the CORS
+      preflight.
+    - Planned defences in the app, from v0.3.0: a `Host` header allowlist (`localhost`,
+      `127.0.0.1`, `[::1]`); a hook endpoint that ignores any request whose
+      `Content-Type` is not `application/json` (still answering with an empty 2xx); and
+      no permissive CORS.
 - **Do not expose it.** Do not publish the ports on other interfaces, and do not put the
   stack behind a reverse proxy, tunnel or port forward without adding authentication in
   front of it.
@@ -81,21 +124,41 @@ to each part from the release that ships it.
   keep them in mind when you share screenshots, exports or bug reports.
 - **Content capture is opt-in.** By default, prompt text, tool inputs and outputs,
   assistant messages and error text are dropped before anything is stored.
-  `ccobs setup --capture-content` turns content capture on in Claude Code, the collector
-  and the app; without it, the collector drops content even if Claude Code sends it.
+  `ccobs setup --capture-content` (from v0.5.0) turns content capture on in Claude Code,
+  the collector and the app; without it, the collector drops content even if Claude
+  Code sends it.
   Captured content can include source code, file contents and any secret that shows up
   in a prompt or a tool's output.
-- **Personal attributes.** The collector deletes `user.email`, `user.id` (on gateway
-  sessions it is the identity provider subject), `user.account_uuid`, `user.account_id`
-  and `organization.id` (and `user.groups` and `identity.source` on gateway sessions)
-  from the telemetry before it is stored.
+- **Personal attributes.** The collector always deletes every attribute whose name
+  starts with `user.` or `enduser.` (such as `user.email`, `user.id`, which on gateway
+  sessions is the identity provider subject, `user.account_uuid`, `user.account_id` and
+  `user.groups`), plus `organization.id`, `identity.source` and `host.name`, from the
+  telemetry before it is stored, including any you add through
+  `OTEL_RESOURCE_ATTRIBUTES` ([ADR 0021](docs/adr/0021-collector-privacy-filters.md)).
 - **No outbound traffic.** At runtime, nothing leaves your machine except the optional
-  Discord webhook, and only if you configure one; alerts sent through it leave your
-  machine. This is a requirement of the bundled stack: from v0.2.0 its configs turn off
-  upstream usage reporting and update checks (in Grafana: analytics reporting, update
-  checks for Grafana and its plugins, the news feed and Gravatar; in Loki:
-  `analytics.reporting_enabled`; in Tempo: `usage_report.reporting_enabled`), and tests
-  check that they stay off.
+  Discord webhook, if you configure one (alerts sent through it leave your machine), and
+  the DNS lookups of a stopped store's name described below. This is a requirement of
+  the bundled stack, and from v0.2.0 its configs enforce it:
+    - Grafana: usage reporting, the update checks for Grafana and its plugins, feedback
+      links, the news feed, Gravatar, external snapshots, the plugin signing key
+      download, the plugin preinstall and its updates, plugin installs from the catalog
+      and Cloud migration are off, and the base URL of its grafana.com API calls points
+      at a closed port on Grafana's own loopback (`127.0.0.1:9`);
+    - Loki and Tempo: their usage reports are off (`analytics.reporting_enabled` and
+      `usage_report.reporting_enabled`);
+    - Prometheus has no remote write or read and no Alertmanager, and the collector
+      exports only to Prometheus, Loki and Tempo;
+    - Prometheus, Loki and Tempo sit on an internal Docker network with no route out,
+      so they cannot reach the internet even with a wrong setting.
+
+  Tests check these settings in the configs and in the running stack, and
+  [docs/stack.md](docs/stack.md#checking-that-nothing-leaves-the-machine) describes a
+  manual check that no connection leaves. Not covered: Grafana's Geomap panel loads its
+  default map tiles from CARTO in your browser; no bundled dashboard has one. And while
+  one of the stores is not running, a lookup of its name by the collector or Grafana
+  (such as `tempo` when traces arrive without the `traces` profile) goes to your host's
+  DNS resolvers; the query carries only that name (with your network's search domain,
+  if any).
 - **Secrets.** Secrets such as `CCOBS_DISCORD_WEBHOOK_URL` are read from the environment
   and never logged.
 - **Settings backup.** `ccobs setup` backs up `~/.claude/settings.json` before changing

@@ -1,0 +1,316 @@
+# cc-observatory: the local observability stack for Claude Code.
+#
+#   docker compose up -d
+#   docker compose --profile traces up -d    # also Tempo, for Claude Code's beta traces
+#
+# Grafana is at http://localhost:4330 (CCOBS_GRAFANA_PORT). Every published port binds
+# to 127.0.0.1 (ADR 0001) and can be moved with the variable named next to it; copying
+# .env.example to .env is optional. Storage services stay on the internal `backend`
+# network; compose.debug.yaml publishes them on loopback for debugging.
+
+name: cc-observatory
+
+# Settings shared by every service.
+x-service: &service
+  restart: unless-stopped
+  # Time to shut down cleanly after SIGTERM before Docker kills the container. Explicit,
+  # because the daemon's default differs (10 s upstream, about 3 s on Docker Desktop
+  # 29.8), and a backend killed mid-shutdown replays its write-ahead log at the next
+  # start. A service that exits sooner does not wait.
+  stop_grace_period: 30s
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  logging:
+    driver: json-file
+    options:
+      max-size: 10m
+      max-file: "3"
+
+networks:
+  # No egress: services only on this network cannot reach the internet or other
+  # networks.
+  backend:
+    internal: true
+  # Normal bridge network, for services that publish ports.
+  edge: {}
+
+services:
+  # OTLP entry point: removes identity and content attributes (ADR 0006), then routes
+  # each signal to its store. The image is the pinned upstream collector plus a static
+  # busybox for the healthcheck (stack/otel-collector/Dockerfile).
+  otel-collector:
+    <<: *service
+    build: stack/otel-collector
+    image: cc-observatory-otel-collector:0.162.0
+    pull_policy: build
+    command: ["--config=/etc/ccobs/otel-collector/config.yaml"]
+    volumes:
+      - ./stack/otel-collector:/etc/ccobs/otel-collector:ro
+    ports:
+      - "127.0.0.1:${CCOBS_OTLP_GRPC_PORT:-4317}:4317"
+      - "127.0.0.1:${CCOBS_OTLP_HTTP_PORT:-4318}:4318"
+    mem_limit: 256m
+    environment:
+      # About 80% of mem_limit, so the Go runtime collects garbage before the limit.
+      GOMEMLIMIT: 204MiB
+      # The host label on every metric, event and trace (ADR 0022); never the machine's
+      # hostname unless you set it to that.
+      CCOBS_HOST_LABEL: ${CCOBS_HOST_LABEL:-local}
+    healthcheck:
+      test: ["CMD", "/busybox", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:13133/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+      start_interval: 2s
+    networks:
+      - backend
+      - edge
+    # No depends_on: the collector accepts OTLP at once, and its exporters queue and
+    # retry while the backends start (ADR 0015).
+
+  # Stores Claude Code's metrics, pushed by the collector to Prometheus's OTLP receiver
+  # (ADR 0013). Only on the internal backend network, with no published port;
+  # compose.debug.yaml publishes it on loopback.
+  prometheus:
+    <<: *service
+    image: prom/prometheus:v3.13.4@sha256:87861b8cf91579109319ebc300f3f1060e6da9c05d6ae8ad15a20c879e84e32e
+    command:
+      - --config.file=/etc/ccobs/prometheus/prometheus.yaml
+      - --storage.tsdb.path=/prometheus
+      # How long metrics are kept, as a Prometheus duration (90d; ADR 0016).
+      - --storage.tsdb.retention.time=${CCOBS_PROMETHEUS_RETENTION:-90d}
+      # The OTLP receiver, at /api/v1/otlp/v1/metrics. It has no authentication.
+      - --web.enable-otlp-receiver
+      # A 0 sample at each stream's start time and the anchored range modifier, which
+      # exact totals need (ADR 0013). Both features are experimental.
+      - --enable-feature=created-timestamp-zero-ingestion,promql-extended-range-selectors
+    volumes:
+      - ./stack/prometheus:/etc/ccobs/prometheus:ro
+      - prometheus-data:/prometheus
+    mem_limit: 512m
+    environment:
+      # About 80% of mem_limit, so the Go runtime collects garbage before the limit.
+      GOMEMLIMIT: 409MiB
+    healthcheck:
+      # The image is busybox-based. /-/ready answers once Prometheus serves queries and
+      # writes; the longer start_period leaves room to replay the write-ahead log.
+      test: ["CMD", "/bin/wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9090/-/ready"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+      start_interval: 2s
+    networks:
+      - backend
+
+  # Stores Claude Code's events, pushed by the collector to Loki's OTLP endpoint
+  # (ADR 0015). Only on the internal backend network, with no published port;
+  # compose.debug.yaml publishes it on loopback.
+  loki:
+    <<: *service
+    image: grafana/loki:3.7.8@sha256:1107dd5274e0ada47e42472b7a7e71f3b2a2fe878878108f3e2f9e51528f0193
+    command:
+      - -config.file=/etc/ccobs/loki/config.yaml
+      - -config.expand-env=true
+    volumes:
+      - ./stack/loki:/etc/ccobs/loki:ro
+      - loki-data:/loki
+    mem_limit: 512m
+    environment:
+      # About 80% of mem_limit, so the Go runtime collects garbage before the limit.
+      GOMEMLIMIT: 409MiB
+      # How long events are kept: a multiple of 24h (720h is 30 days; ADR 0016).
+      CCOBS_LOKI_RETENTION: ${CCOBS_LOKI_RETENTION:-720h}
+    healthcheck:
+      # The image has no shell or HTTP client; -health requests /ready on port 3100,
+      # which answers once the ingester has been ready for 15 seconds. The longer
+      # start_period leaves room to replay the write-ahead log after an unclean stop.
+      test: ["CMD", "/usr/bin/loki", "-health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+      start_interval: 2s
+    networks:
+      - backend
+
+  # Stores Claude Code's traces, pushed by the collector to Tempo's OTLP receiver. Only
+  # in the traces profile, since tracing is a beta feature of Claude Code and off by
+  # default (ADR 0003): docker compose --profile traces up -d. Only on the internal
+  # backend network, with no published port; compose.debug.yaml publishes its HTTP API
+  # on loopback.
+  tempo:
+    <<: *service
+    image: grafana/tempo:3.1.0@sha256:3076b8dcdfb32fd6bc5ccef85e7b7313e6199b9cb84366257fc17ecb696db5fd
+    profiles:
+      - traces
+    command:
+      - -config.file=/etc/ccobs/tempo/config.yaml
+      - -config.expand-env=true
+    volumes:
+      - ./stack/tempo:/etc/ccobs/tempo:ro
+      - tempo-data:/var/tempo
+    mem_limit: 512m
+    environment:
+      # About 80% of mem_limit, so the Go runtime collects garbage before the limit.
+      GOMEMLIMIT: 409MiB
+      # How long traces are kept, as a Go duration (168h is 7 days; ADR 0016).
+      CCOBS_TEMPO_RETENTION: ${CCOBS_TEMPO_RETENTION:-168h}
+    healthcheck:
+      # The image has no shell or HTTP client; -health requests /ready on port 3200,
+      # which answers once every module has started. The longer start_period leaves room
+      # to replay the write-ahead log.
+      test: ["CMD", "/tempo", "-health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+      start_interval: 2s
+    # Tempo exits cleanly on SIGTERM within about 5 s because its backend worker's
+    # finish_on_shutdown_timeout is short (stack/tempo/config.yaml); with the upstream
+    # default (30s) it would outlast a grace period and be killed (exit 137). Its own
+    # grace period, shorter than the shared one, stays well above that timeout.
+    stop_grace_period: 15s
+    networks:
+      - backend
+
+  # The UI for metrics, events and traces, with the Prometheus, Loki and Tempo
+  # datasources and the Claude Code overview dashboard provisioned from stack/grafana
+  # (ADR 0003). It joins edge to publish its port and backend to query the stores. No
+  # depends_on: Grafana queries a datasource only when a page asks, and shows a store
+  # that is down (Tempo without its profile) as an error on that page.
+  grafana:
+    <<: *service
+    image: grafana/grafana:13.2.4@sha256:dbbc38ea21103cefb50396340cd88afec779c7e070b0a7bf5a75b4ce46651d3f
+    volumes:
+      - ./stack/grafana:/etc/ccobs/grafana:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "127.0.0.1:${CCOBS_GRAFANA_PORT:-4330}:3000"
+    # Grafana 13.2 also runs its Prometheus, Loki and Tempo plugins as separate
+    # processes, 20-40 MiB for the three together that GOMEMLIMIT does not cover; opening
+    # the UI took the container's cgroup memory.peak to about 600-630 MiB.
+    mem_limit: 768m
+    environment:
+      # About 80% of mem_limit, so the Go runtime collects garbage before the limit.
+      GOMEMLIMIT: 614MiB
+      # paths.provisioning: the datasources and the dashboards, from the read-only mount
+      # of stack/grafana.
+      GF_PATHS_PROVISIONING: /etc/ccobs/grafana/provisioning
+      # dashboards.default_home_dashboard_path: Grafana's home page is the Claude Code
+      # overview, read from the same file that the dashboard provider loads. Grafana
+      # watches the file for changes, which a mount without file events (Docker Desktop
+      # on Windows), an editor that saves by renaming or a git checkout can miss: if the
+      # home page shows an old version, restart Grafana (the copy in the "Claude Code"
+      # folder rereads the file every 30 seconds).
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /etc/ccobs/grafana/dashboards/claude-code-overview.json
+      # Access (ADR 0017): whoever opens Grafana is an Editor of its one organization.
+      # There is no login form, no basic auth and no admin user, so there is no password
+      # to set, leak or forget. Grafana 13.2 logs at every start that an anonymous role
+      # other than Viewer is deprecated; it still applies it.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Editor
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_AUTH_DISABLE_SIGNOUT_MENU: "true"
+      GF_AUTH_BASIC_ENABLED: "false"
+      GF_SECURITY_DISABLE_INITIAL_ADMIN_CREATION: "true"
+      # Browser defences (ADR 0017). Grafana answers only requests whose Host is
+      # localhost and redirects any other to root_url, so a page that uses DNS rebinding
+      # (which sends the attacker's host name) reads only a redirect; open it at
+      # http://localhost:<port>, not 127.0.0.1. csrf_always_check refuses (403) any
+      # request other than HEAD, OPTIONS and TRACE, GET included, whose Origin names
+      # another host, even from an anonymous visitor, who has no login cookie; a simple
+      # GET (an <img>, say) carries no Origin and passes, which is why the two settings
+      # below are also needed. A few routes answer any Host by Grafana's design
+      # (/api/health, the static files, /bootdata with a 204 that only names the domain);
+      # none of them reads Claude Code data, and /metrics is turned off below.
+      GF_SERVER_DOMAIN: localhost
+      GF_SERVER_ENFORCE_DOMAIN: "true"
+      GF_SERVER_ROOT_URL: http://localhost:${CCOBS_GRAFANA_PORT:-4330}/
+      GF_SECURITY_CSRF_ALWAYS_CHECK: "true"
+      # Closes Grafana's legacy datasource proxy (/api/datasources/proxy/...), which
+      # forwards a request to the datasource's own HTTP API. A simple cross-site GET (no
+      # Origin, so csrf lets it through) to this proxy would otherwise reach a store:
+      # Loki 3.7 serves GET /flush and GET /ingester/shutdown, which stop its ingester.
+      # The allowlist is one host:port no datasource uses, so checkWhiteList() answers
+      # 403 before forwarding any proxy request, of any method. The datasources are
+      # queried through /api/ds/query and /resources, which do not use this proxy
+      # (ADR 0017); the /resources route of Loki and Tempo has a plugin allowlist, and
+      # Prometheus's lifecycle and admin APIs are off (its flags in this file).
+      GF_SECURITY_DATA_SOURCE_PROXY_WHITELIST: 127.0.0.1:9
+      # /metrics is Grafana's own Prometheus metrics; nothing scrapes it, and it is the
+      # widest route outside the Host check, so a DNS-rebinding page could read Grafana's
+      # usage from it. Off, so it answers like any unknown path.
+      GF_METRICS_ENABLED: "false"
+      # No outbound traffic (ADR 0006). Each default below calls out to the internet (the
+      # feedback links send the user there), as Grafana 13.2.4's conf/defaults.ini and
+      # its logs show:
+      #   - analytics.reporting_enabled: usage counters to stats.grafana.org, daily;
+      #   - analytics.check_for_updates: Grafana's latest version, from grafana.com;
+      #   - analytics.check_for_plugin_updates: the plugins' latest versions and the
+      #     Angular detection patterns, from grafana.com;
+      #   - analytics.feedback_links_enabled: links to feedback forms in the UI;
+      #   - news.news_feed_enabled: the news feed, grafana.com/blog/news.xml;
+      #   - security.disable_gravatar: avatars from secure.gravatar.com;
+      #   - snapshots.external_enabled: publishing snapshots to snapshots.raintank.io;
+      #   - plugins.public_key_retrieval_disabled: the plugin signing key, from
+      #     grafana.com every 10 days;
+      #   - plugins.preinstall_disabled and plugins.preinstall_auto_update: installing
+      #     the Drilldown and Advisor apps, and updating the bundled plugins, from
+      #     grafana.com at every start;
+      #   - plugins.plugin_admin_enabled: installing plugins from the catalog;
+      #   - cloud_migration.enabled: migrating to Grafana Cloud (grafana.net);
+      #   - grafana_com.api_url: the base URL for calls to grafana.com's API, both what
+      #     the UI asks for through Grafana's /api/gnet proxy (the plugin catalog,
+      #     dashboard templates and community dashboards) and the server's plugin calls
+      #     (update checks, signing key, preinstall, Angular detection patterns); a
+      #     closed port on Grafana's own loopback, so it is also their safety net if a
+      #     check above is missed or reset upstream. Grafana's own update check has a
+      #     fixed URL, so only analytics.check_for_updates keeps it off.
+      # Off by default and left so: Google Analytics, Rudderstack, PostHog, Application
+      # Insights, Faro and secret scanning. Not covered: the Geomap panel's default map
+      # loads tiles from CARTO in the browser; the bundled dashboards have none.
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES: "false"
+      GF_ANALYTICS_FEEDBACK_LINKS_ENABLED: "false"
+      GF_NEWS_NEWS_FEED_ENABLED: "false"
+      GF_SECURITY_DISABLE_GRAVATAR: "true"
+      GF_SNAPSHOTS_EXTERNAL_ENABLED: "false"
+      GF_PLUGINS_PUBLIC_KEY_RETRIEVAL_DISABLED: "true"
+      GF_PLUGINS_PREINSTALL_DISABLED: "true"
+      GF_PLUGINS_PREINSTALL_AUTO_UPDATE: "false"
+      GF_PLUGINS_PLUGIN_ADMIN_ENABLED: "false"
+      GF_CLOUD_MIGRATION_ENABLED: "false"
+      GF_GRAFANA_COM_API_URL: http://127.0.0.1:9/api
+      # Unused features: public dashboards, which share a dashboard with anyone who has
+      # its link, and Grafana Alerting, since alerts are the app's job (ADR 0007).
+      GF_PUBLIC_DASHBOARDS_ENABLED: "false"
+      GF_UNIFIED_ALERTING_ENABLED: "false"
+      # plugins.disable_plugins: Grafana 13.2.4 runs each bundled backend datasource
+      # plugin as a process of its own, which GOMEMLIMIT does not cover. Only the
+      # Prometheus, Loki and Tempo plugins can be used, since the datasources are
+      # provisioned and not editable and the anonymous Editor cannot add one, so the
+      # other ten are off: less memory and ten fewer processes.
+      GF_PLUGINS_DISABLE_PLUGINS: elasticsearch,grafana-postgresql-datasource,grafana-pyroscope-datasource,influxdb,jaeger,mssql,mysql,opentsdb,stackdriver,zipkin
+    healthcheck:
+      # The image has curl. /api/health answers 200 once the database is reachable,
+      # whatever the Host header, so enforce_domain does not redirect it.
+      test: ["CMD", "/usr/bin/curl", "-fsS", "-o", "/dev/null", "http://127.0.0.1:3000/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+      start_interval: 2s
+    networks:
+      - backend
+      - edge
+
+volumes:
+  prometheus-data: {}
+  loki-data: {}
+  tempo-data: {}
+  grafana-data: {}

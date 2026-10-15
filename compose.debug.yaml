@@ -1,0 +1,38 @@
+# Debug override: publishes the storage services on 127.0.0.1, for debugging only.
+#
+#   docker compose -f compose.yaml -f compose.debug.yaml up -d
+#
+# compose.yaml keeps Prometheus, Loki and Tempo on the internal `backend` network
+# with no published port. This override publishes each one on loopback (ports set by
+# CCOBS_PROMETHEUS_PORT, CCOBS_LOKI_PORT and CCOBS_TEMPO_PORT) and attaches it to the
+# `edge` network, because a service only on an internal network cannot publish ports
+# (ADR 0018). While the override is in use, those services have egress. Tempo runs only
+# with the traces profile:
+#
+#   docker compose -f compose.yaml -f compose.debug.yaml --profile traces up -d
+
+services:
+  # Prometheus's HTTP API and UI: queries, /api/v1/status and /-/ready.
+  prometheus:
+    ports:
+      - "127.0.0.1:${CCOBS_PROMETHEUS_PORT:-4390}:9090"
+    networks:
+      - backend
+      - edge
+
+  # Loki's HTTP API: queries, /config and /ready.
+  loki:
+    ports:
+      - "127.0.0.1:${CCOBS_LOKI_PORT:-4310}:3100"
+    networks:
+      - backend
+      - edge
+
+  # Tempo's HTTP API: traces by ID, TraceQL search, /status/config and /ready. Only with
+  # the traces profile, like Tempo itself; its OTLP receiver is not published.
+  tempo:
+    ports:
+      - "127.0.0.1:${CCOBS_TEMPO_PORT:-4320}:3200"
+    networks:
+      - backend
+      - edge

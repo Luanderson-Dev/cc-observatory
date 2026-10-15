@@ -1,0 +1,24 @@
+# The dashboards cc-observatory provisions in Grafana (ADR 0003).
+#
+# Loads every dashboard file in stack/grafana/dashboards, mounted read-only at
+# /etc/ccobs/grafana/dashboards, into the "Claude Code" folder. The files are the
+# source of truth: Grafana refuses to save or delete these dashboards from the UI or
+# the API, and rereads the directory every 30 seconds, so an edited file shows up in the
+# folder without a restart (the home page may need one; see compose.yaml). To change one
+# in the UI, save a copy under another name ("Save as"), which the anonymous Editor can
+# do (ADR 0017).
+apiVersion: 1
+
+providers:
+  - name: cc-observatory
+    type: file
+    # A fixed folder UID, like the datasources' UIDs, for links to the folder.
+    folder: Claude Code
+    folderUid: claude-code
+    disableDeletion: true
+    allowUiUpdates: false
+    updateIntervalSeconds: 30
+    options:
+      path: /etc/ccobs/grafana/dashboards
+      # Every dashboard goes into the folder above, whatever subdirectory holds it.
+      foldersFromFilesStructure: false

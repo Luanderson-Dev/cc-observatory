@@ -1,0 +1,169 @@
+# Egress sink: a dev-only check that nothing in the stack reports usage or checks for
+# updates (ADR 0006). Not shipped to users; compose.yaml, compose.debug.yaml and the
+# integration tests never load it.
+#
+# It adds a sink container and gives it, on both of the stack's networks, the name of
+# every host a component calls by default, as network aliases: Docker's embedded DNS
+# answers those names with the sink's address before asking any real DNS server. The
+# sink listens on 80 and 443 and logs each connection: the peer, then the printable
+# bytes it sends (the request line and Host header over HTTP, the server name of the
+# TLS ClientHello over HTTPS). TLS fails, which is fine: the TCP connection is the
+# signal. The override also makes the edge network internal, so a call to a host this
+# list misses cannot leave the machine either; it fails, and the caller may log it.
+#
+# The host names (Grafana 13.2.4's conf/defaults.ini and sources, Loki 3.7.8 and Tempo
+# 3.1.0's usage reporters):
+#   - stats.grafana.org: usage reports from Grafana (24 hours after a start, then
+#     daily), Loki and Tempo (first one 4 hours after the first start, then every 4
+#     hours);
+#   - grafana.com: Grafana's update check (its URL is fixed in the code; at every start,
+#     then daily), and the default grafana_com.api_url, which the stack moves to a closed
+#     port on Grafana's loopback (127.0.0.1:9): the plugin update check (at start, then
+#     every 10 minutes), the plugin signing key (at the first start, and a minute later
+#     if that failed, then every 10 days), the Angular detection patterns, the plugin
+#     preinstall and installs, and the /api/gnet proxy;
+#   - secure.gravatar.com: avatars, fetched by Grafana when a page shows one;
+#   - snapshots.raintank.io: snapshots published outside;
+#   - secret-scanning.grafana.net: secret scanning (off by default).
+# Prometheus and the OpenTelemetry Collector have no usage reporting or update check.
+# What the browser loads (feedback links, the news feed, the Geomap panel's tiles) never
+# passes through a container, so the sink cannot see it.
+#
+# A 15-minute run covers every call made at start and the 10-minute jobs. The usage
+# reports come hours later; for them the proof is the running configuration
+# (tests/integration/test_stack_no_outbound.py) and, for Loki and Tempo, the internal
+# backend network.
+#
+# Procedure (bash, from the repository root, with Docker running; about 25 minutes). A
+# separate project, ccobs-egress, on ports of its own (a 44xxx block), so that it
+# touches neither the cc-observatory stack nor the integration tests' ccobs-it project.
+# The ports are set for each command only, never exported: a later `docker compose up`
+# of the stack in the same shell keeps its own. With edge internal, Docker publishes
+# none of them anyway (ADR 0018); they are moved all the same.
+#
+#   egress() {
+#     CCOBS_OTLP_GRPC_PORT=44317 CCOBS_OTLP_HTTP_PORT=44318 CCOBS_GRAFANA_PORT=44330 \
+#       docker compose -p ccobs-egress --env-file .env.example -f compose.yaml \
+#       -f tools/stack/compose.egress-sink.yaml --profile traces "$@"
+#   }
+#
+#   1. Start it; every service waits until the sink listens:
+#        egress up -d --build --wait
+#      The host names resolve to the sink (its address on that network), here from a
+#      throwaway container of the sink's image on the backend network:
+#        docker run --rm --network ccobs-egress_backend \
+#          "$(egress config --images | grep busybox)" nslookup stats.grafana.org
+#   2. Wait 15 minutes.
+#   3. Read the sink's log:
+#        egress logs sink
+#      It holds only its three start-up lines ("sink: listening on 80 and 443" and
+#      "tcpsvd: listening on 0.0.0.0:<port>, starting" for each port). A connection adds
+#      "tcpsvd: start ..." and "sink: connection to <sink>:<port> from <container>.<network>
+#      <address>", then the printable bytes it sent. Then check that no service logged a
+#      call that failed for lack of a route (to a host the list misses), and that
+#      Grafana made no call to grafana.com's API:
+#        egress logs | grep -Ei 'lookup |dial tcp|no such host|network is unreachable'
+#      A "dial tcp 127.0.0.1:9" line is a call to grafana.com's API that the closed port
+#      caught: some check is not turned off, even though nothing left the machine.
+#   4. Remove it with its volumes:
+#        egress down -v
+#
+# Negative controls, each with one outbound setting turned back on through an override
+# read from standard input; remove the project with egress down -v after each.
+#
+# Grafana's update check shows that the sink would see a call. Within seconds of
+# Grafana's start the sink logs a connection to 443 from the Grafana container with
+# grafana.com among the bytes of its ClientHello, and five seconds later Grafana logs
+# "Update check failed" (EOF, as the sink closes the connection):
+#
+#   egress -f - up -d --build --wait <<'EOF'
+#   services:
+#     grafana:
+#       environment:
+#         GF_ANALYTICS_CHECK_FOR_UPDATES: "true"
+#   EOF
+#   egress logs sink
+#   egress logs grafana | grep grafana.update.checker
+#
+# The plugin update check shows that grafana_com.api_url catches what goes to
+# grafana.com's API. The sink sees no connection, and at start Grafana logs at error
+# level "Error while updating detectors" with "dial tcp 127.0.0.1:9: connect: connection
+# refused" (the Angular detection patterns, which this setting also turns on). The
+# version check itself logs the same failure at debug level only; add
+# GF_LOG_FILTERS: plugins.update.checker:debug to the override to see it.
+#
+#   egress -f - up -d --build --wait <<'EOF'
+#   services:
+#     grafana:
+#       environment:
+#         GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES: "true"
+#   EOF
+#   egress logs sink
+#   egress logs grafana | grep 'dial tcp 127.0.0.1:9'
+
+services:
+  sink:
+    image: busybox:1.38.0-musl@sha256:ea2b9914a16a4ac1981994af97b318f7c7d4db76b580c56177f08bf76f4a0be8
+    # One tcpsvd per port; each connection runs the report below, which writes to the
+    # container's log. Compose turns $$ into $, so the shell sees its own variables.
+    command:
+      - sh
+      - -c
+      - |
+        report='echo "sink: connection to $$TCPLOCALADDR from $$TCPREMOTEHOST $$TCPREMOTEADDR" >&2
+        timeout 5 head -c 2048 | strings -n 6 | sed "s/^/sink:   /" >&2'
+        tcpsvd -v -h -l sink 0.0.0.0 80 sh -c "$$report" &
+        tcpsvd -v -h -l sink 0.0.0.0 443 sh -c "$$report" &
+        echo "sink: listening on 80 and 443" >&2
+        wait
+    init: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    mem_limit: 64m
+    healthcheck:
+      # netstat only reads the sockets: a connection would show up in the sink's log.
+      test: ["CMD", "sh", "-c", "netstat -ltn | grep -q ':80 ' && netstat -ltn | grep -q ':443 '"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+      start_interval: 1s
+    networks:
+      backend:
+        aliases: &outbound-hosts
+          - stats.grafana.org
+          - grafana.com
+          - secure.gravatar.com
+          - snapshots.raintank.io
+          - secret-scanning.grafana.net
+      edge:
+        aliases: *outbound-hosts
+
+  # Every service starts once the sink listens, so that it sees the calls made at start.
+  otel-collector:
+    depends_on:
+      sink:
+        condition: service_healthy
+  prometheus:
+    depends_on:
+      sink:
+        condition: service_healthy
+  loki:
+    depends_on:
+      sink:
+        condition: service_healthy
+  tempo:
+    depends_on:
+      sink:
+        condition: service_healthy
+  grafana:
+    depends_on:
+      sink:
+        condition: service_healthy
+
+networks:
+  # No route out for Grafana and the collector either, in this project only.
+  edge:
+    internal: true
