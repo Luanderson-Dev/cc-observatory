@@ -87,7 +87,7 @@ module = ["winpty", "mcp.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
-addopts = "-ra --strict-markers --strict-config -m 'not integration' --cov=ccobs --cov-report=term-missing"
+addopts = "-ra --strict-markers --strict-config -m 'not integration' --cov --cov-report=term-missing"
 markers = [
   "integration: starts an isolated docker compose project (ccobs-it) and talks to it",
 ]
@@ -98,7 +98,9 @@ xfail_strict = true
 
 [tool.coverage.run]
 branch = true
-source = ["ccobs"]
+# A directory, not a package name: coverage then traces files by path, which also
+# counts the Alembic env.py and revisions that Alembic loads under names of its own.
+source = ["src/ccobs"]
 patch = ["subprocess"]
 
 [tool.coverage.report]
