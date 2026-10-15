@@ -12,30 +12,32 @@ and cost, on your own machine.
 
 ## Status
 
-**Pre-alpha.** v0.1.0 is the first release and closes milestone 0 of 8 (foundation).
-There is still nothing useful to install.
+**Pre-alpha.** v0.2.0 closes milestone 1 of 8: the observability stack. The
+`cc-observatory` package on PyPI still only prints its version; the stack runs from a
+clone of this repository.
 
-What v0.1.0 contains:
+What v0.2.0 adds:
 
-- the repository foundation: the Python package `cc-observatory` (import package
-  `ccobs`), published to [PyPI](https://pypi.org/project/cc-observatory/), with a
-  `ccobs` CLI that only prints its version;
-- tooling: uv, ruff, mypy in strict mode, pytest with a coverage gate, pre-commit and
-  Commitizen;
-- CI on GitHub Actions: lint, type checks and tests on Linux, macOS and Windows, a
-  package build, a Conventional Commits check on PR titles, and a release workflow that
-  publishes to PyPI with trusted publishing;
-- architecture decision records (ADRs) 0001 to 0012 for the decisions made so far,
-  including how hooks reach the app
-  ([ADR 0011](https://github.com/Luanderson-Dev/cc-observatory/blob/main/docs/adr/0011-hook-delivery-http-plus-async-sessionstart.md))
-  and what Claude Code 2.1.296 really sends in its telemetry and hooks
-  ([ADR 0012](https://github.com/Luanderson-Dev/cc-observatory/blob/main/docs/adr/0012-observed-telemetry-and-hook-contract.md));
-- fixture capture tooling for development (`tools/capture/`, not part of the package) and
-  sanitized test fixtures recorded from real, isolated Claude Code sessions
-  (`tests/fixtures/`).
+- the observability stack in Docker Compose: the OpenTelemetry Collector, Prometheus,
+  Loki and Grafana, plus Tempo under the optional `traces` profile, with every port bound
+  to `127.0.0.1` (see "Run the observability stack" below and
+  [docs/stack.md](https://github.com/Luanderson-Dev/cc-observatory/blob/main/docs/stack.md));
+- Grafana without a login, with its Prometheus, Loki and Tempo datasources and a Claude
+  Code overview dashboard provisioned from the repository;
+- the collector's privacy filters, which always delete personal attributes and, for now,
+  always drop content (the opt-in to keep content arrives in v0.5.0), and a `host` label
+  on every signal;
+- configs that turn off every usage report and update check, checked by tests against
+  the running stack;
+- integration tests in CI that run against a real compose stack;
+- ADRs 0013 to 0022 for the stack's decisions.
 
-What comes next: milestone 1 (v0.2.0), the observability stack in Docker Compose with a
-provisioned Grafana. The full plan is in the roadmap below.
+v0.1.0 (milestone 0) laid the foundation: the package published to
+[PyPI](https://pypi.org/project/cc-observatory/), tooling, CI, ADRs 0001 to 0012, and
+sanitized fixtures recorded from real Claude Code sessions.
+
+What comes next: milestone 2 (v0.3.0), the app that receives Claude Code's hooks and
+tracks sessions, agents and blocks in SQLite. The full plan is in the roadmap below.
 
 Unless a section says otherwise, the rest of this README describes the planned design.
 
@@ -277,7 +279,7 @@ can still do, and how to report a vulnerability.
 | Milestone | Release | Scope                                                                                  | Status      |
 | --------- | ------- | -------------------------------------------------------------------------------------- | ----------- |
 | 0         | v0.1.0  | Foundation, tooling, CI, ADRs, telemetry and hooks spike, fixtures, first PyPI release | Released    |
-| 1         | v0.2.0  | Observability stack in compose, provisioned Grafana                                    | Planned     |
+| 1         | v0.2.0  | Observability stack in compose, provisioned Grafana                                    | Released    |
 | 2         | v0.3.0  | Hook ingestion, session state machine, SQLite, blocks, `/metrics`                      | Planned     |
 | 3         | v0.4.0  | Web UI (HTMX + SSE)                                                                    | Planned     |
 | 4         | v0.5.0  | `ccobs setup`, `uninstall`, `doctor`, `status`                                         | Planned     |
