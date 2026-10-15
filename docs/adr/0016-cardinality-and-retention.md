@@ -74,8 +74,10 @@ metadata (ADR 0015).
   (ADR 0013), and a long session with several models, tools and languages stays around
   50, the bound used here. At 50 sessions a day that is about 2,500 new series a day: a
   small head block in Prometheus, where series that receive no samples are dropped at
-  the next head compaction, and roughly 1 MB a day on disk. These are estimates; a later
-  stage of this milestone measures the stack's memory use.
+  the next head compaction, and roughly 1 MB a day on disk. These are estimates. The
+  stack's memory was measured with a few replayed sessions
+  ([`docs/stack.md`](../stack.md#measured-use)); disk and memory with 30 to 90 days of
+  real history have not been.
 - `ccobs setup` (milestone 4) never sets `OTEL_METRICS_INCLUDE_SESSION_ID=false`, as
   ADR 0013 also requires. If the user sets it elsewhere, `ccobs doctor` (milestone 4)
   warns, and the app must degrade gracefully: it cannot split metrics by session, and

@@ -144,10 +144,12 @@ keeping every port configurable.
   [port publishing](https://docs.docker.com/engine/network/port-publishing/) and
   [merging compose files](https://docs.docker.com/compose/how-tos/multiple-compose-files/merge/).
 - Docker Engine releases older than 28.0.0 let hosts on the same L2 segment reach ports
-  published to localhost (Docker's port publishing docs). Whether the README and
-  `ccobs doctor` (milestone 4) warn about such engines is decided with them.
+  published to localhost (Docker's port publishing docs). The requirements in the
+  README and `docs/stack.md`, and `SECURITY.md`, warn about such engines; whether
+  `ccobs doctor` (milestone 4) warns too is decided with it.
 - Grafana is published to the browser on purpose. ADR 0001 leaves to milestone 1 how
-  Grafana itself is protected against DNS rebinding; that is settled when Grafana joins
-  the stack. The app's browser defences (ADR 0001) arrive with it in v0.3.0.
+  Grafana itself is protected against DNS rebinding;
+  [ADR 0017](0017-grafana-access-and-dns-rebinding.md) settles it. The app's browser
+  defences (ADR 0001) arrive with it in v0.3.0.
 - Revisit if Docker starts publishing ports of containers on internal networks, or if a
   service needs egress (for example, Grafana plugins downloaded at startup).

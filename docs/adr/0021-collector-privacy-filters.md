@@ -63,8 +63,8 @@ with the data it plants. This ADR extends ADR 0006, which stays in force.
   the start of the key), plus `organization.id`, `identity.source` and `host.name`. The
   prefix rule covers new `user.*` attributes without a change. `host.name` is the
   machine's name, personal data under ADR 0006; the stack's own `host` label
-  ([ADR 0001](0001-local-single-machine-scope.md)) comes from configuration, as a later
-  ADR of this milestone decides.
+  ([ADR 0001](0001-local-single-machine-scope.md)) comes from configuration
+  (`CCOBS_HOST_LABEL`, [ADR 0022](0022-the-host-label.md)).
     - Seen in the fixtures, on every data point, log record and span: `user.id`,
       `user.email`, `user.account_uuid`, `user.account_id` and `organization.id`.
     - From the docs only: `user.groups` and `identity.source` (sessions signed in to a

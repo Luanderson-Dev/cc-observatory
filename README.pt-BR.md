@@ -41,8 +41,9 @@ Salvo indicação em contrário, o restante deste README descreve o projeto plan
 
 ## O que ele vai mostrar
 
-Nada disso funciona ainda. Entre parênteses está a release em que cada parte está
-prevista.
+Entre parênteses está a release que traz cada parte. Só a parte do Grafana chega com a
+v0.2.0 (veja "Como rodar a stack de observabilidade" mais abaixo); o resto está
+planejado.
 
 - **Visão geral ao vivo** das sessões do Claude Code na sua máquina: quais estão
   trabalhando, esperando por você, ociosas ou encerradas (v0.4.0).
@@ -59,9 +60,10 @@ prevista.
   hooks informam). O custo é uma estimativa que vem da telemetria do Claude Code, não o
   valor que você paga.
 - **Página de saúde**: se cada parte da stack está no ar e recebendo dados (v0.4.0).
-- **Grafana** para análises mais profundas, provisionado com as fontes de dados (v0.2.0)
-  e com dashboards que o app abre por links já filtrados pela sessão, agente ou projeto
-  que você estava vendo (v0.7.0).
+- **Grafana** para análises mais profundas, provisionado com as fontes de dados e um
+  dashboard de visão geral do Claude Code (v0.2.0) e, mais tarde, com dashboards que o
+  app abre por links já filtrados pela sessão, agente ou projeto que você estava vendo
+  (v0.7.0).
 - **Alertas** (v0.6.0): notificações no navegador e, opcionalmente, um webhook do Discord
   quando uma sessão espera por você além de um limite de tempo, quando erros de API se
   repetem ou quando o custo estimado de uma sessão ou de um dia passa de um limite. Você
@@ -102,10 +104,88 @@ Mais detalhes para quem contribui estão em [docs/architecture.md](docs/architec
 (em inglês). As decisões por trás desse projeto, e os motivos delas, estão nos registros
 de decisão de arquitetura em [docs/adr/](docs/adr/README.md) (em inglês).
 
+## Como rodar a stack de observabilidade (a partir da v0.2.0)
+
+A partir da v0.2.0 você pode rodar a stack de observabilidade com um clone deste
+repositório e ver as métricas e os eventos do Claude Code no Grafana. O app (hooks,
+sessões e bloqueios) chega na v0.3.0, a interface web dele na v0.4.0 e o `ccobs setup`
+na v0.5.0; até lá, você aponta o Claude Code para a stack manualmente.
+
+1. Suba a stack:
+
+   ~~~bash
+   git clone https://github.com/Luanderson-Dev/cc-observatory
+   cd cc-observatory
+   docker compose up -d
+   ~~~
+
+   A primeira subida baixa cerca de 750 MB de imagens e faz o build da imagem do
+   collector. O `docker compose ps` mostra cada serviço e se ele está saudável. Para
+   guardar também os traces do Claude Code, um recurso beta, suba a stack com
+   `docker compose --profile traces up -d`, que acrescenta o Tempo, e passe
+   `--profile traces` toda vez que subir ou atualizar a stack.
+
+2. Abra o Grafana em <http://localhost:4330>. Use `localhost`: o Grafana redireciona para
+   ele qualquer outro nome de host, inclusive `127.0.0.1`. Não há login. A página inicial
+   é o dashboard **Claude Code overview**: custo, tokens, sessões, tempo ativo, mudanças
+   de código, erros de API e eventos recentes.
+
+3. Aponte o Claude Code para a stack. Acrescente estas variáveis ao bloco `env` das suas
+   configurações de usuário, `~/.claude/settings.json`, mantendo as entradas que você já
+   tem, ou exporte-as no shell que inicia o Claude Code. As configurações de projeto
+   (`.claude/settings.json` e `.claude/settings.local.json`) não conseguem defini-las.
+
+   ~~~json
+   {
+     "env": {
+       "CLAUDE_CODE_ENABLE_TELEMETRY": "1",
+       "OTEL_METRICS_EXPORTER": "otlp",
+       "OTEL_LOGS_EXPORTER": "otlp",
+       "OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf",
+       "OTEL_EXPORTER_OTLP_ENDPOINT": "http://127.0.0.1:4318",
+       "OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE": "cumulative"
+     }
+   }
+   ~~~
+
+   - Use `127.0.0.1`, não `localhost`: as portas escutam só em IPv4, e `localhost` pode
+     resolver para `::1`.
+   - O Claude Code não tem protocolo padrão, então defina um. `grpc` também funciona, com
+     `http://127.0.0.1:4317`.
+   - A temporalidade cumulativa é a recomendada: com o padrão do Claude Code, delta,
+     alguns totais podem sair menores depois de uma pausa
+     ([o limite conhecido](docs/stack.md#known-limit-delta-temporality), em inglês).
+   - Deixe `OTEL_METRICS_INCLUDE_SESSION_ID` no padrão (`true`): sem os IDs de sessão, as
+     séries de sessões simultâneas colidem.
+   - Para traces, defina também `CLAUDE_CODE_ENHANCED_TELEMETRY_BETA` como `1` e
+     `OTEL_TRACES_EXPORTER` como `otlp`, e rode a stack com `--profile traces`.
+
+4. Reinicie o Claude Code para que as novas sessões carreguem as configurações. As
+   métricas chegam a cada 60 segundos e os eventos a cada 5 segundos, e o dashboard se
+   atualiza a cada minuto. Se nada aparecer, veja
+   [No data in the dashboard](docs/stack.md#no-data-in-the-dashboard) (em inglês).
+
+- **Configurações.** Toda configuração é uma variável de ambiente com um valor padrão,
+  então o arquivo `.env` é opcional: para mudar uma, copie o
+  [`.env.example`](.env.example) para `.env`, edite-o e rode `docker compose up -d` de
+  novo. `CCOBS_HOST_LABEL` (padrão `local`) é o label `host` guardado em toda métrica,
+  evento e trace; defina-o para dar um nome à máquina. Ele é guardado como você
+  escrever, então use o nome de host real da máquina só se quiser que ele seja guardado.
+  As portas e a retenção (por padrão, 90 dias de métricas, 30 de eventos e 7 de traces)
+  são definidas do mesmo jeito.
+- **Depois de reiniciar a máquina.** Os serviços reiniciam a menos que você os pare com
+  `docker compose stop`, então a stack volta sempre que o Docker inicia
+  ([ADR 0019](docs/adr/0019-restart-unless-stopped.md), em inglês). O Docker Desktop só
+  inicia quando você entra na sessão se a opção "Start Docker Desktop when you sign in
+  to your computer" estiver ligada, e ela vem desligada; no Linux, habilite o serviço do
+  Docker na inicialização.
+- **Mais.** O [docs/stack.md](docs/stack.md) (em inglês) cobre como parar e atualizar a
+  stack, as configurações, os dados e a retenção, a memória e a solução de problemas.
+
 ## Início rápido (planejado, disponível a partir da v0.5.0)
 
-**Estes passos ainda não funcionam.** A stack chega na v0.2.0 e o comando `setup`, na
-v0.5.0.
+**Ainda não disponível.** O passo 1 funciona a partir da v0.2.0 (veja a seção acima);
+os passos 2 a 4 precisam do comando `setup`, que chega na v0.5.0.
 
 1. Suba a stack:
 
@@ -136,24 +216,34 @@ instalá-la.
 
 - **Só metadados por padrão.** O texto dos prompts, as entradas e saídas das
   ferramentas, as mensagens do assistente e os textos de erro não são armazenados.
-- **A captura de conteúdo é opt-in explícito.** O `ccobs setup --capture-content` mostra
-  um aviso e então liga a captura de conteúdo nas configurações de telemetria do Claude
-  Code e na stack (no collector e no app). Sem ele, o collector descarta o conteúdo da
-  telemetria mesmo que o Claude Code tenha sido configurado para enviá-lo.
-- **Os atributos pessoais são removidos.** O collector apaga da telemetria o seu e-mail e
-  os IDs do seu usuário, da sua conta e da sua organização antes que qualquer coisa seja
-  armazenada.
+- **A captura de conteúdo é opt-in explícito** (prevista para a v0.5.0).
+  O `ccobs setup --capture-content` mostra um aviso e então liga a captura de conteúdo
+  nas configurações de telemetria do Claude Code e na stack (no collector e no app). Sem
+  ele, o collector descarta o conteúdo da telemetria mesmo que o Claude Code tenha sido
+  configurado para enviá-lo.
+- **Os atributos pessoais são removidos.** O collector apaga da telemetria o seu e-mail,
+  os IDs do seu usuário, da sua conta e da sua organização e o nome de host da sua
+  máquina antes que qualquer coisa seja armazenada.
 - **Tudo fica na sua máquina.** Esse é um objetivo do projeto que as configurações
-  incluídas garantem: todas as portas escutam só em `127.0.0.1`, e o envio de dados de
-  uso e a busca por atualizações do Grafana, do Loki e do Tempo ficam desligados. Durante
-  o uso, nada sai da sua máquina, exceto o webhook opcional do Discord, e só se você
-  configurar um.
-- **A retenção é configurável** (na stack de observabilidade a partir da v0.2.0, no banco
-  do app a partir da v0.3.0), então os dados antigos são apagados depois do período que
-  você escolher.
+  incluídas garantem: todas as portas escutam só em `127.0.0.1`; o Prometheus, o Loki e
+  o Tempo não publicam porta nenhuma e ficam numa rede interna, sem rota para fora; e o
+  envio de dados de uso e a busca por atualizações do Grafana, do Loki e do Tempo ficam
+  desligados. Durante o uso, nada sai da sua máquina, exceto o webhook opcional do
+  Discord, se você configurar um, e as consultas de DNS pelo nome de um armazenamento
+  enquanto ele estiver parado (veja o [SECURITY.md](SECURITY.md)).
+- **O Grafana não tem login.** Quem o abre é um Editor, que pode consultar os dados e
+  salvar dashboards, mas não pode mudar as fontes de dados, os plugins, os usuários nem
+  as configurações dele. Ele só responde como `localhost`, o que impede outras páginas
+  web de lê-lo por DNS rebinding, e recusa as requisições de outros sites que poderiam
+  alterá-lo ou ler as respostas dele; uma página ainda consegue fazê-lo rodar uma
+  consulta às cegas, sem ver o resultado. Qualquer programa que rode na sua máquina pode
+  ler os dados.
+- **A retenção é configurável** (na stack de observabilidade a partir da v0.2.0, por
+  padrão 90 dias de métricas, 30 de eventos e 7 de traces; no banco do app a partir da
+  v0.3.0), então os dados antigos são apagados depois do período que você escolher.
 
-Veja o [SECURITY.md](SECURITY.md) (em inglês) para o modelo de segurança e para saber como
-relatar uma vulnerabilidade.
+Veja o [SECURITY.md](SECURITY.md) (em inglês) para o modelo de segurança, inclusive o que
+uma página web ainda consegue fazer, e para saber como relatar uma vulnerabilidade.
 
 ## Sem interferência no Claude Code
 
@@ -168,11 +258,24 @@ relatar uma vulnerabilidade.
   confere se o endpoint dos hooks responde e aponta os hooks que estão falhando, e o
   `ccobs uninstall` remove os hooks.
 
-## Requisitos (planejado)
+## Requisitos
 
-- Docker com Compose v2 (Docker Desktop no Windows e no macOS, ou Docker Engine com o
-  plugin Compose no Linux).
-- [uv](https://docs.astral.sh/uv/).
+- Docker Engine 25.0 ou mais recente com o plugin Docker Compose 2.20.2 ou mais recente
+  (e, se o plugin Buildx estiver instalado, Buildx 0.17.0 ou mais recente): o Docker
+  Desktop no Windows e no macOS, ou os pacotes do próprio Docker no Linux, onde o Docker
+  Engine 28.0 ou mais recente também impede que outros hosts da rede local alcancem as
+  portas publicadas em `127.0.0.1`.
+- Memória: deixe no Docker pelo menos cerca de 2 GB para a stack (2,5 GB com o Tempo), a
+  soma dos limites de memória dela. O uso medido foi de cerca de 260 a 290 MiB em
+  repouso e de 420 a 450 MiB enquanto as consultas do dashboard rodavam pela API do
+  Grafana; carregar a interface do Grafana no navegador levou, por pouco tempo, só o
+  Grafana a cerca de 630 MiB.
+- Disco: cerca de 3 GB para as imagens, mais os dados.
+- Testado no Linux e no Windows 11 com o Docker Desktop, ambos em amd64; macOS e arm64
+  não foram testados. Os detalhes estão em
+  [docs/stack.md](docs/stack.md#requirements) (em inglês).
+- [uv](https://docs.astral.sh/uv/), para a CLI `ccobs` (`uvx cc-observatory`), cujos
+  comandos chegam na v0.5.0.
 - Claude Code 2.1.296 ou mais recente. É a versão com que o cc-observatory foi testado
   ([ADR 0012](docs/adr/0012-observed-telemetry-and-hook-contract.md), em inglês);
   versões anteriores não são suportadas até serem testadas.
@@ -196,13 +299,17 @@ Você precisa do [uv](https://docs.astral.sh/uv/); ele instala a versão certa d
 para você.
 
 ~~~bash
-uv sync                            # cria o virtualenv com as dependências de dev
-uv run pre-commit install          # instala os hooks de pre-commit e commit-msg
-uv run pytest                      # testes unitários com a cobertura mínima
-uv run mypy                        # checagem de tipos em modo estrito
-uv run pre-commit run --all-files  # todas as checagens do job de lint do CI
+uv sync                                # cria o virtualenv com as dependências de dev
+uv run pre-commit install              # instala os hooks de pre-commit e commit-msg
+uv run pytest                          # testes unitários com a cobertura mínima
+uv run mypy                            # checagem de tipos em modo estrito
+uv run pre-commit run --all-files      # todas as checagens do job de lint do CI
+uv run pytest -m integration --no-cov  # testes de integração (precisam do Docker)
 ~~~
 
+- Os testes de integração sobem um projeto compose próprio, `ccobs-it`, em portas
+  próprias, então podem rodar ao lado da sua stack; veja
+  [docs/stack.md](docs/stack.md#running-the-integration-tests) (em inglês).
 - O projeto usa Gitflow. `develop` é a branch padrão: os pull requests de feature têm
   `develop` como destino e são integrados com squash, e os pull requests de release vão
   para a `main` com merge commit.

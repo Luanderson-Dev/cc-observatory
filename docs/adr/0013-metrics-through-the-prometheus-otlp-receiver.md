@@ -112,11 +112,12 @@ query, and remote write needs the same processor for a longer path.
 - Cumulative points pass through `delta_to_cumulative` untouched (with cumulative input
   the spike saw no data points processed), so with `ccobs setup`'s settings it holds no
   state. It stays as the safety net for delta senders.
-- The exporter keeps its defaults: gzip, retries and an in-memory sending queue. An
-  HTTP 400 is permanent ("The client MUST NOT retry the request when it receives
-  `HTTP 400 Bad Request`", [OTLP](https://opentelemetry.io/docs/specs/otlp/)), and the
-  collector drops the request, which is why Prometheus needs the out-of-order window
-  below.
+- The exporter keeps gzip, retries and an in-memory sending queue, sized like Loki's:
+  100 requests, one consumer each and a 5 s timeout
+  ([ADR 0020](0020-compose-conventions.md)). An HTTP 400 is permanent ("The client MUST
+  NOT retry the request when it receives `HTTP 400 Bad Request`",
+  [OTLP](https://opentelemetry.io/docs/specs/otlp/)), and the collector drops the
+  request, which is why Prometheus needs the out-of-order window below.
 
 **Prometheus:**
 
@@ -136,10 +137,11 @@ query, and remote write needs the same processor for a longer path.
   lost its whole `session.count`.
 - The `otlp` translation keeps its defaults: `translation_strategy`
   `UnderscoreEscapingWithSuffixes`, which gives classic names that PromQL needs no
-  quotes for. No resource attribute is promoted to a label except the `host` label,
-  which a later ADR of this milestone adds. `service.name` becomes `job="claude-code"`,
-  and the other resource attributes stay on `target_info`. The names and labels as
-  stored are recorded in a later ADR of this milestone (0014).
+  quotes for. No resource attribute is promoted to a label except the `host` label of
+  [ADR 0022](0022-the-host-label.md) (`otlp.promote_resource_attributes: [host]`).
+  `service.name` becomes `job="claude-code"`, and the other resource attributes stay on
+  `target_info`. The names and labels as stored are recorded in
+  [ADR 0014](0014-stored-telemetry-names.md).
 
 **Temporality** (applied by `ccobs setup`, milestone 4):
 
@@ -220,11 +222,10 @@ query, and remote write needs the same processor for a longer path.
   override.
 - Bad, because queries are more delicate: totals must use `anchored`, the range must
   cover what is being summed, and windows that start after a long pause need
-  `lookback_delta`. The app's queries and the Grafana dashboards (milestone 6) follow
-  the same rules.
+  `lookback_delta`. The app's queries and the Grafana dashboards (the overview
+  dashboard of this milestone, and those of milestone 6) follow the same rules.
 - Bad, because `/api/v1/metadata` returns nothing for metrics ingested over OTLP, so
-  types, units and help texts come from ADR 0012 and the names ADR (0014), not from
-  Prometheus.
+  types, units and help texts come from ADR 0012 and ADR 0014, not from Prometheus.
 - Neutral, because `created-timestamp-zero-ingestion` also changes the default
   `scrape_protocols` to negotiate `PrometheusProto` first for the targets Prometheus
   scrapes, such as the app's `/metrics` from milestone 2.
@@ -237,20 +238,20 @@ query, and remote write needs the same processor for a longer path.
 
 ### Confirmation
 
-- `tests/test_collector_config.py` (extended in a later stage of this milestone) checks
-  that the metrics pipeline runs the privacy processors of ADR 0021 before
-  `delta_to_cumulative`, that the processor has `max_stale: 24h`, and that metrics
-  leave through an `otlp_http` exporter to the OTLP receiver, with no `prometheus`
-  exporter.
-- A static test (a later stage of this milestone) over `compose.yaml` and the
-  Prometheus configuration under `stack/prometheus/` checks `--web.enable-otlp-receiver`,
-  both feature names in `--enable-feature` and `out_of_order_time_window: 30m`.
+- `tests/test_collector_config.py` checks that the metrics pipeline runs the privacy
+  processors of ADR 0021 and the host label of ADR 0022 before `delta_to_cumulative`,
+  that the processor has `max_stale: 24h`, and that metrics leave through an
+  `otlp_http` exporter to the OTLP receiver, with no `prometheus` exporter.
+- `tests/test_prometheus_config.py`, over `compose.yaml` and
+  `stack/prometheus/prometheus.yaml`, checks `--web.enable-otlp-receiver`, exactly the
+  two feature names in `--enable-feature` and `out_of_order_time_window: 30m`.
   `promtool check config` validates the configuration inside the running Prometheus
-  container, in `tests/integration/test_stack_metrics.py`, and the CI `stack` job will
-  run it too, from a later stage of this milestone.
-- An integration test in `tests/integration/` (stage 4 of this milestone) replays the
-  fixtures through the stack and checks exact sums per series in the non-contiguous,
-  concurrent scenario; exact `increase(... anchored)` for single-export sessions; exact
+  container, in `tests/integration/test_stack_metrics.py`, and on the bundled file in
+  the CI `stack` job (the "Validate the service configs" step of
+  `.github/workflows/ci.yml`), with the pinned image and no network.
+- `tests/integration/test_stack_metrics.py` replays the fixtures through the stack and
+  checks exact sums per series in the non-contiguous, concurrent scenario, and with
+  cumulative input; exact `increase(... anchored)` for single-export sessions; exact
   totals after a collector restart in the middle of a replay, at a split where no
   continuing series is contiguous (a strict xfail test records the contiguous case);
   and that no identity label reaches Prometheus.

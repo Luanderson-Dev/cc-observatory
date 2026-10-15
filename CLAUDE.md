@@ -197,18 +197,30 @@ uv run pre-commit install --hook-type pre-commit --hook-type commit-msg
 uv run pre-commit run --all-files
 uv run ruff check . && uv run ruff format --check .
 uv run mypy
-uv run pytest                               # unit tests (what CI runs)
+uv run pytest                               # unit tests (CI's test job)
 uv run pytest tests/test_cli.py --no-cov    # one file (skip the coverage gate)
+uv run pytest -m integration --no-cov       # integration tests (CI's stack job, needs
+                                            # Docker): isolated ccobs-it project on its
+                                            # own ports; CCOBS_IT_KEEP=1 keeps it up
+docker compose up -d                        # the stack (--profile traces adds Tempo);
+                                            # Grafana at http://localhost:4330
 ```
 
 ## Layout
 
 ```text
+compose*.yaml     compose.yaml is the stack; compose.debug.yaml publishes the stores on
+                  loopback (debugging, integration tests)
+stack/            service configs, mounted read-only into the containers
 src/ccobs/        package (CLI entry point in cli.py)
-tests/            unit tests; integration tests are marked @pytest.mark.integration
+tests/            unit tests; integration tests (tests/integration/) are marked
+                  @pytest.mark.integration
 tests/fixtures/   sanitized real payloads (hooks and OTLP) captured from Claude Code
 tools/capture/    dev-only fixture capture tooling (not packaged; tests import it
                   through `pythonpath = ["."]`); its `out/` holds raw data, never committed
+tools/stack/      dev-only stack tools (not packaged): OTLP replay, isolated ccobs-it
+                  project, memory per service, egress sink override
+docs/stack.md     operator reference for the stack (settings, memory, troubleshooting)
 docs/adr/         architecture decision records (MADR)
 .claude/agents/   project subagents
 ```

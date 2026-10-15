@@ -61,7 +61,9 @@ machine's volume does not need.
   ADR 0021, then exports with `otlp_http/loki` to `http://loki:3100/otlp` (the exporter
   appends `/v1/logs`), in plain HTTP on the internal `backend` network
   ([ADR 0018](0018-ports-networks-and-exposure.md)), where Loki runs single-tenant
-  without authentication. Its in-memory queue holds at most 1000 requests and never
+  without authentication. Its in-memory queue holds at most 100 requests, each with a
+  consumer of its own, so that a stop of the collector waits for one 5 s attempt at
+  most even while Loki is down ([ADR 0020](0020-compose-conventions.md)), and it never
   blocks the receiver; a request that keeps failing is retried for 5 minutes, then
   dropped with an error in the collector's logs. The collector has no `depends_on`: it
   accepts OTLP as soon as it starts, and the queue rides out Loki's start (about 16 s,
@@ -78,8 +80,10 @@ machine's volume does not need.
   `ignore_defaults: true`, which drops Loki's default list of promoted attributes
   (`k8s.*`, `cloud.*` and others), and one `index_label` rule for `service.name` and
   `host`. `service.name` becomes `service_name="claude-code"`. `host`, the stack's own
-  label of [ADR 0001](0001-local-single-machine-scope.md), is set by the collector from
-  configuration in a later stage of this milestone; until then it is absent.
+  label of [ADR 0001](0001-local-single-machine-scope.md), is set by the collector on
+  every resource from `CCOBS_HOST_LABEL`, `local` by default
+  ([ADR 0022](0022-the-host-label.md)), so the default stream is
+  `{service_name="claude-code", host="local"}`.
 - **Structured metadata: everything else**, with dots turned into underscores. The
   integration test observed, through the collector:
     - session and event fields: `session_id`, `event_name`, `event_sequence`,
@@ -135,6 +139,14 @@ machine's volume does not need.
   (limited to 256 KB by `max_line_size`) or truncating it.
 - Bad, because the exporter's queue is in memory: a collector restart loses what it
   holds, and events that cannot reach Loki for 5 minutes are dropped.
+- Bad, because one consumer per queued request, which keeps a stop of the collector
+  within its grace period ([ADR 0020](0020-compose-conventions.md)), has two costs. A
+  stop within about 30 s of Loki's recovery drops the requests still waiting out a
+  backoff, where two consumers gave each request they had not picked one attempt. And
+  the queue holds 100 requests instead of 1000: during a Loki outage, 8 busy sessions
+  (an export every 5 seconds each) fill it in about a minute, and after that new events
+  get a 503 (gRPC `UNAVAILABLE`), which an OpenTelemetry exporter treats as retryable
+  and drops after its own retries.
 - Neutral, because `detected_level` is always `unknown`; levels, if needed, come from
   the event name (`api_error`).
 
@@ -153,7 +165,7 @@ machine's volume does not need.
   collector does not wait for Loki.
 - `tests/integration/test_stack_logs.py` replays every fixture scenario with fresh
   session IDs and checks that each session's records are all stored; that the only
-  index labels are `service_name` (and later `host`); that `session_id`, `event_name`,
+  index labels are `service_name` and `host`; that `session_id`, `event_name`,
   `event_sequence`, `event_timestamp`, `prompt_id`, `trace_id` and `span_id` come back
   as structured metadata, with the trace and span IDs that were sent and no identity or
   content keys; that LogQL filters on them; that events sent while Loki is stopped are
@@ -162,9 +174,9 @@ machine's volume does not need.
 - `tests/integration/test_stack_no_outbound.py` reads usage reporting off from Loki's
   `/config` and from Tempo's `/status/config`.
 - `loki -config.expand-env=true -verify-config` and the collector's `validate` run on
-  the bundled files in the CI `stack` job (a later stage of this milestone). Until
-  then, `docker compose up --wait` in the integration tests already fails when either
-  service rejects its config.
+  the bundled files in the CI `stack` job (the "Validate the service configs" step of
+  `.github/workflows/ci.yml`), with the pinned images and no network. The integration
+  tests' `docker compose up --wait` also fails when either service rejects its config.
 - The `reviewer` subagent checks that no change adds an index label or a `drop` rule for
   log record attributes.
 
