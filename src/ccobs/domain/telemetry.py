@@ -207,6 +207,7 @@ SPAN_CONTENT_KEYS: Final = frozenset(
     | {"user_system_prompt", "response.model_output", "tool_input", "full_command"}
     | {"file_path", "hook_definitions", "error", "workspace.host_paths"}
 )
+SPAN_EVENT_CONTENT_KEYS: Final = frozenset({"workspace.host_paths"})
 # ... whole events (log records) with these names, and span events with this name.
 CONTENT_EVENTS: Final = frozenset({"api_request_body", "api_response_body", "system_prompt"})
 CONTENT_SPAN_EVENT: Final = "tool.output"

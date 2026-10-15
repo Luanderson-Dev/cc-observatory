@@ -51,6 +51,7 @@ from ccobs.domain.telemetry import (
     SERVICE_NAME,
     SESSION_COUNT,
     SPAN_CONTENT_KEYS,
+    SPAN_EVENT_CONTENT_KEYS,
     TARGET_INFO,
     TARGET_INFO_LABELS,
     TOKEN_USAGE,
@@ -411,6 +412,10 @@ def test_content_lists_are_the_replayers() -> None:
     assert set(replay.SPAN_CONTENT_CANARY_KEYS) | host_paths == SPAN_CONTENT_KEYS
     assert host_paths == RESOURCE_CONTENT_KEYS
     assert host_paths == DATA_POINT_CONTENT_KEYS
+    span_event_content = {
+        key for key in replay.SPAN_EVENT_CANARY_KEYS if not replay.is_identity_key(key)
+    }
+    assert span_event_content == host_paths == SPAN_EVENT_CONTENT_KEYS
     assert set(replay.CONTENT_EVENT_NAMES) == CONTENT_EVENTS
     assert CONTENT_SPAN_EVENT == replay.CONTENT_SPAN_EVENT
 
@@ -439,6 +444,7 @@ CONTENT_CONTEXTS: Final = (
     ("logs", "log", LOG_CONTENT_KEYS),
     ("traces", "resource", RESOURCE_CONTENT_KEYS),
     ("traces", "span", SPAN_CONTENT_KEYS),
+    ("traces", "spanevent", SPAN_EVENT_CONTENT_KEYS),
 )
 
 

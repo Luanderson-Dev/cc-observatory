@@ -26,6 +26,7 @@ from tools.stack.replay import (
     CANARY_PREFIX,
     CONTENT_EVENT_NAMES,
     CONTENT_SPAN_EVENT,
+    CONTENT_SPAN_EVENT_CANARY_KEYS,
     DATA_POINT_CANARY_KEYS,
     DEFAULT_FIXTURES,
     IDENTITY_CANARY_KEYS,
@@ -35,6 +36,7 @@ from tools.stack.replay import (
     SIGNALS,
     SPAN_CANARY_KEYS,
     SPAN_CONTENT_CANARY_KEYS,
+    SPAN_EVENT_CANARY_KEYS,
     Prepared,
     ReplayError,
     Scenario,
@@ -907,17 +909,25 @@ def test_canaries_reach_every_level(name: str) -> None:
     for record in items(prepared.logs, "logs"):
         for key in LOG_RECORD_CANARY_KEYS:
             assert canary_check(string_attr(record, key), marker), key
-    tool_outputs = 0
-    for item in items(prepared.traces, "traces"):
+    spans = list(items(prepared.traces, "traces"))
+    tool_outputs = kept_events = 0
+    for item in spans:
         for key in SPAN_CANARY_KEYS:
             assert canary_check(string_attr(item, key), marker), key
         for event in objects(item.get("events", [])):
             if event["name"] == CONTENT_SPAN_EVENT:
+                assert set(attributes(event)) == set(CONTENT_SPAN_EVENT_CANARY_KEYS)
                 values = [string_attr(event, key) for key in attributes(event)]
-                assert values
                 assert all(canary_check(value, marker) for value in values)
                 tool_outputs += 1
-    assert tool_outputs >= 1
+            else:
+                # The span events Claude Code sends, which the collector keeps.
+                for key in SPAN_EVENT_CANARY_KEYS:
+                    assert canary_check(string_attr(event, key), marker), key
+                kept_events += 1
+    assert tool_outputs == len(spans) >= 1
+    # Every scenario has gen_ai.request.attempt events; the synthetic one has one.
+    assert kept_events >= 1
 
 
 @pytest.mark.parametrize("name", [*OTLP_NAMES, "synthetic"])
@@ -954,7 +964,60 @@ def test_canary_key_lists_cover_every_level() -> None:
     assert set(DATA_POINT_CANARY_KEYS) == {*IDENTITY_CANARY_KEYS, host_paths}
     assert set(LOG_RECORD_CANARY_KEYS) == {*IDENTITY_CANARY_KEYS, *LOG_CONTENT_CANARY_KEYS}
     assert set(SPAN_CANARY_KEYS) == {*IDENTITY_CANARY_KEYS, *SPAN_CONTENT_CANARY_KEYS, host_paths}
+    # On span events the collector deletes identity and host paths; their other content is
+    # the tool.output event, dropped whole (ADR 0021).
+    assert set(SPAN_EVENT_CANARY_KEYS) == {*IDENTITY_CANARY_KEYS, host_paths}
+    assert CONTENT_SPAN_EVENT_CANARY_KEYS == ("output",)
     assert host_paths in LOG_CONTENT_CANARY_KEYS
+
+
+def test_span_event_canaries_go_on_each_event_sent_and_the_tool_output_event() -> None:
+    prepared = prepare(synthetic(), now_ns=NOW, canaries=True)
+    marker = prepared.canary_marker
+    assert marker is not None
+    child, root = items(prepared.traces, "traces")
+
+    attempt, output = objects(child["events"])
+    (root_output,) = objects(root["events"])
+
+    assert attempt["name"] == "gen_ai.request.attempt"
+    assert attempt["timeUnixNano"] == str(T0 + 6 * SECOND + NOW - LATEST)
+    assert {key: string_attr(attempt, key) for key in attributes(attempt)} == {
+        key: f"{marker}:traces.span0.event0:{key}" for key in SPAN_EVENT_CANARY_KEYS
+    }
+    for number, event in ((0, output), (1, root_output)):
+        assert event["name"] == CONTENT_SPAN_EVENT
+        assert {key: string_attr(event, key) for key in attributes(event)} == {
+            key: f"{marker}:traces.span{number}.{CONTENT_SPAN_EVENT}:{key}"
+            for key in CONTENT_SPAN_EVENT_CANARY_KEYS
+        }
+    assert f"{marker}:traces.span0.event0:user.email" in prepared.canary_values
+
+
+@pytest.mark.parametrize("name", OTLP_NAMES)
+def test_real_fixture_span_events_keep_their_attributes_next_to_the_canaries(name: str) -> None:
+    scenario = load_scenario(name)
+
+    plain = prepare(scenario, now_ns=NOW, rng=CountingBits())
+    marked = prepare(scenario, now_ns=NOW, canaries=True, rng=CountingBits())
+
+    marker = marked.canary_marker
+    assert marker is not None
+    pairs = list(zip(items(plain.traces, "traces"), items(marked.traces, "traces"), strict=True))
+    sent = 0
+    for number, (before, after) in enumerate(pairs):
+        events = objects(before.get("events", []))
+        *kept, output = objects(after["events"])
+        assert output["name"] == CONTENT_SPAN_EVENT
+        assert [event["name"] for event in kept] == [event["name"] for event in events]
+        for index, (old, new) in enumerate(zip(events, kept, strict=True)):
+            assert {key: attributes(new)[key] for key in attributes(old)} == attributes(old)
+            assert set(attributes(new)) - set(attributes(old)) == set(SPAN_EVENT_CANARY_KEYS)
+            place = f"traces.span{number}.event{index}"
+            assert string_attr(new, "user.id") == f"{marker}:{place}:user.id"
+            sent += 1
+    # Every scenario has gen_ai.request.attempt span events, so at least two were seen.
+    assert sent >= 2
 
 
 def test_content_canaries_include_the_names_only_the_monitoring_docs_give() -> None:
@@ -967,7 +1030,7 @@ def test_content_canaries_include_the_names_only_the_monitoring_docs_give() -> N
     assert not metadata & {*LOG_CONTENT_CANARY_KEYS, *SPAN_CONTENT_CANARY_KEYS}
 
 
-def test_host_path_canaries_reach_resources_points_records_and_spans() -> None:
+def test_host_path_canaries_reach_every_level() -> None:
     prepared = prepare(synthetic(), now_ns=NOW, canaries=True)
     marker = prepared.canary_marker
     assert marker is not None
@@ -978,12 +1041,21 @@ def test_host_path_canaries_reach_resources_points_records_and_spans() -> None:
         for entry in resource_entries(prepared.requests(signal), signal)
     ]
     points = [point for _, _, point in data_points(prepared.metrics)]
-    owners = [*resources, *points, *items(prepared.logs, "logs"), *items(prepared.traces, "traces")]
+    spans = list(items(prepared.traces, "traces"))
+    events = [
+        event
+        for span in spans
+        for event in objects(span.get("events", []))
+        if event["name"] != CONTENT_SPAN_EVENT
+    ]
+    owners = [*resources, *points, *items(prepared.logs, "logs"), *spans, *events]
 
     assert len(resources) == 7
+    assert len(events) == 1
     assert all(canary_check(string_attr(owner, key), marker) for owner in owners)
     assert {string_attr(point, key) for point in points} == {f"{marker}:metrics.datapoint:{key}"}
     assert f"{marker}:traces.span0:{key}" in prepared.canary_values
+    assert f"{marker}:traces.span0.event0:{key}" in prepared.canary_values
 
 
 def test_canary_values_are_recorded_and_name_their_place() -> None:

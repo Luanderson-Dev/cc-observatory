@@ -155,6 +155,9 @@ processors:
           - delete_key(span.attributes, "hook_definitions")
           - delete_key(span.attributes, "error")
           - delete_key(span.attributes, "workspace.host_paths")
+      - context: spanevent
+        statements:
+          - delete_key(spanevent.attributes, "workspace.host_paths")
 
   # The stack's host label (ADR 0022), after the privacy processors, so that host.name
   # stays deleted. The resource attribute host gets the value of CCOBS_HOST_LABEL, which

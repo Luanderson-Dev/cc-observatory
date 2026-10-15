@@ -33,6 +33,7 @@ from tools.stack.replay import (
     RESOURCE_CANARY_KEYS,
     SPAN_CANARY_KEYS,
     SPAN_CONTENT_CANARY_KEYS,
+    SPAN_EVENT_CANARY_KEYS,
     is_identity_key,
 )
 
@@ -77,7 +78,11 @@ IDENTITY_CONTEXTS: Final = {
 PLANTED: Final[Mapping[str, Mapping[str, tuple[str, ...]]]] = {
     "metrics": {"resource": RESOURCE_CANARY_KEYS, "datapoint": DATA_POINT_CANARY_KEYS},
     "logs": {"resource": RESOURCE_CANARY_KEYS, "log": LOG_RECORD_CANARY_KEYS},
-    "traces": {"resource": RESOURCE_CANARY_KEYS, "span": SPAN_CANARY_KEYS},
+    "traces": {
+        "resource": RESOURCE_CANARY_KEYS,
+        "span": SPAN_CANARY_KEYS,
+        "spanevent": SPAN_EVENT_CANARY_KEYS,
+    },
 }
 HOST_PATHS: Final = "workspace.host_paths"
 # Exporters that would print telemetry, content included, into the container logs.
@@ -634,7 +639,11 @@ def test_content_attributes_are_deleted_exactly() -> None:
     expected = {
         "metrics": {"resource": {HOST_PATHS}, "datapoint": {HOST_PATHS}},
         "logs": {"resource": {HOST_PATHS}, "log": set(LOG_CONTENT_CANARY_KEYS)},
-        "traces": {"resource": {HOST_PATHS}, "span": {*SPAN_CONTENT_CANARY_KEYS, HOST_PATHS}},
+        "traces": {
+            "resource": {HOST_PATHS},
+            "span": {*SPAN_CONTENT_CANARY_KEYS, HOST_PATHS},
+            "spanevent": {HOST_PATHS},
+        },
     }
     for signal, contexts in expected.items():
         found = _deletions(CONTENT_TRANSFORM, signal)

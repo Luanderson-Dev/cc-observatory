@@ -103,11 +103,13 @@ SPAN_CONTENT_CANARY_KEYS: Final = (
 )
 # Events that only carry content: whole extra log records are added for them.
 CONTENT_EVENT_NAMES: Final = ("api_request_body", "api_response_body", "system_prompt")
-# A span event that only carries content (not seen in the fixtures; its attribute names
-# are a guess, which does not matter because the collector drops the whole event).
+# A span event that only carries content, added to every span (not seen in the fixtures;
+# its attribute names are a guess, which does not matter because the collector drops the
+# whole event).
 CONTENT_SPAN_EVENT: Final = "tool.output"
-SPAN_EVENT_CANARY_KEYS: Final = ("output",)
-# Host paths contain the OS username; they are planted on every signal, not only on logs.
+CONTENT_SPAN_EVENT_CANARY_KEYS: Final = ("output",)
+# Host paths contain the OS username; they are planted on every signal and level, not
+# only on logs (ADR 0021).
 HOST_PATHS_CANARY_KEYS: Final = ("workspace.host_paths",)
 # Every key planted at each level. Data point values are constant per key for the whole
 # run, so they do not split series.
@@ -119,6 +121,9 @@ SPAN_CANARY_KEYS: Final = (
     *SPAN_CONTENT_CANARY_KEYS,
     *HOST_PATHS_CANARY_KEYS,
 )
+# The span events a scenario already has (gen_ai.request.attempt in the fixtures) are
+# metadata that the collector keeps, deleting identity and host paths from them.
+SPAN_EVENT_CANARY_KEYS: Final = (*IDENTITY_CANARY_KEYS, *HOST_PATHS_CANARY_KEYS)
 
 # Export request layout per signal: resource list -> scope list -> item list.
 _LAYOUT: Final[dict[Signal, tuple[str, str, str]]] = {
@@ -722,12 +727,14 @@ def _plant_canaries(requests: Mapping[Signal, list[JSONObject]], marker: str) ->
     spans = [span for request in requests["traces"] for _, span in _entries(request, "traces")]
     for number, span in enumerate(spans):
         plant(span, f"traces.span{number}", SPAN_CANARY_KEYS)
+        for index, sent in enumerate(_objects(span.get("events"))):
+            plant(sent, f"traces.span{number}.event{index}", SPAN_EVENT_CANARY_KEYS)
         event: JSONObject = {
             "timeUnixNano": span.get("startTimeUnixNano", "0"),
             "name": CONTENT_SPAN_EVENT,
             "attributes": [],
         }
-        plant(event, f"traces.span{number}.event", SPAN_EVENT_CANARY_KEYS)
+        plant(event, f"traces.span{number}.{CONTENT_SPAN_EVENT}", CONTENT_SPAN_EVENT_CANARY_KEYS)
         events = span.get("events")
         if isinstance(events, list):
             events.append(event)

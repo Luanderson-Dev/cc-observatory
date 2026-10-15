@@ -6,10 +6,10 @@ fixture scenario are replayed through the collector with fresh session, trace an
 IDs, and with the privacy canaries planted, then read back from Tempo on its debug port:
 every trace comes back by ID with exactly the spans sent and their parent links, a
 TraceQL search by session finds the run's traces, and no identity or content attribute
-and no ``tool.output`` span event is stored (ADR 0021; a later stage searches every
-backend for every canary). Tempo is optional (ADR 0003): the last test stops it and
-checks that the collector keeps storing metrics and logs, drops the traces it cannot
-deliver within its short retry, and reaches Tempo again once it is back.
+and no ``tool.output`` span event is stored (ADR 0021; ``test_stack_privacy.py``
+searches every backend for every canary). Tempo is optional (ADR 0003): the last test
+stops it and checks that the collector keeps storing metrics and logs, drops the traces
+it cannot deliver within its short retry, and reaches Tempo again once it is back.
 """
 
 from __future__ import annotations

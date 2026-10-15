@@ -81,7 +81,7 @@ with the data it plants. This ADR extends ADR 0006, which stays in force.
       `system_prompt_preview`, `user_system_prompt`, `response.model_output`,
       `tool_input`, `full_command`, `file_path`, `hook_definitions`, `error` and
       `workspace.host_paths`;
-    - resource and metric data point attributes: `workspace.host_paths`;
+    - resource, metric data point and span event attributes: `workspace.host_paths`;
     - whole log records of the events `api_request_body`, `api_response_body` and
       `system_prompt`, matched on the `event.name` attribute, on the record's event
       name field (empty in the fixtures) and on the body `claude_code.<name>`;
@@ -111,8 +111,8 @@ with the data it plants. This ADR extends ADR 0006, which stays in force.
       (`OTEL_LOG_TOOL_CONTENT`).
     - `workspace.host_paths` (host workspace directories chosen in the desktop app) is
       documented on events only. Its paths contain the OS username, so it is deleted
-      on spans, resources and data points too, in case it arrives there, for example
-      through `OTEL_RESOURCE_ATTRIBUTES`.
+      on spans, span events, resources and data points too, in case it arrives there,
+      for example through `OTEL_RESOURCE_ATTRIBUTES`.
 - **Considered and kept as metadata.** The repository attributes
   `vcs.repository.url.full` and `vcs.owner.name` (sent only with
   `OTEL_METRICS_INCLUDE_REPOSITORY`, off by default) can name the user's account, and
@@ -165,9 +165,9 @@ with the data it plants. This ADR extends ADR 0006, which stays in force.
   `filter/content` drops exactly the three content events and `tool.output` span
   events; that the privacy processors fail closed; and that no `debug`, `file` or
   `logging` exporter exists.
-- An integration test (a later stage of this milestone) replays the fixtures with
-  canaries planted at every level (`tools/stack/replay.py --canaries`) and finds none of
-  them in Prometheus, Loki or Tempo.
+- An integration test (`tests/integration/test_stack_privacy.py`) replays the fixtures
+  with canaries planted at every level (`tools/stack/replay.py --canaries`) and finds
+  none of them in Prometheus, Loki or Tempo.
 - The `reviewer` subagent checks every change to the collector config or to the canary
   lists against this ADR.
 
