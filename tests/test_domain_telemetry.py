@@ -79,7 +79,11 @@ LABEL_NAME: Final = re.compile(r"[a-zA-Z_][a-zA-Z0-9_]*")
 # The unit suffix Prometheus appended to each unit the fixtures carry (ADR 0013).
 UNIT_SUFFIXES: Final = {"": "", "s": "seconds", "tokens": "tokens", "USD": "USD"}
 # Modules ccobs.domain may import: none of them does I/O.
-ALLOWED_IMPORTS: Final = frozenset({"__future__", "collections.abc", "dataclasses", "re", "typing"})
+# json is there for json.dumps, which the hook parser uses to size tool inputs and
+# responses (ADR 0023); with open banned below, the domain has no file to dump to or load.
+ALLOWED_IMPORTS: Final = frozenset(
+    {"__future__", "collections.abc", "dataclasses", "json", "re", "typing"}
+)
 # Builtins that read or write outside the process, or run code from strings.
 IO_BUILTINS: Final = frozenset({"open", "print", "input", "__import__", "exec", "eval", "compile"})
 # The resource attribute that becomes Prometheus's job label instead of a target_info

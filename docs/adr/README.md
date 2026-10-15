@@ -51,3 +51,4 @@ the ADR wins.
 | [0020](0020-compose-conventions.md)                          | Compose conventions for a no-extra-steps start on Linux, macOS and Windows            | Accepted |
 | [0021](0021-collector-privacy-filters.md)                    | Privacy filters in the collector                                                      | Accepted |
 | [0022](0022-the-host-label.md)                               | The host label: one configured value, set by the collector on every signal            | Accepted |
+| [0023](0023-per-event-allowlist-of-hook-metadata.md)         | The app keeps a per-event allowlist of hook metadata                                  | Accepted |
