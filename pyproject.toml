@@ -95,6 +95,11 @@ markers = [
 pythonpath = ["."]
 testpaths = ["tests"]
 xfail_strict = true
+# Starlette 1.x deprecates its TestClient on httpx in favour of httpx2, warning on import
+# (a UserWarning subclass). Moving the app tests to httpx2 is a later follow-up.
+filterwarnings = [
+  "ignore:Using `httpx` with `starlette\\.testclient` is deprecated:UserWarning",
+]
 
 [tool.coverage.run]
 branch = true

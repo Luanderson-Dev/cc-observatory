@@ -55,3 +55,4 @@ the ADR wins.
 | [0024](0024-session-agent-and-block-state-machine.md)        | A hook-driven reducer derives session, agent and block state                          | Accepted |
 | [0025](0025-registered-hook-events.md)                       | Register only the hook events the state machine needs                                 | Accepted |
 | [0026](0026-app-database-schema-migrations-and-retention.md) | The app database: metadata-only schema, Alembic at start-up, retention by last event  | Accepted |
+| [0027](0027-the-app-http-surface-and-hook-queue.md)          | The app's HTTP surface: guarded routes, a neutral hook route and a bounded queue      | Accepted |
