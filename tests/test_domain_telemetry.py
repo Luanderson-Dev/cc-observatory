@@ -81,8 +81,11 @@ UNIT_SUFFIXES: Final = {"": "", "s": "seconds", "tokens": "tokens", "USD": "USD"
 # Modules ccobs.domain may import: none of them does I/O.
 # json is there for json.dumps, which the hook parser uses to size tool inputs and
 # responses (ADR 0023); with open banned below, the domain has no file to dump to or load.
+# ccobs.domain.hooks is a domain module, held to these same rules: the session reducer
+# consumes its events (ADR 0024).
 ALLOWED_IMPORTS: Final = frozenset(
     {"__future__", "collections.abc", "dataclasses", "json", "re", "typing"}
+    | {"ccobs.domain.hooks"}
 )
 # Builtins that read or write outside the process, or run code from strings.
 IO_BUILTINS: Final = frozenset({"open", "print", "input", "__import__", "exec", "eval", "compile"})
