@@ -1,0 +1,3 @@
+# Provisions nothing yet: the bundled dashboards come in a later stage of milestone 1.
+# Grafana reads this directory at every start and logs an error when it is missing.
+apiVersion: 1

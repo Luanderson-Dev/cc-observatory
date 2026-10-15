@@ -3,10 +3,10 @@
 #   docker compose up -d
 #   docker compose --profile traces up -d    # also Tempo, for Claude Code's beta traces
 #
-# Every published port binds to 127.0.0.1 (ADR 0001) and can be moved with the
-# variable named next to it; copying .env.example to .env is optional. Storage
-# services stay on the internal `backend` network; compose.debug.yaml publishes
-# them on loopback for debugging.
+# Grafana is at http://localhost:4330 (CCOBS_GRAFANA_PORT). Every published port binds
+# to 127.0.0.1 (ADR 0001) and can be moved with the variable named next to it; copying
+# .env.example to .env is optional. Storage services stay on the internal `backend`
+# network; compose.debug.yaml publishes them on loopback for debugging.
 
 name: cc-observatory
 
@@ -177,7 +177,121 @@ services:
     networks:
       - backend
 
+  # The UI for metrics, events and traces, with the Prometheus, Loki and Tempo
+  # datasources provisioned from stack/grafana (ADR 0003). It joins edge to publish its
+  # port and backend to query the stores. No depends_on: Grafana queries a datasource
+  # only when a page asks, and shows a store that is down (Tempo without its profile)
+  # as an error on that page.
+  grafana:
+    <<: *service
+    image: grafana/grafana:13.2.4@sha256:dbbc38ea21103cefb50396340cd88afec779c7e070b0a7bf5a75b4ce46651d3f
+    volumes:
+      - ./stack/grafana:/etc/ccobs/grafana:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "127.0.0.1:${CCOBS_GRAFANA_PORT:-4330}:3000"
+    mem_limit: 384m
+    environment:
+      # About 80% of mem_limit, so the Go runtime collects garbage before the limit.
+      GOMEMLIMIT: 307MiB
+      # paths.provisioning: the datasources, from the read-only mount of stack/grafana.
+      GF_PATHS_PROVISIONING: /etc/ccobs/grafana/provisioning
+      # Access (ADR 0017): whoever opens Grafana is an Editor of its one organization.
+      # There is no login form, no basic auth and no admin user, so there is no password
+      # to set, leak or forget. Grafana 13.2 logs at every start that an anonymous role
+      # other than Viewer is deprecated; it still applies it.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Editor
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_AUTH_DISABLE_SIGNOUT_MENU: "true"
+      GF_AUTH_BASIC_ENABLED: "false"
+      GF_SECURITY_DISABLE_INITIAL_ADMIN_CREATION: "true"
+      # Browser defences (ADR 0017). Grafana answers only requests whose Host is
+      # localhost and redirects any other to root_url, so a page that uses DNS rebinding
+      # (which sends the attacker's host name) reads only a redirect; open it at
+      # http://localhost:<port>, not 127.0.0.1. csrf_always_check refuses (403) any
+      # request other than HEAD, OPTIONS and TRACE, GET included, whose Origin names
+      # another host, even from an anonymous visitor, who has no login cookie; a simple
+      # GET (an <img>, say) carries no Origin and passes, which is why the two settings
+      # below are also needed. A few routes answer any Host by Grafana's design
+      # (/api/health, the static files, /bootdata with a 204 that only names the domain);
+      # none of them reads Claude Code data, and /metrics is turned off below.
+      GF_SERVER_DOMAIN: localhost
+      GF_SERVER_ENFORCE_DOMAIN: "true"
+      GF_SERVER_ROOT_URL: http://localhost:${CCOBS_GRAFANA_PORT:-4330}/
+      GF_SECURITY_CSRF_ALWAYS_CHECK: "true"
+      # Closes Grafana's legacy datasource proxy (/api/datasources/proxy/...), which
+      # forwards a request to the datasource's own HTTP API. A simple cross-site GET (no
+      # Origin, so csrf lets it through) to this proxy would otherwise reach a store:
+      # Loki 3.7 serves GET /flush and GET /ingester/shutdown, which stop its ingester.
+      # The allowlist is one host:port no datasource uses, so checkWhiteList() answers
+      # 403 before forwarding any proxy request, of any method. The datasources are
+      # queried through /api/ds/query and /resources, which do not use this proxy
+      # (ADR 0017); the /resources route of Loki and Tempo has a plugin allowlist, and
+      # Prometheus's lifecycle and admin APIs are off (its flags in this file).
+      GF_SECURITY_DATA_SOURCE_PROXY_WHITELIST: 127.0.0.1:9
+      # /metrics is Grafana's own Prometheus metrics; nothing scrapes it, and it is the
+      # widest route outside the Host check, so a DNS-rebinding page could read Grafana's
+      # usage from it. Off, so it answers like any unknown path.
+      GF_METRICS_ENABLED: "false"
+      # No outbound traffic (ADR 0006). Each default below calls out to the internet (the
+      # feedback links send the user there), as Grafana 13.2.4's conf/defaults.ini and
+      # its logs show:
+      #   - analytics.reporting_enabled: usage counters to stats.grafana.org, daily;
+      #   - analytics.check_for_updates: Grafana's latest version, from grafana.com;
+      #   - analytics.check_for_plugin_updates: the plugins' latest versions and the
+      #     Angular detection patterns, from grafana.com;
+      #   - analytics.feedback_links_enabled: links to feedback forms in the UI;
+      #   - news.news_feed_enabled: the news feed, grafana.com/blog/news.xml;
+      #   - security.disable_gravatar: avatars from secure.gravatar.com;
+      #   - snapshots.external_enabled: publishing snapshots to snapshots.raintank.io;
+      #   - plugins.public_key_retrieval_disabled: the plugin signing key, from
+      #     grafana.com every 10 days;
+      #   - plugins.preinstall_disabled and plugins.preinstall_auto_update: installing
+      #     the Drilldown and Advisor apps, and updating the bundled plugins, from
+      #     grafana.com at every start;
+      #   - plugins.plugin_admin_enabled: installing plugins from the catalog;
+      #   - cloud_migration.enabled: migrating to Grafana Cloud (grafana.net);
+      #   - grafana_com.api_url: the base URL for every call to grafana.com's API, both
+      #     what the UI asks for through Grafana's /api/gnet proxy (the plugin catalog,
+      #     dashboard templates and community dashboards) and any server-side call (the
+      #     Angular detection patterns, say); a closed port on Grafana's own loopback, so
+      #     it is also the safety net if a check above is missed or reset upstream.
+      # Off by default and left so: Google Analytics, Rudderstack, PostHog, Application
+      # Insights, Faro and secret scanning. Not covered: the Geomap panel's default map
+      # loads tiles from CARTO in the browser; the bundled dashboards have none.
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES: "false"
+      GF_ANALYTICS_FEEDBACK_LINKS_ENABLED: "false"
+      GF_NEWS_NEWS_FEED_ENABLED: "false"
+      GF_SECURITY_DISABLE_GRAVATAR: "true"
+      GF_SNAPSHOTS_EXTERNAL_ENABLED: "false"
+      GF_PLUGINS_PUBLIC_KEY_RETRIEVAL_DISABLED: "true"
+      GF_PLUGINS_PREINSTALL_DISABLED: "true"
+      GF_PLUGINS_PREINSTALL_AUTO_UPDATE: "false"
+      GF_PLUGINS_PLUGIN_ADMIN_ENABLED: "false"
+      GF_CLOUD_MIGRATION_ENABLED: "false"
+      GF_GRAFANA_COM_API_URL: http://127.0.0.1:9/api
+      # Unused features: public dashboards, which share a dashboard with anyone who has
+      # its link, and Grafana Alerting, since alerts are the app's job (ADR 0007).
+      GF_PUBLIC_DASHBOARDS_ENABLED: "false"
+      GF_UNIFIED_ALERTING_ENABLED: "false"
+    healthcheck:
+      # The image has curl. /api/health answers 200 once the database is reachable,
+      # whatever the Host header, so enforce_domain does not redirect it.
+      test: ["CMD", "/usr/bin/curl", "-fsS", "-o", "/dev/null", "http://127.0.0.1:3000/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+      start_interval: 2s
+    networks:
+      - backend
+      - edge
+
 volumes:
   prometheus-data: {}
   loki-data: {}
   tempo-data: {}
+  grafana-data: {}

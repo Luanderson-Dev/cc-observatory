@@ -287,8 +287,10 @@ def otlp_grpc_address(stack: Stack) -> tuple[str, int]:
 
 @pytest.fixture(scope="session")
 def grafana_url(stack: Stack) -> str:
-    """Base URL of Grafana (from the stage that adds it)."""
-    return stack.url("CCOBS_GRAFANA_PORT")
+    """Grafana's root URL, ``http://localhost:<port>``. Grafana redirects any other host
+    name there (enforce_domain, ADR 0017), so a client that connects to 127.0.0.1 (ADR
+    0018) sends this URL's host and port as its ``Host`` header."""
+    return f"http://localhost:{stack.ports['CCOBS_GRAFANA_PORT']}"
 
 
 @pytest.fixture(scope="session")

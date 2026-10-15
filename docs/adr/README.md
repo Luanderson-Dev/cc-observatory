@@ -45,6 +45,7 @@ the ADR wins.
 | [0014](0014-stored-telemetry-names.md)                       | Stored names of metrics and events, recorded in `ccobs.domain.telemetry`     | Accepted |
 | [0015](0015-loki-through-its-otlp-endpoint.md)               | Loki receives events over OTLP, with session fields as structured metadata   | Accepted |
 | [0016](0016-cardinality-and-retention.md)                    | Session IDs on metrics, not in Loki's index, and per-backend retention       | Accepted |
+| [0017](0017-grafana-access-and-dns-rebinding.md)             | Grafana: anonymous Editors, no login, answering only to `localhost`          | Accepted |
 | [0018](0018-ports-networks-and-exposure.md)                  | Ports and networks: minimal exposure in a dedicated port block               | Accepted |
 | [0019](0019-restart-unless-stopped.md)                       | The stack restarts unless stopped                                            | Accepted |
 | [0020](0020-compose-conventions.md)                          | Compose conventions for a no-extra-steps start on Linux, macOS and Windows   | Accepted |

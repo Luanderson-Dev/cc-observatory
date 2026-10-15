@@ -194,7 +194,9 @@ jobs:
           # Tempo's -config.* switches need an explicit =true; -config.verify also fails on
           # Tempo's configuration warnings.
           check tempo /tempo -config.file=/etc/ccobs/tempo/config.yaml -config.expand-env=true -config.verify=true
-          # Grafana joins in a later stage of milestone 1: one `check` line, here.
+          # Grafana has no offline config check (its CLI only runs the server, plugins
+          # and admin commands); tests/integration/test_stack_grafana.py checks that it
+          # starts and loads the provisioned datasources.
 
       - name: Install the project
         run: uv sync --locked

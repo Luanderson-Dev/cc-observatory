@@ -60,6 +60,10 @@ MIN_STOP_GRACE_SECONDS: Final = 10
 VERSION_TAG: Final = re.compile(r"^v?\d+\.\d+\.\d+(?:-[a-z0-9]+)*$")
 LOKI_REPOSITORY: Final = "grafana/loki"
 TEMPO_REPOSITORY: Final = "grafana/tempo"
+GRAFANA_REPOSITORY: Final = "grafana/grafana"
+# The services that publish ports in compose.yaml: OTLP for Claude Code and Grafana for
+# the browser (ADR 0018); the app joins them in milestone 2.
+PUBLISHING_SERVICES: Final = frozenset({"otel-collector", "grafana"})
 # Optional services, by compose profile: Tempo, because tracing is a beta feature of
 # Claude Code and off by default (ADR 0003).
 OPTIONAL_SERVICES: Final = {"tempo": ["traces"]}
@@ -327,6 +331,18 @@ def test_tempo_runs_only_in_the_traces_profile(name: str) -> None:
     assert _strings(_services(COMPOSE)[name].get("profiles"), "profiles") == ["traces"]
 
 
+@pytest.mark.parametrize("name", SERVICES)
+def test_only_the_collector_and_grafana_publish_ports(name: str) -> None:
+    # By default only OTLP and Grafana listen on the host (ADR 0018); a service that
+    # publishes a port joins edge to do so.
+    service = _services(COMPOSE)[name]
+    if name in PUBLISHING_SERVICES:
+        assert service.get("ports"), f"{name} must publish its port"
+        assert "edge" in _networks(service), f"{name} publishes a port, so it joins edge"
+    else:
+        assert "ports" not in service, f"{name} must not publish ports in compose.yaml"
+
+
 # Rules for both compose files.
 
 
@@ -464,7 +480,7 @@ def test_built_service_uses_a_dockerfile_under_stack(name: str) -> None:
     assert (path / "Dockerfile").is_file()
 
 
-# What exists now (milestone 1, stage 8).
+# What exists now (milestone 1, stage 10).
 
 
 def test_compose_project_is_named_cc_observatory() -> None:
@@ -697,6 +713,68 @@ def test_debug_override_publishes_tempo_on_loopback() -> None:
     override = _services(COMPOSE_DEBUG)["tempo"]
     assert override.get("ports") == ["127.0.0.1:${CCOBS_TEMPO_PORT:-4320}:3200"]
     assert _networks(override) == {"backend", "edge"}
+
+
+def test_compose_defines_grafana_from_the_pinned_image() -> None:
+    assert "grafana" in SERVICES
+    service = _services(COMPOSE)["grafana"]
+    _pinned_tag(service.get("image"), GRAFANA_REPOSITORY, "grafana")
+    assert "build" not in service
+
+
+def test_grafana_publishes_its_port_on_loopback_with_a_configurable_port() -> None:
+    assert _services(COMPOSE)["grafana"].get("ports") == [
+        "127.0.0.1:${CCOBS_GRAFANA_PORT:-4330}:3000"
+    ]
+
+
+def test_grafana_joins_backend_and_edge() -> None:
+    # edge publishes its port; backend reaches Prometheus, Loki and Tempo (ADR 0018).
+    assert _networks(_services(COMPOSE)["grafana"]) == {"backend", "edge"}
+
+
+def test_grafana_reads_its_provisioning_read_only_and_keeps_data_in_a_named_volume() -> None:
+    # /var/lib/grafana is the image's data directory, owned by its user (472), so the
+    # named volume starts with the right owner.
+    service = _services(COMPOSE)["grafana"]
+    assert service.get("volumes") == [
+        "./stack/grafana:/etc/ccobs/grafana:ro",
+        "grafana-data:/var/lib/grafana",
+    ]
+    assert "grafana-data" in _mapping(_load(COMPOSE).get("volumes"), "volumes")
+    assert (STACK / "grafana" / "provisioning" / "datasources" / "datasources.yaml").is_file()
+
+
+def test_grafana_healthcheck_uses_curl_against_api_health() -> None:
+    # The image has curl. /api/health answers 200 once the database is reachable, and,
+    # unlike the other pages, it answers any Host header, so enforce_domain does not
+    # turn it into a redirect (which curl -f would accept).
+    healthcheck = _mapping(_services(COMPOSE)["grafana"]["healthcheck"], "healthcheck")
+    assert healthcheck["test"] == [
+        "CMD",
+        "/usr/bin/curl",
+        "-fsS",
+        "-o",
+        "/dev/null",
+        "http://127.0.0.1:3000/api/health",
+    ]
+
+
+def test_grafana_memory_settings() -> None:
+    service = _services(COMPOSE)["grafana"]
+    assert service.get("mem_limit") == "384m"
+    assert _environment(service).get("GOMEMLIMIT") == "307MiB"
+
+
+def test_grafana_starts_without_waiting_for_the_backends() -> None:
+    # Grafana queries its datasources only when a page asks, so it starts on its own and
+    # reports a store that is down (Tempo without its profile) on the pages that use it.
+    assert "depends_on" not in _services(COMPOSE)["grafana"]
+
+
+def test_debug_override_leaves_grafana_alone() -> None:
+    # Grafana is published by compose.yaml itself.
+    assert "grafana" not in DEBUG_SERVICES
 
 
 @pytest.mark.parametrize("name", SERVICES)
