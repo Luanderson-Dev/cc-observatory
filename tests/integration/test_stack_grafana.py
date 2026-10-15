@@ -8,8 +8,9 @@ does. They check:
 - datasources: Prometheus, Loki and Tempo (the project runs the traces profile) are
   provisioned read-only and healthy, return a session replayed through the collector
   with fresh IDs, and link Loki events and Tempo traces both ways;
-- unused features (public dashboards, Grafana Alerting) are off, and Grafana logs no
-  unexpected error;
+- unused features (public dashboards, Grafana Alerting) are off, the only plugin
+  processes are those of the provisioned datasources, and Grafana logs no unexpected
+  error;
 - access: the anonymous visitor is an Editor who can read, query and save dashboards but
   not administer, and there is no way to log in and no user at all (read from Grafana's
   own database, since /metrics is off);
@@ -127,6 +128,13 @@ PROXY_READ_PATHS: Final = {
 # only that read and the test fails, before a simple cross-site GET to the route could
 # reach Loki's GET /flush or GET /ingester/shutdown (ADR 0017).
 RESOURCE_PATHS_OUTSIDE_ALLOWLIST: Final = {"loki": "config", "tempo": "status/config"}
+# Grafana's own process in its container; every other process is a backend plugin.
+SERVER_COMMAND: Final = "grafana server"
+# A bundled backend plugin as `docker compose top` shows it; the directory is the
+# plugin's ID in Grafana 13.2.4.
+BUNDLED_PLUGIN: Final = re.compile(
+    r"/usr/share/grafana/data/plugins-bundled/(?P<id>[a-z0-9-]+)/gpx_[\w.-]+"
+)
 # Grafana's copy of its SQLite database: without WAL it keeps a rollback journal, which
 # `docker compose cp` does not bring along, so a copy taken mid-commit can be torn.
 DATABASE: Final = "/var/lib/grafana/grafana.db"
@@ -245,6 +253,31 @@ def _columns(frame: JSONObject) -> dict[str, list[JSON]]:
 
 def _strings(value: JSON) -> dict[str, str]:
     return {key: str(item) for key, item in _object(value).items()}
+
+
+def _commands(top: str) -> list[str]:
+    """The command of each process in ``docker compose top`` output: the text under the
+    CMD heading of its table (Compose prints one table, or one per container)."""
+    commands: list[str] = []
+    column: int | None = None
+    for line in top.splitlines():
+        if re.search(r"\bPID\b.*\bCMD$", line.rstrip()):
+            column = line.rstrip().rindex("CMD")
+        elif column is not None and line[column:].strip():
+            commands.append(line[column:].strip())
+    return commands
+
+
+def _plugin_processes(commands: list[str]) -> list[str]:
+    """The plugin ID of each process that is not Grafana's server, sorted; a process that
+    is not a bundled plugin keeps its whole command, so a failure shows it."""
+    found = []
+    for command in commands:
+        if command.startswith(SERVER_COMMAND):
+            continue
+        match = BUNDLED_PLUGIN.fullmatch(command)
+        found.append(match["id"] if match else command)
+    return sorted(found)
 
 
 def _poll[T](read: Callable[[], T], done: Callable[[T], bool], seconds: float) -> T:
@@ -693,12 +726,35 @@ def test_resource_route_forwards_only_its_plugins_allowlist(
     assert response.status == 404, f"{uid}: {response.status} {response.body[:200]!r}"
 
 
+def test_only_the_provisioned_datasources_run_a_plugin_process(
+    compose: Callable[..., subprocess.CompletedProcess[str]],
+) -> None:
+    # Grafana 13.2 runs each bundled backend datasource plugin as a process of its own,
+    # outside GOMEMLIMIT; compose.yaml disables those that no provisioned datasource uses
+    # (plugins.disable_plugins). Every process but the server must be the plugin of a
+    # provisioned datasource, each once, so a Grafana update that bundles a new backend
+    # plugin fails this test until compose.yaml disables it too. Grafana may still be
+    # starting its plugins when it first reports healthy, hence the polling.
+    expected = sorted(set(DATASOURCE_TYPES.values()))
+    top = _poll(
+        lambda: compose("top", GRAFANA).stdout,
+        lambda output: _plugin_processes(_commands(output)) == expected,
+        DEADLINE,
+    )
+    # The raw `docker compose top` output in each message, in case parsing it failed.
+    commands = _commands(top)
+    assert sum(command.startswith(SERVER_COMMAND) for command in commands) == 1, top
+    assert _plugin_processes(commands) == expected, top
+
+
 def test_no_app_plugin_is_installed(grafana: Grafana) -> None:
     # /api/plugins/<id>/resources/* and /api/plugin-proxy/<id>/* answer a simple GET and
     # the proxy whitelist does not cover them; with no app plugin installed they reach
-    # nothing. The control: the same listing does list the bundled datasource plugins
-    # (Grafana 13.2 leaves Prometheus, Loki and Tempo out of it). And the frontend
-    # settings, which hold every enabled app plugin, hold none.
+    # nothing. The control: the same listing does list the core datasource plugins that
+    # run inside Grafana's server (Graphite, CloudWatch, ...), which plugins.disable_plugins
+    # leaves alone; Grafana 13.2 leaves the bundled ones (Prometheus, Loki, Tempo and the
+    # disabled ones) out of it. And the frontend settings, which hold every enabled app
+    # plugin, hold none.
     assert grafana.get_json("/api/plugins?type=app") == []
     assert _objects(grafana.get_json("/api/plugins?type=datasource&enabled=1"))
     assert _object(grafana.get_json("/api/frontend/settings")).get("apps") == {}

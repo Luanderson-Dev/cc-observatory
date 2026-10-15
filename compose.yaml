@@ -190,10 +190,13 @@ services:
       - grafana-data:/var/lib/grafana
     ports:
       - "127.0.0.1:${CCOBS_GRAFANA_PORT:-4330}:3000"
-    mem_limit: 384m
+    # Grafana 13.2 also runs its Prometheus, Loki and Tempo plugins as separate
+    # processes, 20-40 MiB for the three together that GOMEMLIMIT does not cover; opening
+    # the UI took the container's cgroup memory.peak to about 600-630 MiB.
+    mem_limit: 768m
     environment:
       # About 80% of mem_limit, so the Go runtime collects garbage before the limit.
-      GOMEMLIMIT: 307MiB
+      GOMEMLIMIT: 614MiB
       # paths.provisioning: the datasources and the dashboards, from the read-only mount
       # of stack/grafana.
       GF_PATHS_PROVISIONING: /etc/ccobs/grafana/provisioning
@@ -287,6 +290,12 @@ services:
       # its link, and Grafana Alerting, since alerts are the app's job (ADR 0007).
       GF_PUBLIC_DASHBOARDS_ENABLED: "false"
       GF_UNIFIED_ALERTING_ENABLED: "false"
+      # plugins.disable_plugins: Grafana 13.2.4 runs each bundled backend datasource
+      # plugin as a process of its own, which GOMEMLIMIT does not cover. Only the
+      # Prometheus, Loki and Tempo plugins can be used, since the datasources are
+      # provisioned and not editable and the anonymous Editor cannot add one, so the
+      # other ten are off: less memory and ten fewer processes.
+      GF_PLUGINS_DISABLE_PLUGINS: elasticsearch,grafana-postgresql-datasource,grafana-pyroscope-datasource,influxdb,jaeger,mssql,mysql,opentsdb,stackdriver,zipkin
     healthcheck:
       # The image has curl. /api/health answers 200 once the database is reachable,
       # whatever the Host header, so enforce_domain does not redirect it.

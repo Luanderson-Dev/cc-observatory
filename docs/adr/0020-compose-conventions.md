@@ -94,8 +94,16 @@ works on the minimum Docker versions below and is handled by Dependabot.
   limit, as the collector's
   [memory limiter docs](https://github.com/open-telemetry/opentelemetry-collector/blob/main/processor/memorylimiterprocessor/README.md)
   recommend; and the collector's `memory_limiter` processor, first in every pipeline
-  and set as a percentage of the limit. The numbers are measured in a later stage of
-  this milestone.
+  and set as a percentage of the limit. The numbers were measured with
+  [`tools/stack/memory.py`](../../tools/stack/memory.py) and are listed in
+  [docs/stack.md](../stack.md). The target of about 1.5 GB in
+  [ADR 0003](0003-observability-backends.md) is about real use, which stays well under
+  it; the limits are caps that leave each service room for its spikes, so they add up to
+  more: 2048 MiB, or 2560 MiB with Tempo. `GOMEMLIMIT` bounds only the process it is set
+  for, so a service that runs other processes needs room for them above it: Grafana 13.2
+  runs each bundled backend datasource plugin as a separate process, so its limit is
+  768m and the plugins of datasources it does not provision are off
+  ([ADR 0017](0017-grafana-access-and-dns-rebinding.md)).
 - **Shutdown.** An explicit `stop_grace_period` on every service: 30 s, from the shared
   settings, so that each one can stop cleanly after SIGTERM before Docker kills it.
   Without it, the daemon's `default-stop-timeout` applies, which differs between
@@ -109,8 +117,8 @@ works on the minimum Docker versions below and is handled by Dependabot.
   `name:exact-tag@sha256:<multi-arch index digest>`. The tag says what runs and the
   digest makes it immutable, because a tag can be re-published upstream, as the
   collector's `0.162.0` tag was during this milestone; the index digest stays valid on
-  amd64 and arm64. Dependabot (set up in a later stage of this milestone) updates tag
-  and digest together, with the 7-day cooldown of
+  amd64 and arm64. Dependabot (`.github/dependabot.yml`, with its `docker-compose` and
+  `docker` ecosystems) updates tag and digest together, with the 7-day cooldown of
   [ADR 0009](0009-engineering-workflow-and-quality.md). Dependabot has no security
   updates for Docker images
   ([supported ecosystems](https://docs.github.com/en/code-security/dependabot/ecosystems-supported-by-dependabot/supported-ecosystems-and-repositories)),
@@ -138,9 +146,9 @@ works on the minimum Docker versions below and is handled by Dependabot.
 - **Restrictive umask on Linux.** A clone made with a umask such as `027` or `077`
   (common on CIS-hardened distributions) leaves `stack/` unreadable for the containers'
   non-root users: the collector runs as uid 10001, exits with "permission denied" and
-  keeps restarting. The fix is `chmod -R o+rX stack/`. It is documented with the stack
-  later in this milestone, and `ccobs doctor` checks it in milestone 4. Docker Desktop
-  on macOS and Windows is not affected.
+  keeps restarting. The fix is `chmod -R o+rX stack/`. It is documented in
+  [docs/stack.md](../stack.md), and `ccobs doctor` checks it in milestone 4. Docker
+  Desktop on macOS and Windows is not affected.
 - **Minimum Docker versions**, which the README repeats:
     - Docker Engine 25.0 or later (API 1.44), for `healthcheck.start_interval`, which
       "requires Docker Engine version 25.0 or later"
@@ -214,8 +222,6 @@ works on the minimum Docker versions below and is handled by Dependabot.
 - If the project ever publishes this image, for example with the GHCR images of
   milestone 7, it distributes busybox and takes on GPL-2.0's source obligations:
   revisit then.
-- The memory numbers and the Dependabot configuration for `docker-compose` and `docker`
-  (the collector's Dockerfile) come in later stages of this milestone.
 - Revisit the derived image if the upstream collector image gains a way to run a
   healthcheck, or if image mounts become widely supported by Docker, Compose and
   Dependabot.

@@ -127,7 +127,24 @@ FEATURES: Final = (
     Setting("public_dashboards", "enabled", "false"),
     Setting("unified_alerting", "enabled", "false"),
 )
-SETTINGS: Final = (*PATHS, *ACCESS, *BROWSER, *OUTBOUND, *FEATURES)
+# The backend datasource plugins bundled with Grafana 13.2.4 that no provisioned
+# datasource uses. Grafana runs each bundled backend plugin as its own process, outside
+# GOMEMLIMIT, so they are turned off; only the Prometheus, Loki and Tempo plugins run
+# (tests/integration/test_stack_grafana.py checks the processes).
+UNUSED_PLUGINS: Final = (
+    "elasticsearch",
+    "grafana-postgresql-datasource",
+    "grafana-pyroscope-datasource",
+    "influxdb",
+    "jaeger",
+    "mssql",
+    "mysql",
+    "opentsdb",
+    "stackdriver",
+    "zipkin",
+)
+PLUGINS: Final = (Setting("plugins", "disable_plugins", ",".join(UNUSED_PLUGINS)),)
+SETTINGS: Final = (*PATHS, *ACCESS, *BROWSER, *OUTBOUND, *FEATURES, *PLUGINS)
 # Environment variables of the Grafana service that are not Grafana settings.
 OTHER_VARIABLES: Final = frozenset({"GOMEMLIMIT"})
 
@@ -227,6 +244,20 @@ def test_every_outbound_setting_is_explained_in_compose() -> None:
     comments = _comments(_service_block())
     missing = [setting.name for setting in OUTBOUND if setting.name not in comments]
     assert not missing, f"the comments above Grafana's settings do not explain {missing}"
+
+
+def test_only_unused_datasource_plugins_are_disabled() -> None:
+    # Disabling the plugin of a provisioned datasource would break its panels and queries.
+    disabled = _environment()["GF_PLUGINS_DISABLE_PLUGINS"].split(",")
+    assert disabled == sorted(set(disabled)), "keep the list sorted, without repeats"
+    assert all(re.fullmatch(r"[a-z0-9-]+", plugin) for plugin in disabled), disabled
+    assert not set(disabled) & set(DATASOURCE_TYPES.values())
+
+
+def test_disabled_plugins_are_explained_in_compose() -> None:
+    comments = _comments(_service_block())
+    for setting in PLUGINS:
+        assert setting.name in comments, f"the comments above Grafana do not explain {setting.name}"
 
 
 def test_root_url_names_localhost_and_the_published_port() -> None:

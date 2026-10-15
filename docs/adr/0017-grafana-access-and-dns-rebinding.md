@@ -163,7 +163,15 @@ explains each one; `tests/test_grafana_config.py` lists them.
 - **Unused features off.** `unified_alerting.enabled = false`, since alerts are the
   app's job ([ADR 0007](0007-alerts-browser-and-discord.md)), and
   `public_dashboards.enabled = false`, which would share a dashboard with anyone who has
-  its link.
+  its link. `plugins.disable_plugins` keeps Grafana from loading the backend datasource
+  plugins bundled with Grafana 13.2.4 that no provisioned datasource uses
+  (Elasticsearch, Google Cloud Monitoring, Grafana Pyroscope, InfluxDB, Jaeger,
+  Microsoft SQL Server, MySQL, OpenTSDB, PostgreSQL and Zipkin). With the datasources
+  provisioned read-only and no admin, none of them can be used, and Grafana runs each
+  one as a process of its own, outside `GOMEMLIMIT`
+  ([ADR 0020](0020-compose-conventions.md)), so only the Prometheus, Loki and Tempo
+  plugins run. The core datasources that run inside Grafana's server process
+  (CloudWatch, Azure Monitor, Graphite, TestData and others) are left alone.
 - **Provisioning.** The Prometheus, Loki and Tempo datasources are provisioned from
   `stack/grafana/provisioning` with fixed UIDs (`prometheus`, `loki`, `tempo`) and
   `editable: false`, so with no admin they change only in the repository. Tempo is
@@ -207,15 +215,20 @@ explains each one; `tests/test_grafana_config.py` lists them.
 - Neutral, because Grafana logs some of the requests its access control denies (those on
   organizations and dashboards) at error level, so those lines in its logs are not
   faults.
+- Neutral, because a Grafana update that bundles another backend datasource plugin has
+  to add it to `GF_PLUGINS_DISABLE_PLUGINS`; the integration test
+  `test_only_the_provisioned_datasources_run_a_plugin_process` fails on the Dependabot
+  pull request that brings such a release until it does.
 
 ### Confirmation
 
-- `tests/test_grafana_config.py` checks every access, browser, outbound and feature
-  setting with its value, that Grafana has no other setting, that the comments in
-  `compose.yaml` explain each outbound one, that `root_url` uses the published port, and
-  that there are no admin credentials; that the proxy whitelist is a non-empty list of
-  host:port entries that match no datasource's host:port; and, for the datasources, the
-  UIDs, types, `editable: false`, proxy access, URLs on the backend network, no
+- `tests/test_grafana_config.py` checks every access, browser, outbound, feature and
+  plugin setting with its value, that Grafana has no other setting, that the comments in
+  `compose.yaml` explain each outbound one and the disabled plugins, that only plugins
+  no provisioned datasource uses are disabled, that `root_url` uses the published port,
+  and that there are no admin credentials; that the proxy whitelist is a non-empty list
+  of host:port entries that match no datasource's host:port; and, for the datasources,
+  the UIDs, types, `editable: false`, proxy access, URLs on the backend network, no
   credentials, no external URLs, and links between Loki and Tempo that match their
   configs.
 - `tests/test_compose.py` checks the pinned image, the port on loopback, the `edge` and
@@ -230,9 +243,11 @@ explains each one; `tests/test_grafana_config.py` lists them.
   harmless read path, so no store is reached, and Loki stays healthy) and `/metrics` is
   not served; the resource routes of Loki and Tempo answer 404 to a read their store
   serves but their plugin's allowlist leaves out (`/config`, `/status/config`), which
-  fails on the Grafana update that drops an allowlist; no app plugin is enabled; public
-  dashboards and Grafana Alerting are off; and each datasource is healthy and returns a
-  session replayed through the collector.
+  fails on the Grafana update that drops an allowlist; no app plugin is enabled; the
+  only plugin processes are those of the provisioned datasources, which fails on a
+  Grafana update that bundles another backend plugin; public dashboards and Grafana
+  Alerting are off; and each datasource is healthy and returns a session replayed
+  through the collector.
 - `tests/integration/test_stack_no_outbound.py`, against the running stack: Grafana
   applied every setting `compose.yaml` gives it, the outbound settings are off, the
   background jobs that call grafana.com never ran, avatars are not fetched and the

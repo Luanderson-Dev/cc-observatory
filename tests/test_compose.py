@@ -761,9 +761,12 @@ def test_grafana_healthcheck_uses_curl_against_api_health() -> None:
 
 
 def test_grafana_memory_settings() -> None:
+    # Measured in milestone 1: opening the UI takes the cgroup memory.peak to about
+    # 600-630 MiB, the Prometheus, Loki and Tempo plugins (20-40 MiB for the three, outside
+    # GOMEMLIMIT) included; at 384m, with all 13 bundled plugins, the limit was reached.
     service = _services(COMPOSE)["grafana"]
-    assert service.get("mem_limit") == "384m"
-    assert _environment(service).get("GOMEMLIMIT") == "307MiB"
+    assert service.get("mem_limit") == "768m"
+    assert _environment(service).get("GOMEMLIMIT") == "614MiB"
 
 
 def test_grafana_starts_without_waiting_for_the_backends() -> None:
