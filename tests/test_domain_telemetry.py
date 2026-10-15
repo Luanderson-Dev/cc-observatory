@@ -84,8 +84,8 @@ UNIT_SUFFIXES: Final = {"": "", "s": "seconds", "tokens": "tokens", "USD": "USD"
 # ccobs.domain.hooks is a domain module, held to these same rules: the session reducer
 # consumes its events (ADR 0024).
 ALLOWED_IMPORTS: Final = frozenset(
-    {"__future__", "collections.abc", "dataclasses", "json", "re", "typing"}
-    | {"ccobs.domain.hooks"}
+    {"__future__", "collections.abc", "dataclasses", "datetime", "json", "re", "typing"}
+    | {"ccobs.domain.durations", "ccobs.domain.hooks"}
 )
 # Builtins that read or write outside the process, or run code from strings.
 IO_BUILTINS: Final = frozenset({"open", "print", "input", "__import__", "exec", "eval", "compile"})

@@ -17,7 +17,7 @@ from typing import Final
 import pytest
 import yaml
 
-from ccobs.domain.telemetry import DEFAULT_HOST
+from ccobs.domain.telemetry import DEFAULT_HOST, HOST_VALUE_PATTERN
 
 ROOT: Final = Path(__file__).resolve().parents[1]
 COMPOSE: Final = ROOT / "compose.yaml"
@@ -81,7 +81,7 @@ CONTRIB_MENTION: Final = re.compile(r"\bcontrib (?P<version>v?\d+(?:\.\d+)+)")
 # The stack's host label (ADR 0022): the variable the collector reads, and the characters
 # .env.example allows in its value.
 HOST_VARIABLE: Final = "CCOBS_HOST_LABEL"
-HOST_VALUE: Final = re.compile(r"[A-Za-z0-9._-]+")
+HOST_VALUE: Final = HOST_VALUE_PATTERN
 _UNITS: Final = {"b": 1, "k": 1024, "m": 1024**2, "g": 1024**3}
 _GO_UNITS: Final = {"B": 1, "KiB": 1024, "MiB": 1024**2, "GiB": 1024**3}
 
