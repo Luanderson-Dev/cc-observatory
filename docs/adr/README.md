@@ -53,3 +53,4 @@ the ADR wins.
 | [0022](0022-the-host-label.md)                               | The host label: one configured value, set by the collector on every signal            | Accepted |
 | [0023](0023-per-event-allowlist-of-hook-metadata.md)         | The app keeps a per-event allowlist of hook metadata                                  | Accepted |
 | [0024](0024-session-agent-and-block-state-machine.md)        | A hook-driven reducer derives session, agent and block state                          | Accepted |
+| [0025](0025-registered-hook-events.md)                       | Register only the hook events the state machine needs                                 | Accepted |

@@ -16,8 +16,9 @@ from typing import Any, Final
 
 import pytest
 
-from ccobs.domain.hooks import HookEvent, parse_hook
+from ccobs.domain.hooks import _PARSERS, HookEvent, UnknownHookEvent, parse_hook
 from ccobs.domain.sessions import (
+    HANDLED_EVENTS,
     Agent,
     AgentChanged,
     Block,
@@ -866,6 +867,63 @@ def test_unknown_events_only_update_the_session_metadata() -> None:
     state = run("TaskCreated", 300)
     assert state.session.permission_mode == "acceptEdits"
     assert state.session.cwd == "/w"
+
+
+# For each handled event: extra events after the common prior (a turn with a pending Bash
+# call and its permission block), and the fields of the event under test. Each case is
+# chosen so that the event has an effect of its own.
+HANDLED_CASES: Final[dict[str, tuple[list[tuple[str, dict[str, Any]]], dict[str, Any]]]] = {
+    "UserPromptSubmit": ([], {"prompt": "next"}),
+    "Stop": ([], {}),
+    "StopFailure": ([], {"error": "rate_limit"}),
+    "PreCompact": ([], {"trigger": "auto"}),
+    "PostCompact": ([("PreCompact", {"trigger": "auto"})], {"trigger": "auto"}),
+    "PostToolBatch": ([], {}),
+    "PreToolUse": ([], {"tool_name": "Read", "tool_use_id": "t2"}),
+    "PermissionRequest": ([], {"tool_name": "Read"}),
+    "PostToolUse": ([], {"tool_name": "Bash", "tool_use_id": "t1"}),
+    "PostToolUseFailure": ([], {"tool_name": "Bash", "tool_use_id": "t1"}),
+    "PermissionDenied": ([], {"tool_name": "Bash", "tool_use_id": "t1"}),
+    "Notification": ([], {"notification_type": "permission_prompt"}),
+    "Elicitation": ([], {"mcp_server_name": "srv", "elicitation_id": "e1"}),
+    "ElicitationResult": (
+        [("Elicitation", {"mcp_server_name": "srv", "elicitation_id": "e1"})],
+        {"mcp_server_name": "srv", "elicitation_id": "e1", "action": "accept"},
+    ),
+    # An unknown event of the scope also creates the agent; only SubagentStart links it to
+    # its Agent tool call.
+    "SubagentStart": (
+        [("PreToolUse", {"tool_name": "Agent", "tool_use_id": "t3"})],
+        {"agent_id": "a1", "agent_type": "Explore"},
+    ),
+    "SubagentStop": ([], {"agent_id": "a1", "agent_type": "Explore"}),
+    "SessionStart": ([], {"source": "startup", "model": "claude-opus-5"}),
+    "SessionEnd": ([], {"reason": "other"}),
+}
+
+
+def test_every_handled_event_has_a_case() -> None:
+    assert set(HANDLED_CASES) == HANDLED_EVENTS
+    assert set(_PARSERS) >= HANDLED_EVENTS
+
+
+@pytest.mark.parametrize("name", sorted(HANDLED_CASES))
+def test_every_handled_event_changes_more_than_an_unknown_event(name: str) -> None:
+    extra, fields = HANDLED_CASES[name]
+    run = Run()
+    run("UserPromptSubmit", 100, prompt="hi")
+    bash_permission(run, 110)
+    for at, (prior, prior_fields) in enumerate(extra, start=200):
+        run(prior, at, **prior_fields)
+    seq = run.seq + 1
+
+    handled, _ = apply(run.now, event(name, **fields), 500, seq)
+    # The same common fields (agent_id included) under a name the reducer does not know.
+    unknown_event = event("NotAHookEvent", **fields)
+    assert isinstance(unknown_event, UnknownHookEvent)
+    unknown, _ = apply(run.now, unknown_event, 500, seq)
+
+    assert handled != unknown
 
 
 # Order and time.

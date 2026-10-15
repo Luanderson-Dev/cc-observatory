@@ -44,6 +44,7 @@ from ccobs.domain.hooks import (
 )
 
 __all__ = [
+    "HANDLED_EVENTS",
     "Agent",
     "AgentChanged",
     "AgentStatus",
@@ -586,6 +587,34 @@ def _touch_agent(work: _Work, event: HookEvent) -> None:
     else:
         agent = replace(known, last_event_at_ms=max(known.last_event_at_ms, work.at))
     work.put_agent(agent)
+
+
+# The events with rules of their own: a case arm in _handle (SessionStart and SessionEnd
+# also get special treatment in apply). Keep it in sync with _handle; any other event only
+# updates the session's metadata. tests/test_domain_sessions.py checks that each one
+# changes more than an unknown event does.
+HANDLED_EVENTS: Final[frozenset[str]] = frozenset(
+    {
+        "UserPromptSubmit",
+        "Stop",
+        "StopFailure",
+        "PreCompact",
+        "PostCompact",
+        "PostToolBatch",
+        "PreToolUse",
+        "PermissionRequest",
+        "PostToolUse",
+        "PostToolUseFailure",
+        "PermissionDenied",
+        "Notification",
+        "Elicitation",
+        "ElicitationResult",
+        "SubagentStart",
+        "SubagentStop",
+        "SessionStart",
+        "SessionEnd",
+    }
+)
 
 
 def _handle(work: _Work, event: HookEvent) -> None:
