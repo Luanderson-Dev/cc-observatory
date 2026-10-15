@@ -322,9 +322,9 @@ def test_logql_filters_on_structured_metadata(
     assert _query(loki_url, _session_query(UNKNOWN_SESSION), replay) == []
 
 
-def test_loki_runs_without_usage_reports_and_with_retention(loki_url: str) -> None:
+def test_loki_runs_with_retention(loki_url: str) -> None:
+    # That it sends no usage reports is checked in test_stack_no_outbound.py.
     config = _mapping(yaml.safe_load(_get(loki_url, "/config", {})), "/config")
-    assert _mapping(config.get("analytics"), "analytics").get("reporting_enabled") is False
     limits = _mapping(config.get("limits_config"), "limits_config")
     # 720h from .env.example, through -config.expand-env; Loki prints it in days.
     assert limits.get("retention_period") == "30d"

@@ -42,8 +42,9 @@ OUT_OF_ORDER_WINDOW: Final = "30m"
 DEFAULT_TRANSLATION: Final = "UnderscoreEscapingWithSuffixes"
 # The only resource attribute promoted to a label: the stack's host label (ADR 0022).
 PROMOTED: Final = ["host"]
-# Sections that would send data out of Prometheus or read it from elsewhere.
-OUTBOUND_SECTIONS: Final = ("remote_write", "remote_read", "alerting")
+# Sections that would send data out of Prometheus (its own traces, over OTLP, included)
+# or read it from elsewhere.
+OUTBOUND_SECTIONS: Final = ("remote_write", "remote_read", "alerting", "tracing")
 # Keys a scrape job may use: static targets over plain HTTP, no service discovery.
 SCRAPE_KEYS: Final = frozenset(
     {"job_name", "static_configs", "scrape_interval", "scrape_timeout", "metrics_path"}
@@ -217,7 +218,7 @@ def test_otlp_translation_keeps_its_defaults_and_promotes_only_host() -> None:
 # Nothing leaves Prometheus (ADR 0006, ADR 0018).
 
 
-def test_no_remote_storage_and_no_alerting() -> None:
+def test_no_remote_storage_alerting_or_tracing() -> None:
     config = _config()
     for section in OUTBOUND_SECTIONS:
         assert section not in config, f"{section} would send data out of Prometheus"

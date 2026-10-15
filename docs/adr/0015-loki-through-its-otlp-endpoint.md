@@ -157,8 +157,10 @@ machine's volume does not need.
   `event_sequence`, `event_timestamp`, `prompt_id`, `trace_id` and `span_id` come back
   as structured metadata, with the trace and span IDs that were sent and no identity or
   content keys; that LogQL filters on them; that events sent while Loki is stopped are
-  stored once it is back, from the collector's queue; that Loki's `/config` has
-  reporting off and 30 days of retention; and that Loki logs no errors.
+  stored once it is back, from the collector's queue; that Loki's `/config` has 30 days
+  of retention; and that Loki logs no errors.
+- `tests/integration/test_stack_no_outbound.py` reads usage reporting off from Loki's
+  `/config` and from Tempo's `/status/config`.
 - `loki -config.expand-env=true -verify-config` and the collector's `validate` run on
   the bundled files in the CI `stack` job (a later stage of this milestone). Until
   then, `docker compose up --wait` in the integration tests already fails when either

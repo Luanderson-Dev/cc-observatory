@@ -128,6 +128,12 @@ keeping every port configurable.
   `compose.debug.yaml`.
 - The integration tests (`tests/integration/`) start the `ccobs-it` project with both
   files on the 24xxx ports.
+  `tests/integration/test_stack_no_outbound.py::test_backend_network_is_internal_and_holds_the_stores`
+  reads from Docker that the running project's `backend` network is internal and holds
+  Prometheus, Loki and Tempo, and that `edge` is not internal.
+- A manual check, described in `tools/stack/compose.egress-sink.yaml`, runs the stack
+  with every host name its components call by default resolving to a sink container
+  that logs each connection; the sink sees none.
 - The `reviewer` subagent checks every diff for ports not bound to `127.0.0.1` and for
   storage services attached to `edge` outside the override.
 

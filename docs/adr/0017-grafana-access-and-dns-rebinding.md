@@ -148,13 +148,17 @@ explains each one; `tests/test_grafana_config.py` lists them.
   detection patterns), feedback links, the news feed, Gravatar, external snapshots, the
   plugin signing key download, the plugin preinstall at every start and its updates,
   plugin installs from the catalog, and Cloud migration are off.
-  `grafana_com.api_url = http://127.0.0.1:9/api` is the base URL of every grafana.com
-  call, both what the UI asks for through Grafana's `/api/gnet` proxy (the plugin
-  catalog, dashboard templates, community dashboards) and any server-side call (the
-  Angular patterns, which read `GrafanaComAPIURL` in `dynamic.go`), so a closed port on
-  Grafana's own loopback is also the safety net if a check above is missed or reset
-  upstream; those pages show errors instead. Not covered: the Geomap panel's default map
-  loads tiles from CARTO in the browser, and no bundled dashboard has one.
+  `grafana_com.api_url = http://127.0.0.1:9/api` is the base URL of the grafana.com API
+  calls, both what the UI asks for through Grafana's `/api/gnet` proxy (the plugin
+  catalog, dashboard templates, community dashboards) and the server's plugin calls
+  (plugin update checks, the signing key, the preinstall and the Angular patterns, which
+  read `GrafanaComAPIURL` in `dynamic.go`), so a closed port on Grafana's own loopback
+  is also their safety net if a check above is missed or reset upstream; those pages
+  show errors instead. Grafana's own update check is not covered: it calls a fixed URL
+  (`https://grafana.com/api/grafana/versions/stable`, in `updatemanager/grafana.go`), so
+  only `analytics.check_for_updates = false` keeps it off. Not covered: the Geomap
+  panel's default map loads tiles from CARTO in the browser, and no bundled dashboard
+  has one.
   [SECURITY.md](../../SECURITY.md) states the rule.
 - **Unused features off.** `unified_alerting.enabled = false`, since alerts are the
   app's job ([ADR 0007](0007-alerts-browser-and-discord.md)), and
@@ -226,10 +230,13 @@ explains each one; `tests/test_grafana_config.py` lists them.
   harmless read path, so no store is reached, and Loki stays healthy) and `/metrics` is
   not served; the resource routes of Loki and Tempo answer 404 to a read their store
   serves but their plugin's allowlist leaves out (`/config`, `/status/config`), which
-  fails on the Grafana update that drops an allowlist; no app plugin is enabled; the
-  outbound settings are off, the background jobs that call grafana.com never ran,
-  avatars are not fetched and the grafana.com proxy goes nowhere; and each datasource is
-  healthy and returns a session replayed through the collector.
+  fails on the Grafana update that drops an allowlist; no app plugin is enabled; public
+  dashboards and Grafana Alerting are off; and each datasource is healthy and returns a
+  session replayed through the collector.
+- `tests/integration/test_stack_no_outbound.py`, against the running stack: Grafana
+  applied every setting `compose.yaml` gives it, the outbound settings are off, the
+  background jobs that call grafana.com never ran, avatars are not fetched and the
+  grafana.com proxy goes nowhere.
 - Prometheus's lifecycle and admin APIs stay off:
   `tests/test_prometheus_config.py::test_no_flag_opens_admin_lifecycle_or_remote_write_endpoints`
   checks its flags in `compose.yaml`, and

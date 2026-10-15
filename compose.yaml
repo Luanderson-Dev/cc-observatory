@@ -260,11 +260,13 @@ services:
       #     grafana.com at every start;
       #   - plugins.plugin_admin_enabled: installing plugins from the catalog;
       #   - cloud_migration.enabled: migrating to Grafana Cloud (grafana.net);
-      #   - grafana_com.api_url: the base URL for every call to grafana.com's API, both
-      #     what the UI asks for through Grafana's /api/gnet proxy (the plugin catalog,
-      #     dashboard templates and community dashboards) and any server-side call (the
-      #     Angular detection patterns, say); a closed port on Grafana's own loopback, so
-      #     it is also the safety net if a check above is missed or reset upstream.
+      #   - grafana_com.api_url: the base URL for calls to grafana.com's API, both what
+      #     the UI asks for through Grafana's /api/gnet proxy (the plugin catalog,
+      #     dashboard templates and community dashboards) and the server's plugin calls
+      #     (update checks, signing key, preinstall, Angular detection patterns); a
+      #     closed port on Grafana's own loopback, so it is also their safety net if a
+      #     check above is missed or reset upstream. Grafana's own update check has a
+      #     fixed URL, so only analytics.check_for_updates keeps it off.
       # Off by default and left so: Google Analytics, Rudderstack, PostHog, Application
       # Insights, Faro and secret scanning. Not covered: the Geomap panel's default map
       # loads tiles from CARTO in the browser; the bundled dashboards have none.

@@ -1,4 +1,4 @@
-"""Grafana in the isolated ``ccobs-it`` compose project (ADR 0003, ADR 0006, ADR 0017).
+"""Grafana in the isolated ``ccobs-it`` compose project (ADR 0003, ADR 0017).
 
 Needs Docker: ``uv run pytest -m integration --no-cov``. Grafana answers only to the host
 name of its root URL, ``localhost`` (enforce_domain), so the tests connect to 127.0.0.1
@@ -8,14 +8,17 @@ does. They check:
 - datasources: Prometheus, Loki and Tempo (the project runs the traces profile) are
   provisioned read-only and healthy, return a session replayed through the collector
   with fresh IDs, and link Loki events and Tempo traces both ways;
-- no outbound traffic (ADR 0006): the settings that would reach grafana.com,
-  gravatar.com and the like are off, and the background jobs that would never ran;
+- unused features (public dashboards, Grafana Alerting) are off, and Grafana logs no
+  unexpected error;
 - access: the anonymous visitor is an Editor who can read, query and save dashboards but
   not administer, and there is no way to log in and no user at all (read from Grafana's
   own database, since /metrics is off);
 - browser defences: any other host name (DNS rebinding) gets a redirect to localhost, a
   request from another origin is refused even as a GET, the legacy datasource proxy that
   a simple cross-site GET could reach is closed, and /metrics is not served.
+
+That Grafana, like every other service, reports no usage and checks for no updates (ADR
+0006) is checked in test_stack_no_outbound.py.
 
 Every request the tests make to the legacy datasource proxy is a harmless read path, so
 the proxy's refusal is proven by its status, never by reaching a store.
@@ -52,8 +55,6 @@ DATASOURCE_TYPES: Final = {"prometheus": "prometheus", "loki": "loki", "tempo": 
 # Seconds to wait until the replayed session can be queried, and between two polls.
 DEADLINE: Final = 90.0
 POLL_INTERVAL: Final = 0.5
-# Seconds to wait for a line in Grafana's logs.
-LOG_DEADLINE: Final = 15.0
 HTTP_TIMEOUT: Final = 20.0
 # Queries cover the last hour; the replayed session ends now.
 WINDOW_MS: Final = 3_600_000
@@ -113,14 +114,6 @@ CROSS_SITE: Final = (
     ("application/json", "http://evil.example"),
     ("text/plain", "null"),
 )
-# Background jobs that call grafana.com log these lines when they run, even when the call
-# succeeds (Grafana 13.2.4).
-OUTBOUND_JOB_LINES: Final = (
-    "Installing plugin",
-    "Patterns update finished",
-    "grafana.update.checker",
-    "plugins.update.checker",
-)
 # A harmless read path on each store, used to prove the legacy datasource proxy refuses
 # the request (the whitelist answers 403 before forwarding, so no store is reached).
 PROXY_READ_PATHS: Final = {
@@ -138,10 +131,12 @@ RESOURCE_PATHS_OUTSIDE_ALLOWLIST: Final = {"loki": "config", "tempo": "status/co
 # `docker compose cp` does not bring along, so a copy taken mid-commit can be torn.
 DATABASE: Final = "/var/lib/grafana/grafana.db"
 COPY_ATTEMPTS: Final = 3
-# Error-level log lines the tests here cause on purpose, each tied to a request they
-# make: the access-control denials of the org operations in ADMIN_REQUESTS
-# (anonymous.invalid-org), the resolution of the test dashboards' UIDs, and the
-# grafana.com proxy that dials a closed port. Every other error line is a real fault.
+# Error-level log lines that the integration tests cause on purpose, each tied to a
+# request they make: the access-control denials of the org operations in ADMIN_REQUESTS
+# (anonymous.invalid-org), the resolution of the test dashboards' UIDs (here and in
+# test_stack_dashboard.py), and the request to the grafana.com proxy in
+# test_stack_no_outbound.py, which dials a closed port (it may run first). Every other
+# error line is a real fault.
 DASHBOARD_UID_PREFIX: Final = "ccobs-it-"
 GRAFANA_COM_CLOSED_PORT: Final = "127.0.0.1:9"
 EXPECTED_ERRORS: Final = (
@@ -150,8 +145,6 @@ EXPECTED_ERRORS: Final = (
     f'msg="Proxy request failed" err="dial tcp {GRAFANA_COM_CLOSED_PORT}',
     "path=/api/gnet/",
 )
-# What Grafana logs when asked for an avatar while Gravatar is off.
-NO_GRAVATAR: Final = "called despite gravatars being disabled"
 # Grafana's console log: logger=... t=... level=... msg=...
 ERROR_LINE: Final = re.compile(r"\blevel=error\b")
 # The Loki query Grafana 13.2.4's trace view runs for "logs for this span" with
@@ -521,62 +514,24 @@ def test_tempo_spans_link_to_their_events_in_loki(grafana: Grafana, run: Prepare
         assert {entry.get("session_id") for entry in entries} == {run.session_id}
 
 
-# No outbound traffic (ADR 0006).
+# Unused features and logs.
 
 
-def test_settings_that_reach_the_internet_are_off(grafana: Grafana) -> None:
+def test_unused_features_are_off(grafana: Grafana) -> None:
+    # Public dashboards would share a dashboard with anyone who has its link; alerts are
+    # the app's job (ADR 0007).
     settings = _frontend_settings(grafana)
-    for key in (
-        "feedbackLinksEnabled",
-        "newsFeedEnabled",
-        "pluginAdminEnabled",
-        "pluginCatalogPreinstalledAutoUpdate",
-        "cloudMigrationEnabled",
-        "publicDashboardsEnabled",
-        "unifiedAlertingEnabled",
-    ):
-        assert settings.get(key) is False, key
-    # No update check ran, so Grafana knows of no newer version.
-    build = _object(settings.get("buildInfo"))
-    assert build.get("latestVersion") == ""
-    assert build.get("hasUpdate") is False
-    # The browser-side trackers are off by default.
-    for key in ("googleAnalyticsId", "googleAnalytics4Id", "rudderstackWriteKey"):
-        assert not settings.get(key), key
-
-
-def test_avatars_are_not_fetched_from_gravatar(
-    grafana: Grafana, service_logs: Callable[[str], str]
-) -> None:
-    # The visitor's avatar is Grafana's own image, and an avatar request is answered
-    # with it instead of a fetch from gravatar.com.
-    user = _object(_object(grafana.get_json("/bootdata")).get("user"))
-    assert str(user.get("gravatarUrl")).startswith("/public/")
-    response = grafana.request("GET", f"/avatar/{uuid.uuid4().hex}")
-    assert response.status == 200
-    assert response.headers.get("content-type") == "image/jpeg"
-    logs = _poll(lambda: service_logs(GRAFANA), lambda text: NO_GRAVATAR in text, LOG_DEADLINE)
-    assert NO_GRAVATAR in logs
-
-
-def test_background_jobs_that_call_grafana_com_never_ran(
-    service_logs: Callable[[str], str], service_started: Callable[[str], bool]
-) -> None:
-    if not service_started(GRAFANA):
-        pytest.skip("Grafana was reused from an earlier session (CCOBS_IT_KEEP=1)")
-    logs = service_logs(GRAFANA)
-    assert "HTTP Server Listen" in logs, "Grafana's start-up lines are missing"
-    found = [line for line in OUTBOUND_JOB_LINES if line in logs]
-    assert not found, found
+    assert settings.get("publicDashboardsEnabled") is False
+    assert settings.get("unifiedAlertingEnabled") is False
 
 
 def test_grafana_logs_no_errors(
     service_logs: Callable[[str], str], loki_entries: list[dict[str, str]]
 ) -> None:
     # Independent of test order: Grafana logs at error level every access-control denial
-    # and every grafana.com proxy failure, so the tests here that make such requests on
-    # purpose leave expected error lines, each tied to one of their paths or targets
-    # (EXPECTED_ERRORS). Every other error line is a real fault.
+    # and every grafana.com proxy failure, so the integration tests that make such
+    # requests on purpose leave expected error lines, each tied to one of their paths or
+    # targets (EXPECTED_ERRORS). Every other error line is a real fault.
     assert loki_entries
     logs = service_logs(GRAFANA)
     assert logs.strip(), "Grafana logged nothing at all"
@@ -782,12 +737,3 @@ def test_same_origin_writes_are_accepted(grafana: Grafana) -> None:
     finally:
         origin = {"Origin": f"http://{grafana.host}"}
         grafana.request("DELETE", f"/api/dashboards/uid/{uid}", headers=origin)
-
-
-def test_grafana_com_requests_stay_on_the_machine(grafana: Grafana) -> None:
-    # The plugin catalog, dashboard templates and community dashboards reach grafana.com
-    # through /api/gnet; its API URL is a closed port on Grafana's own loopback.
-    started = time.monotonic()
-    response = grafana.request("GET", "/api/gnet/plugins")
-    assert response.status == 502
-    assert time.monotonic() - started < 5

@@ -110,6 +110,26 @@ class Stack:
             pytest.fail(f"`docker inspect` of {service} failed:\n{result.stderr}")
         return started_since(result.stdout.strip(), self.since)
 
+    def network(self, name: str) -> dict[str, object]:
+        """``docker network inspect`` of the project's network ``name`` (``backend``,
+        ``edge``), which Compose creates as ``<project>_<name>``."""
+        # S603: as in compose, docker comes from shutil.which and the arguments are fixed.
+        result = subprocess.run(  # noqa: S603
+            [self.docker, "network", "inspect", f"{PROJECT}_{name}"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=COMMAND_TIMEOUT,
+            check=False,
+        )
+        if result.returncode != 0:
+            pytest.fail(f"`docker network inspect` of {name} failed:\n{result.stderr}")
+        # A JSON list with one object per network named.
+        entries = _json_objects(result.stdout)
+        assert len(entries) == 1, f"expected one {name} network, got {result.stdout[:300]!r}"
+        return entries[0]
+
     def health(self, service: str) -> str:
         """The health status of ``service`` (``healthy``, ``starting``, ...)."""
         output = self.compose("ps", "--all", "--format", "json", service).stdout
@@ -264,6 +284,13 @@ def service_logs(stack: Stack) -> Callable[[str], str]:
 def service_started(stack: Stack) -> Callable[[str], bool]:
     """Whether a service's container started after the test session started."""
     return stack.started
+
+
+@pytest.fixture(scope="session")
+def network_inspect(stack: Stack) -> Callable[[str], dict[str, object]]:
+    """``docker network inspect`` of one of the project's networks (``backend``,
+    ``edge``)."""
+    return stack.network
 
 
 @pytest.fixture(scope="session")

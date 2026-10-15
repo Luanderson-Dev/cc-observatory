@@ -2,8 +2,9 @@
 
 Unit tests: they parse the Grafana service in ``compose.yaml`` and the provisioning
 files under ``stack/grafana/``; Docker is not needed. Grafana has no offline check of its
-settings, so ``tests/integration/test_stack_grafana.py`` checks the same rules against a
-running Grafana.
+settings, so ``tests/integration/test_stack_grafana.py`` and, for the outbound settings,
+``tests/integration/test_stack_no_outbound.py`` check the same rules against a running
+Grafana.
 """
 
 from __future__ import annotations

@@ -603,6 +603,31 @@ def test_health_check_extension_answers_the_compose_healthcheck() -> None:
     assert test[-1] == f"http://{endpoint}/"
 
 
+# Nothing calls out (ADR 0006): the collector opens connections only to its exporters'
+# backends.
+
+
+def test_collector_exports_no_telemetry_of_its_own() -> None:
+    # Only its metrics, which Prometheus pulls (above); its own traces or logs would be
+    # pushed over OTLP to an endpoint of their own.
+    service = _mapping(_config().get("service"), "service")
+    assert set(_mapping(service.get("telemetry"), "service.telemetry")) == {"metrics"}
+
+
+def test_the_only_receiver_is_otlp() -> None:
+    # A pull receiver (prometheus, httpcheck, ...) would make the collector connect to
+    # its targets.
+    used = {name for pipeline in _pipelines().values() for name in pipeline["receivers"]}
+    assert used == {"otlp"}
+
+
+def test_the_only_extension_is_health_check() -> None:
+    # Extensions run whatever the pipelines do; opamp, for one, connects to a management
+    # server.
+    service = _mapping(_config().get("service"), "service")
+    assert _strings(service.get("extensions"), "service.extensions") == ["health_check"]
+
+
 # Identity (always deleted).
 
 

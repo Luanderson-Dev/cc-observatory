@@ -483,15 +483,13 @@ def test_no_identity_or_content_reaches_tempo(
     assert KEPT_SPAN_EVENT in events
 
 
-def test_tempo_runs_single_tenant_without_reports_or_extras_and_with_retention(
-    tempo_url: str,
-) -> None:
+def test_tempo_runs_single_tenant_without_extras_and_with_retention(tempo_url: str) -> None:
+    # That it sends no usage reports is checked in test_stack_no_outbound.py.
     config = _status_config(tempo_url)
     assert config.get("target") == "all"
     # Both are written only when true.
     assert not config.get("multitenancy_enabled")
     assert not config.get("auth_enabled")
-    assert _at(config, "usage_report", "reporting_enabled") is False
     assert _at(config, "query_frontend", "mcp_server", "enabled") is False
     # No storage path: Tempo leaves the metrics generator disabled.
     assert _at(config, "metrics_generator", "storage", "path") == ""
