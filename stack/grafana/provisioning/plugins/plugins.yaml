@@ -1,0 +1,4 @@
+# Provisions nothing: the stack uses only the plugins bundled with Grafana, and installs
+# none (ADR 0006). Grafana reads this directory at every start and logs an error when it
+# is missing.
+apiVersion: 1

@@ -147,11 +147,11 @@ a new ADR supersedes it, and only the old one's status line changes.
 - The collector also drops content-bearing telemetry (attributes such as `prompt`,
   `response` and `tool_input`, the raw API body and system prompt events, `tool.output`
   span events, `workspace.host_paths`) while the opt-in is off, even if `OTEL_LOG_*`
-  flags were set outside `ccobs setup` (ADR 0006).
-- The collector deletes personal attributes (`user.email`, `user.id` (the identity
-  provider subject on gateway sessions), `user.account_uuid`, `user.account_id`,
-  `organization.id`, and `user.groups` and `identity.source` on gateway sessions) by
-  default.
+  flags were set outside `ccobs setup` (ADRs 0006 and 0021).
+- The collector always deletes personal attributes: every key that starts with `user.`
+  or `enduser.` (such as `user.email`, `user.id` (the identity provider subject on
+  gateway sessions), `user.account_uuid`, `user.account_id` and `user.groups`), plus
+  `organization.id`, `identity.source` and `host.name` (ADR 0021).
 - Paths in hook payloads (`cwd`, `transcript_path`, ...) contain the OS username;
   treat them as personal data.
 - Test fixtures come from real sessions but are sanitized; a guard test fails if
@@ -197,18 +197,30 @@ uv run pre-commit install --hook-type pre-commit --hook-type commit-msg
 uv run pre-commit run --all-files
 uv run ruff check . && uv run ruff format --check .
 uv run mypy
-uv run pytest                               # unit tests (what CI runs)
+uv run pytest                               # unit tests (CI's test job)
 uv run pytest tests/test_cli.py --no-cov    # one file (skip the coverage gate)
+uv run pytest -m integration --no-cov       # integration tests (CI's stack job, needs
+                                            # Docker): isolated ccobs-it project on its
+                                            # own ports; CCOBS_IT_KEEP=1 keeps it up
+docker compose up -d                        # the stack (--profile traces adds Tempo);
+                                            # Grafana at http://localhost:4330
 ```
 
 ## Layout
 
 ```text
+compose*.yaml     compose.yaml is the stack; compose.debug.yaml publishes the stores on
+                  loopback (debugging, integration tests)
+stack/            service configs, mounted read-only into the containers
 src/ccobs/        package (CLI entry point in cli.py)
-tests/            unit tests; integration tests are marked @pytest.mark.integration
+tests/            unit tests; integration tests (tests/integration/) are marked
+                  @pytest.mark.integration
 tests/fixtures/   sanitized real payloads (hooks and OTLP) captured from Claude Code
 tools/capture/    dev-only fixture capture tooling (not packaged; tests import it
                   through `pythonpath = ["."]`); its `out/` holds raw data, never committed
+tools/stack/      dev-only stack tools (not packaged): OTLP replay, isolated ccobs-it
+                  project, memory per service, egress sink override
+docs/stack.md     operator reference for the stack (settings, memory, troubleshooting)
 docs/adr/         architecture decision records (MADR)
 .claude/agents/   project subagents
 ```

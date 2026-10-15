@@ -1,0 +1,57 @@
+# Tempo 3.1 for cc-observatory: stores Claude Code's traces.
+#
+# Tracing is a beta feature of Claude Code and off by default, so Tempo only runs in the
+# compose profile traces (ADR 0003): docker compose --profile traces up -d.
+#
+# Single binary (target all), single tenant, local storage in the tempo-data volume
+# (mounted at /var/tempo, the image's data directory, where every default path of Tempo
+# points too). Close to the upstream single-binary example, without its metrics
+# generator (span metrics pushed to Prometheus's remote write receiver) and without its
+# MCP server: Tempo only stores and answers queries.
+#   - receiver: OTLP over HTTP on port 4318, reachable only on the stack's internal
+#     backend network. The collector pushes traces there (otlp_http/tempo) once it has
+#     removed identity and content (ADR 0021).
+#   - retention: in Tempo 3.x the backend worker runs the retention jobs, with the
+#     block_retention of its own compaction settings; the scheduler's copy of that key
+#     does not apply retention. It comes from CCOBS_TEMPO_RETENTION (default 168h, 7
+#     days; ADR 0016), a Go duration: hours at most, never days. compose.yaml passes the
+#     variable and starts Tempo with -config.expand-env=true, which expands variables
+#     anywhere in this file, comments included: the dollar sign appears only in
+#     block_retention.
+
+# Lets Grafana's Tempo datasource stream search results over HTTP.
+stream_over_http_enabled: true
+
+server:
+  http_listen_port: 3200
+
+distributor:
+  receivers:
+    otlp:
+      protocols:
+        # Every interface of the container, since the collector runs in another one.
+        # The port is never published: compose.debug.yaml publishes only the HTTP API
+        # (3200).
+        http:
+          endpoint: 0.0.0.0:4318
+
+storage:
+  trace:
+    backend: local
+    wal:
+      path: /var/tempo/wal
+    local:
+      path: /var/tempo/blocks
+
+backend_worker:
+  # How long the worker may finish its job after SIGTERM. In 3.1.0 the scheduler of the
+  # single binary stops first, and the worker keeps asking it for jobs until this runs
+  # out; the upstream default (30s) outlasts Compose's stop grace period, so Tempo was
+  # killed instead of exiting. A compaction or retention job cut short is rescheduled.
+  finish_on_shutdown_timeout: 5s
+  compaction:
+    block_retention: ${CCOBS_TEMPO_RETENTION:-168h}
+
+# No usage reports (ADR 0006). The backend network has no egress either (ADR 0018).
+usage_report:
+  reporting_enabled: false
