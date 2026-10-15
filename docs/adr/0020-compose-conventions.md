@@ -112,7 +112,15 @@ works on the minimum Docker versions below and is handled by Dependabot.
   sooner does not wait. Tempo has 15 s, and its config shortens the backend worker's
   `finish_on_shutdown_timeout` to 5 s: in Tempo 3.1.0 the worker keeps asking the
   stopped scheduler for jobs until that timeout runs out, and the upstream 30 s would
-  outlast the grace period.
+  outlast the grace period. At SIGTERM the collector stops its exporters one after
+  another, and each gives every request that no consumer has picked one last attempt,
+  which fails while that backend is down (Tempo without its profile, as a rule): with 2
+  consumers for 100 queued traces, ceil(`queue_size` / `num_consumers`) rounds of
+  attempts of up to `timeout` each outlasted the grace period. So each exporter has one
+  consumer per queued request (the requests in flight count toward `queue_size`) and a
+  5 s `timeout`: at SIGTERM it lets the attempts in progress end and drops those
+  waiting for a retry, and a stop waits for one attempt per exporter at most (15 s if
+  all three backends are down).
 - **Images.** Every image, in `compose.yaml` and in Dockerfile `FROM` lines, is
   `name:exact-tag@sha256:<multi-arch index digest>`. The tag says what runs and the
   digest makes it immutable, because a tag can be re-published upstream, as the
@@ -196,7 +204,9 @@ works on the minimum Docker versions below and is handled by Dependabot.
   derived image from the pinned contrib and busybox images; a memory limit, with
   `GOMEMLIMIT` at 70 to 90% of it in the Go services; a healthcheck; the log rotation
   options; an explicit `stop_grace_period`, with Tempo's above its
-  `finish_on_shutdown_timeout` (`tests/test_tempo_config.py`); `no-new-privileges` and
+  `finish_on_shutdown_timeout` (`tests/test_tempo_config.py`) and the collector's
+  exporters' worst-case stops, one attempt per exporter and summed, within half of the
+  collector's (`tests/test_collector_config.py`); `no-new-privileges` and
   `cap_drop: [ALL]`; no `container_name`; read-only
   configuration directories under `stack/` and data on declared named volumes;
   `name: cc-observatory`; and a default for every variable, listed in `.env.example`
@@ -205,6 +215,11 @@ works on the minimum Docker versions below and is handled by Dependabot.
   `compose.debug.yaml`.
 - The integration tests (`tests/integration/`) start the stack as the `ccobs-it` project
   with `docker compose up --wait`, which fails unless every service becomes healthy.
+  They also freeze Tempo with SIGSTOP (every attempt to it then waits for the whole
+  `timeout`, on any OS) and then stop it, fill the collector's traces queue each time
+  and check that the collector then exits by itself well within its grace period,
+  keeping the metrics and events sent just before
+  (`tests/integration/test_stack_traces.py`).
 - `ccobs doctor` (milestone 4) checks that `stack/` is readable for the containers and
   that Docker Engine, Compose and Buildx meet the minimums.
 - The `reviewer` subagent checks every new service against these rules.

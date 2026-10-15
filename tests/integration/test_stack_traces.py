@@ -7,9 +7,12 @@ IDs, and with the privacy canaries planted, then read back from Tempo on its deb
 every trace comes back by ID with exactly the spans sent and their parent links, a
 TraceQL search by session finds the run's traces, and no identity or content attribute
 and no ``tool.output`` span event is stored (ADR 0021; ``test_stack_privacy.py``
-searches every backend for every canary). Tempo is optional (ADR 0003): the last test
-stops it and checks that the collector keeps storing metrics and logs, drops the traces
-it cannot deliver within its short retry, and reaches Tempo again once it is back.
+searches every backend for every canary). Tempo is optional (ADR 0003): the last tests
+take it away. The first stops it and checks that the collector keeps storing metrics and
+logs, drops the traces it cannot deliver within its short retry, and reaches Tempo again
+once it is back; the last, with Tempo frozen and then stopped, fills the traces
+exporter's queue and checks that the collector still stops cleanly within its grace
+period, keeping the metrics and logs sent just before (ADR 0020).
 """
 
 from __future__ import annotations
@@ -22,7 +25,7 @@ import subprocess
 import time
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import Final
 from urllib.parse import urlencode, urlsplit
 
@@ -36,8 +39,10 @@ from tools.stack.replay import (
     HOST_PATHS_CANARY_KEYS,
     SPAN_CONTENT_CANARY_KEYS,
     Prepared,
+    ReplayError,
     is_identity_key,
     load_scenario,
+    post_otlp,
     prepare,
     scenario_names,
     send,
@@ -88,6 +93,34 @@ IDLE_WORKER_ERROR: Final = re.compile(
 # The collector's console log: <time>\t<level>\t<caller>\t<message>\t<JSON fields>.
 COLLECTOR_ERROR: Final = re.compile(r"\terror\t")
 DROPPED: Final = "Exporting failed. Dropping data."
+# Seconds `docker compose stop` of the collector may take while Tempo is away and the
+# traces exporter's queue is full. With one consumer per queued request, the collector's
+# own stop waits for the attempts in progress, one export attempt at most (timeout: 5s,
+# stack/otel-collector/config.yaml; tests/test_collector_config.py checks that bound).
+# Measured on Docker Desktop: 3.5 to 4.8 s from Docker's kill event to the collector's
+# "Shutdown complete.", then about 0.3 s until the container exited and 0.2 s in the
+# compose CLI, 4.0 to 5.3 s in all. 20 s leaves room for a loaded machine and stays
+# clear of the stop_grace_period (30 s, compose.yaml): fewer consumers than requests
+# made the stop outlast it, and Docker killed the collector (exit 137) at 30.5 s.
+STOP_DEADLINE: Final = 20.0
+# The collector's answer to a request that finds an exporter's queue full, and how many
+# trace requests are sent at most to fill the traces exporter's queue.
+QUEUE_FULL: Final = "sending queue is full"
+FILL_LIMIT: Final = 500
+COLLECTOR_CONFIG: Final = (
+    Path(__file__).resolve().parents[2] / "stack" / "otel-collector" / "config.yaml"
+)
+# How the shutdown test takes Tempo away, and how it brings it back (docker compose
+# arguments). The name of a stopped Tempo does not resolve, which fails in milliseconds
+# on Linux and in about 4 s on Docker Desktop. A frozen Tempo (SIGSTOP) still resolves,
+# and the kernel still completes the TCP handshake for its stopped process, so every
+# attempt waits for the exporter's whole timeout on every OS. `docker compose pause`
+# freezes it the same way, but Docker marks a paused container unhealthy at once and
+# probes it again only one healthcheck interval (30 s) after it is unpaused.
+AWAY: Final = {
+    "stopped": (("stop",), ("start",)),
+    "frozen": (("kill", "--signal", "SIGSTOP"), ("kill", "--signal", "SIGCONT")),
+}
 
 
 @dataclass(frozen=True)
@@ -370,6 +403,45 @@ def _exited(compose: Callable[..., subprocess.CompletedProcess[str]], service: s
     return entries[0].get("ExitCode")
 
 
+def _smallest_run() -> Prepared:
+    """A fresh run of the smallest fixture scenario that has metrics, logs and spans."""
+    names = [
+        name
+        for name in scenario_names(with_otlp=True)
+        if (scenario := load_scenario(name)).metrics and scenario.logs and scenario.traces
+    ]
+    assert names, "no fixture scenario has metrics, logs and spans"
+    runs = [prepare(load_scenario(name), now_ns=time.time_ns()) for name in names]
+    return min(runs, key=lambda item: len(item.metrics) + len(item.logs) + len(item.traces))
+
+
+def _traces_queue_size() -> int:
+    """The traces exporter's ``queue_size``, from the collector's config."""
+    config = yaml.safe_load(COLLECTOR_CONFIG.read_text(encoding="utf-8"))
+    size = _at(config, "exporters", TEMPO_EXPORTER, "sending_queue", "queue_size")
+    assert isinstance(size, int), size
+    return size
+
+
+def _fill_traces_queue(otlp_http_url: str) -> int:
+    """Send fresh trace requests until the collector refuses one because the traces
+    exporter's queue is full; return how many it accepted before that."""
+    names = [name for name in scenario_names(with_otlp=True) if load_scenario(name).traces]
+    assert names, "no fixture scenario has OTLP spans"
+    accepted = 0
+    while accepted < FILL_LIMIT:
+        for name in names:
+            for request in prepare(load_scenario(name), now_ns=time.time_ns()).traces:
+                try:
+                    post_otlp(otlp_http_url, "traces", request)
+                except ReplayError as error:
+                    if QUEUE_FULL not in str(error):
+                        raise
+                    return accepted
+                accepted += 1
+    pytest.fail(f"the collector accepted {accepted} trace requests and never refused one")
+
+
 def _poll[T](read: Callable[[], T], done: Callable[[T], bool], seconds: float) -> T:
     """Call ``read`` until ``done`` accepts its result or ``seconds`` have passed; return
     the last result, for the caller to assert on."""
@@ -515,15 +587,15 @@ def test_tempo_logs_no_errors(
     assert not errors, "\n".join(errors[:5])
 
 
-# Last in this module: it stops Tempo, which logs errors while it shuts down, so it runs
-# after test_tempo_logs_no_errors, and it leaves Tempo healthy. Tempo exits cleanly on
-# SIGTERM because its backend worker's finish_on_shutdown_timeout is short: in 3.1.0
-# the worker keeps calling the stopped scheduler ("nil job received") until it runs out,
-# and the upstream default (30s) would outlast Compose's grace period, so Tempo would be
-# killed (exit 137). Even after a clean exit, the next start logs "failed to replay
-# block. removing." when Tempo had received traces: it is the empty head block (one
-# empty segment, no meta.json) that the live store opens after its last cut, and no
-# trace is lost.
+# Last in this module: these take Tempo away, and stopping it makes it log errors while
+# it shuts down, so they run after test_tempo_logs_no_errors; they leave Tempo (and the
+# collector, which the last one stops) healthy. Tempo exits cleanly on SIGTERM because
+# its backend worker's finish_on_shutdown_timeout is short: in 3.1.0 the worker keeps
+# calling the stopped scheduler ("nil job received") until it runs out, and the upstream
+# default (30s) would outlast Compose's grace period, so Tempo would be killed (exit
+# 137). Even after a clean exit, the next start logs "failed to replay block. removing."
+# when Tempo had received traces: it is the empty head block (one empty segment, no
+# meta.json) that the live store opens after its last cut, and no trace is lost.
 
 
 def test_metrics_and_logs_are_stored_while_tempo_is_stopped(
@@ -542,14 +614,7 @@ def test_metrics_and_logs_are_stored_while_tempo_is_stopped(
     # The module's traces are all in Tempo before it stops, so that the end of the test
     # can find them again after the restart.
     assert _complete(stored, sent), "the module's traces are not all in Tempo"
-    names = [
-        name
-        for name in scenario_names(with_otlp=True)
-        if (scenario := load_scenario(name)).metrics and scenario.logs and scenario.traces
-    ]
-    assert names, "no fixture scenario has metrics, logs and spans"
-    runs = [prepare(load_scenario(name), now_ns=time.time_ns()) for name in names]
-    run = min(runs, key=lambda item: len(item.metrics) + len(item.logs) + len(item.traces))
+    run = _smallest_run()
     before = len(service_logs(COLLECTOR).splitlines())
     compose("stop", TEMPO)
     try:
@@ -604,3 +669,62 @@ def test_metrics_and_logs_are_stored_while_tempo_is_stopped(
     expected = _sent((again,))
     found = _wait_for_traces(tempo_url, expected)
     assert _complete(found, expected), run.scenario
+
+
+@pytest.mark.parametrize("away", sorted(AWAY))
+def test_the_collector_stops_cleanly_while_tempo_is_away(
+    compose: Callable[..., subprocess.CompletedProcess[str]],
+    service_health: Callable[[str], str],
+    otlp_http_url: str,
+    prometheus_url: str,
+    loki_url: str,
+    away: str,
+) -> None:
+    # ADR 0020: every service stops after SIGTERM within its grace period. Claude Code
+    # can send traces while Tempo is not running (beta tracing on, no traces profile).
+    # At SIGTERM the collector's traces exporter stops retrying: the attempts in progress
+    # end and the requests waiting for their next retry are dropped. That must not hold
+    # the collector until Docker kills it, and the metrics and events sent just before
+    # the stop must still be stored.
+    leave, come_back = AWAY[away]
+    run = _smallest_run()
+    size = _traces_queue_size()
+    compose(*leave, TEMPO)
+    try:
+        # Every slot of the traces exporter's queue holds a request it keeps retrying.
+        accepted = _fill_traces_queue(otlp_http_url)
+        total = len(run.metrics) + len(run.logs)
+        assert send(otlp_http_url, run, signals=("metrics", "logs")) == total
+        started = time.monotonic()
+        compose("stop", COLLECTOR)
+        took = time.monotonic() - started
+        exit_code = _exited(compose, COLLECTOR)
+    finally:
+        try:
+            compose(*come_back, TEMPO)
+        finally:
+            compose("start", COLLECTOR)
+        health = _poll(
+            lambda: (service_health(TEMPO), service_health(COLLECTOR)),
+            lambda states: states == ("healthy", "healthy"),
+            HEALTHY_DEADLINE,
+        )
+    assert health == ("healthy", "healthy")
+    # The requests in flight count toward queue_size, so every queued request already
+    # has a consumer.
+    assert accepted == size
+    # Not killed (137) at the end of its grace period, and well within it.
+    assert exit_code == 0, f"the collector exited with {exit_code} after {took:.1f} s"
+    assert took <= STOP_DEADLINE, f"the collector took {took:.1f} s to stop"
+    series = _poll(
+        lambda: _series_count(prometheus_url, run.session_id),
+        lambda count: count == len(run.expected),
+        DEADLINE,
+    )
+    records = _poll(
+        lambda: _log_count(loki_url, run),
+        lambda count: count == len(_records(run)),
+        DEADLINE,
+    )
+    assert series == len(run.expected), run.scenario
+    assert records == len(_records(run)), run.scenario

@@ -210,16 +210,36 @@ processors:
     max_stale: 24h
 
 exporters:
+  # Each exporter queues requests in memory, bounded in requests (those in flight
+  # count), and refuses new data at once while its queue is full, so the receiver never
+  # blocks Claude Code's exports. Each queue has one consumer per request, so that the
+  # collector stops within compose's stop_grace_period (30 s, ADR 0020) even while a
+  # backend is down. At SIGTERM the collector stops its receivers, then its exporters
+  # one after another. Each stops retrying: the attempts in progress end, the requests
+  # waiting for their next retry are dropped, and every request no consumer has picked
+  # gets one last attempt. With fewer consumers than requests, a stop takes up to
+  # ceil(queue_size / num_consumers) rounds of attempts, each up to timeout (the name of
+  # a stopped backend took about 4 s to fail to resolve on Docker Desktop), so a few
+  # dozen requests queued for a down backend outlast the grace period and Docker kills
+  # the collector (exit 137). With one consumer per request, every request already has
+  # a consumer: at SIGTERM the attempts in progress end (5 s at most) and the requests
+  # waiting for their next retry are dropped at once, so a stop waits for one attempt
+  # per exporter at most (15 s if all three backends are down).
+  # tests/test_collector_config.py checks that bound against the grace period.
+
   # Loki's native OTLP endpoint; the exporter appends /v1/logs. Plain HTTP on the
   # internal backend network, where Loki runs single-tenant with no authentication.
   otlp_http/loki:
     endpoint: http://loki:3100/otlp
-    # In memory and bounded, in requests: it rides out a Loki restart, and when it is
-    # full new data is refused (the receiver never blocks Claude Code's exports).
+    # Per attempt, and the longest a stop waits for this exporter (above).
+    timeout: 5s
+    # Claude Code exports a session's events every 5 seconds by default, so 100 requests
+    # ride out a Loki restart (about 16 s) for dozens of sessions, and 5 minutes of a
+    # Loki outage for one or two busy ones.
     sending_queue:
       enabled: true
-      num_consumers: 2
-      queue_size: 1000
+      num_consumers: 100
+      queue_size: 100
     # A request that still fails after 5 minutes is dropped, with an error in the
     # collector's logs.
     retry_on_failure:
@@ -235,11 +255,14 @@ exporters:
   # which is why Prometheus keeps an out-of-order window.
   otlp_http/prometheus:
     metrics_endpoint: http://prometheus:9090/api/v1/otlp/v1/metrics
-    # As for Loki: in memory and bounded, and a full queue refuses new data.
+    # As for Loki.
+    timeout: 5s
+    # Claude Code exports a session's metrics every minute by default, so 100 requests
+    # hold 5 minutes of retries for some 20 sessions.
     sending_queue:
       enabled: true
-      num_consumers: 2
-      queue_size: 1000
+      num_consumers: 100
+      queue_size: 100
     retry_on_failure:
       enabled: true
       initial_interval: 1s
@@ -252,19 +275,24 @@ exporters:
   # beta tracing is turned on, so this exporter is usually idle: with no traces it opens
   # no connection and logs nothing. Traces that arrive while Tempo is not running (the
   # name tempo does not resolve) are dropped when the retry gives up, 30 seconds after a
-  # consumer first tries them: each request logs an info line per attempt and then one
-  # "Dropping data" error. The queue holds at most 100 requests, so a stream of traces
-  # never takes much memory, and while it is full new traces are refused at once. The
-  # metrics and logs pipelines have exporters and queues of their own, which this one
-  # never holds back.
+  # consumer first tries them, with an info line per attempt and a "Dropping data" error
+  # per request (the collector samples its logs: about 10 identical lines per 10
+  # seconds). The queue holds at most 20 requests, so a stream of traces never takes
+  # much memory, and while it is full new traces are refused at once (HTTP 503, "sending
+  # queue is full", logged as a "Rejecting data" error). The 30 seconds of retries ride
+  # out a Tempo restart. A stop of the collector while Tempo is away waits 5 s at most
+  # for this exporter (above): the attempts in progress end, and the traces waiting for
+  # their next retry are dropped. The metrics and logs pipelines have exporters and
+  # queues of their own, which this one never holds back.
   otlp_http/tempo:
     endpoint: http://tempo:4318
-    # Per attempt: a Tempo that accepts the connection and then hangs.
-    timeout: 10s
+    # Per attempt (a Tempo that accepts the connection and then hangs), and the longest
+    # a stop waits for this exporter (above).
+    timeout: 5s
     sending_queue:
       enabled: true
-      num_consumers: 2
-      queue_size: 100
+      num_consumers: 20
+      queue_size: 20
     retry_on_failure:
       enabled: true
       initial_interval: 1s

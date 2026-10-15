@@ -19,6 +19,7 @@ import json
 import os
 import shutil
 import subprocess
+import time
 import warnings
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
@@ -47,6 +48,12 @@ WAIT_TIMEOUT: Final = 180
 UP_TIMEOUT: Final = 900
 DOWN_TIMEOUT: Final = 300
 COMMAND_TIMEOUT: Final = 120
+# test_stack_traces.py freezes Tempo (SIGSTOP) for a few seconds. Once resumed, it passes
+# its healthcheck again within one interval (30 s) plus one probe timeout (5 s), from
+# compose.yaml; seconds to wait for that, with a margin, and between two polls.
+TEMPO: Final = "tempo"
+RESUME_TIMEOUT: Final = 45.0
+RESUME_POLL: Final = 1.0
 
 
 @dataclass(frozen=True)
@@ -206,6 +213,36 @@ def _diagnostics(running: Stack) -> str:
     return "\n".join(parts)
 
 
+def _existing_health(running: Stack, service: str) -> str | None:
+    """The health status of ``service``'s container, or ``None`` when the project has no
+    container for it (or ``docker compose ps`` fails); never fails the test."""
+    result = running.compose("ps", "--all", "--format", "json", service, check=False)
+    try:
+        entries = [
+            item
+            for line in result.stdout.splitlines()
+            if line.strip()
+            for item in _json_objects(line)
+        ]
+    except ValueError:
+        return None
+    return str(entries[0].get("Health", "")) if len(entries) == 1 else None
+
+
+def _resume_tempo(running: Stack) -> None:
+    """Resume a Tempo that a session killed while test_stack_traces.py had it frozen
+    (SIGSTOP) left behind, in a project that `up` reuses (CCOBS_IT_KEEP=1, or a session
+    killed before its teardown). After three failed healthchecks Docker reports it
+    unhealthy, and `up --wait` gives up on an unhealthy container at once, so wait until
+    a healthcheck passes again. SIGCONT does nothing to a process that is not stopped."""
+    if _existing_health(running, TEMPO) is None:
+        return
+    running.compose("kill", "--signal", "SIGCONT", TEMPO, check=False)
+    deadline = time.monotonic() + RESUME_TIMEOUT
+    while _existing_health(running, TEMPO) == "unhealthy" and time.monotonic() < deadline:
+        time.sleep(RESUME_POLL)
+
+
 def _tear_down(running: Stack) -> None:
     """Remove the project with its volumes. A failure only warns, with the command to
     clean up by hand, so that it never hides the failure of a test."""
@@ -245,6 +282,7 @@ def stack() -> Iterator[Stack]:
     # Everything from `up` on is inside the try: a timeout or Ctrl+C during `up` still
     # removes the containers, which `restart: unless-stopped` would bring back forever.
     try:
+        _resume_tempo(running)
         up = running.compose(
             "up",
             "--detach",

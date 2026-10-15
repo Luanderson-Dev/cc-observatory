@@ -1,16 +1,19 @@
 """Static checks of the OpenTelemetry Collector config (ADR 0003, ADR 0006, ADR 0013,
-ADR 0015, ADR 0021, ADR 0022).
+ADR 0015, ADR 0020, ADR 0021, ADR 0022).
 
 Unit tests: they parse ``stack/otel-collector/config.yaml`` and the OTTL statements of
 its privacy processors, and compare the keys and events they delete with the canaries
 that ``tools.stack.replay`` plants, so that every planted canary is covered by a filter.
-They also check the processor that sets the stack's host label and where each signal
-goes. The integration tests send the canaries through a running collector.
+They also check the processor that sets the stack's host label, where each signal goes,
+and that each exporter's queue lets the collector stop within the grace period that
+``compose.yaml`` gives it. The integration tests send the canaries through a running
+collector.
 """
 
 from __future__ import annotations
 
 import json
+import math
 import re
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
@@ -119,6 +122,24 @@ TELEMETRY_ADDRESS: Final = "0.0.0.0:8888"
 # Upper bound for an exporter's in-memory queue, in requests: enough to ride out a backend
 # restart, small enough to stay well inside the collector's memory limit.
 MAX_QUEUE_REQUESTS: Final = 5000
+# Each backend exporter's queue, in requests (those in flight count), served by one
+# consumer per request, and the timeout of one export attempt.
+QUEUE_REQUESTS: Final = {LOKI_EXPORTER: 100, PROMETHEUS_EXPORTER: 100, TEMPO_EXPORTER: 20}
+ATTEMPT_TIMEOUT: Final = "5s"
+# The share of the collector's stop_grace_period (compose.yaml) that the exporters
+# together may take to stop while their backends are down (ADR 0020). The collector
+# shuts its components down one after another, exporters last, so their waits add up;
+# the rest is for its other components and for Docker.
+SHUTDOWN_SHARE: Final = 0.5
+COLLECTOR_SERVICE: Final = "otel-collector"
+# The keys the backend exporters may use, each seen to take effect. The collector 0.162.0
+# accepts an unknown key at an exporter's top level or in retry_on_failure with no error
+# from `validate` or at start-up (sending_queue is checked), so a misspelt timeout would
+# go unnoticed.
+EXPORTER_KEYS: Final = frozenset(
+    {"endpoint", "metrics_endpoint", "timeout", "sending_queue", "retry_on_failure"}
+)
+RETRY_KEYS: Final = frozenset({"enabled", "initial_interval", "max_interval", "max_elapsed_time"})
 # Keys near the identity rule that must survive it.
 KEPT_KEYS: Final = (
     "user",
@@ -562,6 +583,70 @@ def test_backend_exporter_queues_and_retries_are_bounded(name: str) -> None:
     max_elapsed = retry.get("max_elapsed_time")
     assert isinstance(max_elapsed, str)
     assert re.fullmatch(r"[1-9]\d*(s|m)", max_elapsed), max_elapsed
+
+
+@pytest.mark.parametrize("name", BACKEND_EXPORTERS)
+def test_backend_exporters_only_use_keys_that_take_effect(name: str) -> None:
+    exporter = _section("exporters").get(name)
+    assert exporter is not None, f"no {name} exporter"
+    extra = sorted(set(exporter) - EXPORTER_KEYS)
+    assert not extra, (
+        f"{name}: {extra} not in EXPORTER_KEYS; the collector 0.162.0 ignores unknown keys "
+        "here, so add one only after seeing it take effect"
+    )
+    retry = _mapping(exporter.get("retry_on_failure"), "retry_on_failure")
+    extra = sorted(set(retry) - RETRY_KEYS)
+    assert not extra, (
+        f"{name}: retry_on_failure {extra} not in RETRY_KEYS; the collector 0.162.0 "
+        "ignores unknown keys here, so add one only after seeing it take effect"
+    )
+
+
+@pytest.mark.parametrize("name", BACKEND_EXPORTERS)
+def test_backend_exporters_have_one_consumer_per_queued_request(name: str) -> None:
+    # The requests in flight count toward queue_size, so with one consumer per request
+    # every request already has a consumer. At SIGTERM each exporter stops retrying: the
+    # attempts in progress end (timeout at most) and the requests waiting for their next
+    # retry are dropped at once. With fewer consumers, each request no consumer had
+    # picked would get one attempt in turn, however many a down backend left queued.
+    exporter = _section("exporters").get(name)
+    assert exporter is not None, f"no {name} exporter"
+    queue = _mapping(exporter.get("sending_queue"), "sending_queue")
+    assert queue.get("queue_size") == QUEUE_REQUESTS[name]
+    assert queue.get("num_consumers") == queue.get("queue_size")
+    # Explicit: the stop's bound, and the longest a backend that accepts the connection
+    # and then hangs holds a consumer.
+    assert exporter.get("timeout") == ATTEMPT_TIMEOUT
+
+
+def _grace_seconds(service: str) -> float:
+    """The ``stop_grace_period`` of a compose service (shared settings merged in)."""
+    compose = _mapping(yaml.safe_load(COMPOSE.read_text(encoding="utf-8")), "compose")
+    found = _mapping(_mapping(compose["services"], "services")[service], service)
+    return _seconds(found.get("stop_grace_period"))
+
+
+def _worst_stop_seconds(name: str) -> float:
+    """How long the exporter ``name`` can take to stop while its backend is down:
+    ceil(queue_size / num_consumers) rounds of attempts that fail (a name that does not
+    resolve took about 4 s to fail on Docker Desktop; a backend that accepts the
+    connection and then hangs takes the whole timeout), each cut at its timeout."""
+    exporter = _section("exporters").get(name)
+    assert exporter is not None, f"no {name} exporter"
+    queue = _mapping(exporter.get("sending_queue"), "sending_queue")
+    size, consumers = queue.get("queue_size"), queue.get("num_consumers")
+    assert isinstance(size, int)
+    assert isinstance(consumers, int)
+    assert consumers > 0
+    return math.ceil(size / consumers) * _seconds(exporter.get("timeout"))
+
+
+def test_the_exporters_stop_well_within_the_collectors_grace_period() -> None:
+    # ADR 0020. The collector stops its exporters one after another, so with every
+    # backend down their waits add up; past the grace period Docker kills the collector
+    # (exit 137). Today: 5 s each, 15 s for the three.
+    worst = {name: _worst_stop_seconds(name) for name in BACKEND_EXPORTERS}
+    assert sum(worst.values()) <= SHUTDOWN_SHARE * _grace_seconds(COLLECTOR_SERVICE), worst
 
 
 # Receivers and health.
