@@ -216,6 +216,16 @@ jobs:
         run: |
           docker stats --no-stream --format "table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.MemPerc}}"
 
+      # Memory per compose service of ccobs-it (used, peak and limit), from
+      # tools/stack/memory.py: three readings a second apart, each taking about two
+      # seconds. docs/stack.md has the numbers measured on a desktop. A failure fails the
+      # job on purpose: the tool fails only when no reading succeeds, so this step also
+      # checks it against the runner's Docker.
+      - name: Show the stack's memory per service
+        if: ${{ !cancelled() && steps.integration.outcome != 'skipped' }}
+        timeout-minutes: 3
+        run: uv run python -m tools.stack.memory --project ccobs-it --samples 3 --interval 1
+
       # The same project, env file, compose files and profile as tools/stack/isolated.py.
       - name: Show the stack's state and logs
         if: ${{ failure() && steps.integration.outcome == 'failure' }}
