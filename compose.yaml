@@ -178,10 +178,10 @@ services:
       - backend
 
   # The UI for metrics, events and traces, with the Prometheus, Loki and Tempo
-  # datasources provisioned from stack/grafana (ADR 0003). It joins edge to publish its
-  # port and backend to query the stores. No depends_on: Grafana queries a datasource
-  # only when a page asks, and shows a store that is down (Tempo without its profile)
-  # as an error on that page.
+  # datasources and the Claude Code overview dashboard provisioned from stack/grafana
+  # (ADR 0003). It joins edge to publish its port and backend to query the stores. No
+  # depends_on: Grafana queries a datasource only when a page asks, and shows a store
+  # that is down (Tempo without its profile) as an error on that page.
   grafana:
     <<: *service
     image: grafana/grafana:13.2.4@sha256:dbbc38ea21103cefb50396340cd88afec779c7e070b0a7bf5a75b4ce46651d3f
@@ -194,8 +194,16 @@ services:
     environment:
       # About 80% of mem_limit, so the Go runtime collects garbage before the limit.
       GOMEMLIMIT: 307MiB
-      # paths.provisioning: the datasources, from the read-only mount of stack/grafana.
+      # paths.provisioning: the datasources and the dashboards, from the read-only mount
+      # of stack/grafana.
       GF_PATHS_PROVISIONING: /etc/ccobs/grafana/provisioning
+      # dashboards.default_home_dashboard_path: Grafana's home page is the Claude Code
+      # overview, read from the same file that the dashboard provider loads. Grafana
+      # watches the file for changes, which a mount without file events (Docker Desktop
+      # on Windows), an editor that saves by renaming or a git checkout can miss: if the
+      # home page shows an old version, restart Grafana (the copy in the "Claude Code"
+      # folder rereads the file every 30 seconds).
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /etc/ccobs/grafana/dashboards/claude-code-overview.json
       # Access (ADR 0017): whoever opens Grafana is an Editor of its one organization.
       # There is no login form, no basic auth and no admin user, so there is no password
       # to set, leak or forget. Grafana 13.2 logs at every start that an anonymous role

@@ -32,8 +32,11 @@ SERVICE: Final = "grafana"
 CONFIG_DIR: Final = "/etc/ccobs/grafana"
 PROVISIONING_DIR: Final = f"{CONFIG_DIR}/provisioning"
 # Directories Grafana reads at every start, logging an error for each one that is
-# missing; until a later stage provisions something there, each holds an empty file.
-EMPTY_PROVISIONING: Final = ("alerting", "dashboards", "plugins")
+# missing; those with nothing to provision hold an empty file. The dashboard provider
+# is checked in tests/test_grafana_dashboard.py.
+EMPTY_PROVISIONING: Final = ("alerting", "plugins")
+# The bundled overview dashboard, which is also Grafana's home page.
+HOME_DASHBOARD: Final = f"{CONFIG_DIR}/dashboards/claude-code-overview.json"
 # The fixed datasource UIDs that dashboards and the app's links use, each with its
 # plugin type and the compose service it queries over the backend network.
 DATASOURCE_TYPES: Final = {"prometheus": "prometheus", "loki": "loki", "tempo": "tempo"}
@@ -71,8 +74,12 @@ class Setting:
         return f"{self.section}.{self.key}"
 
 
-# Where Grafana reads its provisioning: the read-only mount of stack/grafana.
-PATHS: Final = (Setting("paths", "provisioning", PROVISIONING_DIR),)
+# Where Grafana reads its provisioning, and the file it shows as its home page: both
+# from the read-only mount of stack/grafana.
+PATHS: Final = (
+    Setting("paths", "provisioning", PROVISIONING_DIR),
+    Setting("dashboards", "default_home_dashboard_path", HOME_DASHBOARD),
+)
 # Access (ADR 0017): whoever opens Grafana is an Editor of its one organization, with no
 # login form, no basic auth and no admin user.
 ACCESS: Final = (

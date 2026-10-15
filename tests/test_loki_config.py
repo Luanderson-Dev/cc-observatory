@@ -185,6 +185,18 @@ def test_retention_comes_from_the_environment_with_a_30_day_default() -> None:
     assert _hours(RETENTION_DEFAULT) == 30 * 24
 
 
+def test_queries_reach_back_only_as_far_as_the_retention() -> None:
+    # Loki refuses a query longer than max_query_length (721h by default) with an error,
+    # while Prometheus keeps 90 days, so a dashboard range such as "Last 90 days" would
+    # fail every Loki panel. max_query_lookback moves the start of a longer query to the
+    # retention instead (Loki 3.7.8 clamps it before checking the length), and nothing
+    # older than the retention is stored anyway. The length limit is off (0), or a
+    # retention set above 721h would bring the error back.
+    limits = _section("limits_config")
+    assert limits.get("max_query_lookback") == limits.get("retention_period")
+    assert limits.get("max_query_length") == 0
+
+
 def test_retention_default_is_a_multiple_of_the_index_period() -> None:
     assert _hours(RETENTION_DEFAULT) % 24 == 0
     assigned = dict(

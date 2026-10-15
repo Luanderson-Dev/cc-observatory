@@ -328,6 +328,8 @@ def test_loki_runs_without_usage_reports_and_with_retention(loki_url: str) -> No
     limits = _mapping(config.get("limits_config"), "limits_config")
     # 720h from .env.example, through -config.expand-env; Loki prints it in days.
     assert limits.get("retention_period") == "30d"
+    # Queries reach back no further than the retention, instead of failing when longer.
+    assert limits.get("max_query_lookback") == "30d"
     assert _mapping(config.get("compactor"), "compactor").get("retention_enabled") is True
 
 
