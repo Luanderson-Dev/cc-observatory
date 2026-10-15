@@ -41,6 +41,17 @@ Changelog = "https://github.com/Luanderson-Dev/cc-observatory/blob/main/CHANGELO
 ccobs = "ccobs.cli:main"
 cc-observatory = "ccobs.cli:main"
 
+[project.optional-dependencies]
+server = [
+  "alembic>=1.20.0",
+  "fastapi>=0.143.2",
+  "httpx>=0.28.1",
+  "prometheus-client>=0.26.0",
+  "pydantic-settings>=2.16.0",
+  "sqlalchemy>=2.1.4",
+  "uvicorn>=0.54.0",
+]
+
 [build-system]
 requires = ["uv_build>=0.12.23,<0.13"]
 build-backend = "uv_build"
@@ -68,11 +79,11 @@ strict = true
 python_version = "3.12"
 files = ["src", "tests", "tools"]
 
-# The capture tools import pywinpty (`winpty`) and the MCP SDK (`mcp`, which brings
-# `pydantic`) only when they run through `uv run --with ...`. They are not dev
-# dependencies, so mypy has neither the packages nor their stubs here.
+# The capture tools import pywinpty (`winpty`) and the MCP SDK (`mcp`) only when they
+# run through `uv run --with ...`. They are not dev dependencies, so mypy has neither
+# the packages nor their stubs here.
 [[tool.mypy.overrides]]
-module = ["winpty", "mcp.*", "pydantic"]
+module = ["winpty", "mcp.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
@@ -104,6 +115,8 @@ major_version_zero = true
 
 [dependency-groups]
 dev = [
+  # The app's dependencies, so that `uv sync`, mypy and pytest see them.
+  "cc-observatory[server]",
   "commitizen>=4.19.2",
   "mypy>=2.4.0",
   "pre-commit>=4.7.0",
