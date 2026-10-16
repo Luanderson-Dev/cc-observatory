@@ -240,11 +240,12 @@ def esc(app_url: str, otlp_http_url: str) -> EscReplay:
     status_after_close = _status(app_url, session_id)
 
     send_hooks(app_url, hooks.lines[split:])
-    poll(
+    stored = poll(
         lambda: len(events(app_url, session_id)),
         lambda count: count == len(hooks.lines),
         STORED_DEADLINE,
     )
+    assert stored == len(hooks.lines), "the rest of the replay was not stored"
     after = _block(app_url, session_id, denied_call)
     assert after is not None
     return EscReplay(

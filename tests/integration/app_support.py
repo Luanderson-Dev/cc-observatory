@@ -154,8 +154,12 @@ def detail(app_url: str, session_id: str) -> dict[str, object] | None:
 
 
 def events(app_url: str, session_id: str) -> list[dict[str, object]]:
-    found = get_json(app_url, f"{API}/{session_id}/events", {"limit": PAGE})
-    return [mapping(item, "event") for item in items(found, "events")]
+    """A session's stored events; empty while the app has not stored the session."""
+    answer = request(app_url, "GET", f"{API}/{session_id}/events", {"limit": PAGE})
+    if answer.status == 404:
+        return []
+    assert answer.status == 200, f"{session_id}: {answer.status} {answer.body[:300]!r}"
+    return [mapping(item, "event") for item in items(answer.json(), "events")]
 
 
 # The state to compare.
