@@ -36,6 +36,7 @@ from dataclasses import dataclass, field
 from typing import Final
 
 from ccobs.domain.app_metrics import event_label
+from ccobs.domain.denials import OpenBlock
 from ccobs.domain.hooks import HookEvent, parse_hook
 from ccobs.domain.sessions import (
     BlockClosed,
@@ -65,6 +66,7 @@ _log = logging.getLogger(__name__)
 # live work for the counts.
 _CLOSED: Final = frozenset({"ended", "stale"})
 _ENDED: Final = "ended"
+_PERMISSION: Final = "permission"
 _MS_PER_S: Final = 1000
 
 # Receives each closed block's kind and how long it was open, in seconds.
@@ -306,6 +308,18 @@ class Writer:
             sessions_ended=ended,
             events_received=received,
         )
+
+    def open_permission_blocks(self) -> list[OpenBlock]:
+        """The committed open permission blocks that have a ``tool_use_id``, which the
+        reconciler can match with telemetry (ADR 0029); blocks without one cannot be."""
+        with self._lock:
+            states = list(self._states.values())
+        return [
+            OpenBlock(state.session.session_id, block.tool_use_id, block.opened_at_ms)
+            for state in states
+            for block in state.open_blocks
+            if block.kind == _PERMISSION and block.tool_use_id is not None
+        ]
 
     def state(self, session_id: str) -> SessionState | None:
         """The committed state of a session in memory; ``None`` for ended or unknown ones."""

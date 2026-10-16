@@ -30,6 +30,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import text
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from ccobs.domain.denials import OpenBlock
 from ccobs.domain.hook_config import HOOK_PATH
 from ccobs.domain.hooks import parse_hook
 from ccobs.domain.sessions import apply
@@ -49,7 +50,9 @@ from ccobs.server.writer import BlockClosedCallback, WriterCounts
 
 # The app without its metrics listener (only tests/server/test_metrics.py opens sockets)
 # and without its sweeper (tests/server/test_sweeps.py covers it).
-create_app: Final = functools.partial(server_app.create_app, serve_metrics=False, sweeps=False)
+create_app: Final = functools.partial(
+    server_app.create_app, serve_metrics=False, sweeps=False, reconcile=False
+)
 KIB: Final = 1024
 MIB: Final = 1024 * KIB
 BODY_MAX: Final = 64 * KIB
@@ -87,6 +90,12 @@ class IdleWriter:
 
     def submit_retention(self, cutoff_ms: int) -> None:
         pass
+
+    def submit_telemetry_close(self, session_id: str, tool_use_id: str, at_ms: int) -> None:
+        pass
+
+    def open_permission_blocks(self) -> list[OpenBlock]:
+        return []
 
     def counts(self) -> WriterCounts:
         return WriterCounts(

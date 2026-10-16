@@ -28,6 +28,7 @@ from sqlalchemy import Engine, func, select
 from sqlalchemy.exc import OperationalError
 
 from ccobs.domain.app_metrics import EVENT_LABELS, event_label
+from ccobs.domain.denials import OpenBlock
 from ccobs.domain.hook_config import HOOK_PATH
 from ccobs.domain.hooks import parse_hook
 from ccobs.domain.sessions import SessionState, apply
@@ -48,7 +49,9 @@ from ccobs.server.writer import BlockClosedCallback, Writer, WriterCounts
 
 # The app without its metrics listener (only tests/server/test_metrics.py opens sockets)
 # and without its sweeper (tests/server/test_sweeps.py covers it).
-create_app: Final = functools.partial(server_app.create_app, serve_metrics=False, sweeps=False)
+create_app: Final = functools.partial(
+    server_app.create_app, serve_metrics=False, sweeps=False, reconcile=False
+)
 HOOK_FIXTURES: Final = Path(__file__).parents[1] / "fixtures" / "hooks"
 FIXTURES: Final = sorted(HOOK_FIXTURES.glob("*.jsonl"))
 TOOLS: Final = HOOK_FIXTURES / "headless-tools-subagent.jsonl"
@@ -388,6 +391,12 @@ def test_the_lifespan_uses_an_injected_writer_factory(settings: Settings) -> Non
 
         def submit_retention(self, cutoff_ms: int) -> None:
             calls.append(("retention", cutoff_ms))
+
+        def submit_telemetry_close(self, session_id: str, tool_use_id: str, at_ms: int) -> None:
+            calls.append(("close", at_ms))
+
+        def open_permission_blocks(self) -> list[OpenBlock]:
+            return []
 
         def counts(self) -> WriterCounts:
             return WriterCounts(

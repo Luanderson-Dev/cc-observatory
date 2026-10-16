@@ -7,9 +7,11 @@ request on the hook route, whatever happens to it, gets the same neutral 204 (CL
 ADR 0011). The lifespan starts the writer once the database is migrated, then the
 metrics listener (``ccobs.server.metrics``, ADR 0028), which serves ``/metrics`` on a
 port of its own (this app has no ``/metrics`` route), then the sweeper
-(``ccobs.server.sweeps``), which submits the stale sweep and retention to the writer. At
-shutdown it stops the listener, then the sweeper, then the writer, draining the queue,
-before it disposes the engine.
+(``ccobs.server.sweeps``), which submits the stale sweep and retention to the writer,
+then the reconciler (``ccobs.server.reconcile``, ADR 0029), which closes permission
+blocks denied with Esc from Loki. At shutdown it stops the listener, then the
+reconciler, then the sweeper, then the writer, draining the queue, before it disposes the
+engine.
 """
 
 from __future__ import annotations
@@ -20,6 +22,7 @@ from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from typing import Final, Protocol
 
+import httpx
 from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
 from starlette.routing import Route
@@ -42,6 +45,7 @@ from ccobs.server.guards import (
 from ccobs.server.ingest import Clock, DropReason, HookQueue, RawHook, SeqAllocator, wall_clock_ms
 from ccobs.server.metrics import AppMetrics, MetricsListener
 from ccobs.server.migrations import upgrade_to_head
+from ccobs.server.reconcile import POLL_INTERVAL_S, Reconciler, ReconcileTarget
 from ccobs.server.sweeps import RETENTION_INTERVAL_S, TICK_INTERVAL_S, Sweeper, SweepTarget
 from ccobs.server.writer import BlockClosedCallback, Writer, WriterCounts
 
@@ -56,11 +60,17 @@ _MS_PER_S: Final = 1000
 WRITER_STOP_TIMEOUT_S: Final = 5.0
 # How long shutdown waits for the sweeper thread; its stop interrupts its wait at once.
 SWEEPER_STOP_TIMEOUT_S: Final = 5.0
+# How long shutdown waits for the reconciler thread: its stop interrupts its wait at
+# once. A query in flight is not cut short: its 5 s timeout applies to each phase
+# (connect, each read or write), not to the whole request, and shutdown moves on (with
+# a warning) when this runs out.
+RECONCILER_STOP_TIMEOUT_S: Final = 5.0
 
 
-class BackgroundWriter(SweepTarget, Protocol):
+class BackgroundWriter(SweepTarget, ReconcileTarget, Protocol):
     """What the app needs of the writer: ``Writer``, or a test double. The sweeper
-    submits its ticks and retention through ``SweepTarget``'s methods."""
+    submits its ticks and retention through ``SweepTarget``'s methods, and the
+    reconciler reads open blocks and submits closes through ``ReconcileTarget``'s."""
 
     def start(self) -> None: ...
 
@@ -145,6 +155,9 @@ def create_app(
     metrics_port: int | None = None,
     sweeps: bool = True,
     sweep_intervals: tuple[float, float] | None = None,
+    reconcile: bool = True,
+    reconcile_interval_s: float | None = None,
+    loki_transport: httpx.BaseTransport | None = None,
 ) -> FastAPI:
     """The app, not started: its lifespan migrates the database, seeds ``seq``, runs the
     writer thread and the metrics listener.
@@ -158,7 +171,11 @@ def create_app(
     still in ``app.state.metrics``. The sweeper (``ccobs.server.sweeps``) submits the
     stale sweep and retention to the writer on ``sweep_intervals``, ``(tick, retention)``
     in seconds (60 s and 1 h by default), with the same clock as the hook route;
-    ``sweeps=False`` leaves it off.
+    ``sweeps=False`` leaves it off. The reconciler (``ccobs.server.reconcile``, ADR
+    0029) polls ``settings.loki_url`` every ``reconcile_interval_s`` (2 s by default)
+    while permission blocks are open, with the same clock, through ``loki_transport``
+    (httpx's by default; tests pass an ``httpx.MockTransport``); it runs only when both
+    ``reconcile`` and ``settings.telemetry_reconcile`` are true.
     """
     hook_queue = queue or HookQueue(settings.hook_queue_max_items, settings.hook_queue_max_bytes)
     endpoint = HookEndpoint(
@@ -226,6 +243,8 @@ def create_app(
             app.state.metrics_listener = listener
             sweeper: Sweeper | None = None
             app.state.sweeper = None
+            reconciler: Reconciler | None = None
+            app.state.reconciler = None
             try:
                 if sweeps:
                     # After the writer starts, inside the try that stops it.
@@ -238,12 +257,29 @@ def create_app(
                     )
                     sweeper.start()
                     app.state.sweeper = sweeper
+                if reconcile and settings.telemetry_reconcile:
+                    reconciler = Reconciler(
+                        writer,
+                        loki_url=settings.loki_url,
+                        host=settings.host_label,
+                        poll_interval_s=reconcile_interval_s or POLL_INTERVAL_S,
+                        clock=endpoint.clock,
+                        transport=loki_transport,
+                        on_query=metrics.count_loki_query,
+                    )
+                    reconciler.start()
+                    app.state.reconciler = reconciler
                 yield
             finally:
                 # Before the writer stops, so no new scrape reads a writer going away.
                 if listener is not None:
                     await asyncio.to_thread(listener.stop)
                     app.state.metrics_listener = None
+                # Before the sweeper and the writer: nothing is submitted to a stopping
+                # writer, and no query starts during shutdown.
+                if reconciler is not None:
+                    await asyncio.to_thread(reconciler.stop, RECONCILER_STOP_TIMEOUT_S)
+                    app.state.reconciler = None
                 # Before the writer stops, so nothing is submitted to a stopping writer.
                 if sweeper is not None:
                     await asyncio.to_thread(sweeper.stop, SWEEPER_STOP_TIMEOUT_S)

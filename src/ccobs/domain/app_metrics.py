@@ -38,10 +38,13 @@ __all__ = [
     "HOOK_QUEUE_BYTES",
     "HOOK_QUEUE_DEPTH",
     "KIND_LABEL",
+    "LOKI_QUERIES",
+    "LOKI_RESULTS",
     "METRICS_PATH",
     "OTHER_EVENT",
     "REASON_LABEL",
     "RECEIVED_EVENTS",
+    "RESULT_LABEL",
     "SCRAPE_JOB",
     "SESSIONS",
     "SESSIONS_ENDED",
@@ -49,6 +52,7 @@ __all__ = [
     "STATE_LABEL",
     "VERSION_LABEL",
     "AppMetric",
+    "LokiQueryResult",
     "MetricType",
     "event_label",
 ]
@@ -63,6 +67,7 @@ KIND_LABEL: Final = "kind"
 EVENT_LABEL: Final = "event"
 REASON_LABEL: Final = "reason"
 VERSION_LABEL: Final = "version"
+RESULT_LABEL: Final = "result"
 
 # Every status but ended, the values of the state label: ended sessions leave the
 # writer's memory, and the counter of sessions ended stands for them.
@@ -94,6 +99,13 @@ BLOCK_DURATION_BUCKETS: Final[tuple[float, ...]] = (
     1800,
     3600,
 )
+
+# The result of a query the app sends to Loki to close Esc denials (ADR 0029): answered
+# with a streams result, or not (no connection, a timeout, a non-2xx status, a body
+# that is not a streams result). A poll with nothing to ask sends no query and counts
+# nothing.
+type LokiQueryResult = Literal["ok", "error"]
+LOKI_RESULTS: Final[tuple[LokiQueryResult, ...]] = get_args(LokiQueryResult.__value__)
 
 type MetricType = Literal["gauge", "counter", "histogram"]
 
@@ -184,6 +196,14 @@ DATABASE_WAL: Final = AppMetric(
     (HOST_LABEL,),
 )
 
+LOKI_QUERIES: Final = AppMetric(
+    "ccobs_loki_queries_total",
+    "counter",
+    "Queries sent to Loki to close permission blocks denied with Esc since the app"
+    " started, by result.",
+    (HOST_LABEL, RESULT_LABEL),
+)
+
 APP_METRICS: Final = (
     SESSIONS,
     SESSIONS_ENDED,
@@ -197,6 +217,7 @@ APP_METRICS: Final = (
     HOOK_QUEUE_BYTES,
     BUILD_INFO,
     DATABASE_WAL,
+    LOKI_QUERIES,
 )
 
 

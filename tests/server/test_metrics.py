@@ -46,6 +46,8 @@ from ccobs.domain.app_metrics import (
     HOOK_EVENTS_RECEIVED,
     HOOK_QUEUE_BYTES,
     HOOK_QUEUE_DEPTH,
+    LOKI_QUERIES,
+    LOKI_RESULTS,
     METRICS_PATH,
     OTHER_EVENT,
     RECEIVED_EVENTS,
@@ -54,6 +56,7 @@ from ccobs.domain.app_metrics import (
     SESSIONS_ENDED,
     AppMetric,
 )
+from ccobs.domain.denials import OpenBlock
 from ccobs.domain.hook_config import HOOK_PATH
 from ccobs.server import app as server_app
 from ccobs.server.config import Settings
@@ -69,8 +72,9 @@ from ccobs.server.metrics import (
 )
 from ccobs.server.writer import BlockClosedCallback, Writer, WriterCounts
 
-# The app without its sweeper: tests/server/test_sweeps.py covers it.
-create_app: Final = functools.partial(server_app.create_app, sweeps=False)
+# The app without its sweeper and reconciler: tests/server/test_sweeps.py and
+# tests/server/test_reconcile.py cover them.
+create_app: Final = functools.partial(server_app.create_app, sweeps=False, reconcile=False)
 HOOK_FIXTURES: Final = Path(__file__).parents[1] / "fixtures" / "hooks"
 SERVER_SOURCES: Final = Path(__file__).parents[2] / "src" / "ccobs" / "server"
 # Agents and a permission block; an elicitation block and idle; compaction and a
@@ -248,8 +252,8 @@ def test_the_exposition_has_exactly_the_documented_series(client: TestClient) ->
 
     assert types == {metric.name: metric.type for metric in APP_METRICS}
     assert "_created" not in text
-    # The fixed total of ADR 0028.
-    assert sum(len(found) for found in samples.values()) == 63
+    # The fixed total of ADR 0028, plus the two Loki query series of ADR 0029.
+    assert sum(len(found) for found in samples.values()) == 65
     for metric in APP_METRICS:
         assert samples[metric.name], metric.name
         for sample in samples[metric.name]:
@@ -266,6 +270,7 @@ def test_states_kinds_reasons_and_events_are_exported_with_zeros(client: TestCli
     assert by_label(samples, BLOCKS_OPEN, "kind") == dict.fromkeys(BLOCK_KINDS, 0)
     assert by_label(samples, HOOK_EVENTS_DROPPED, "reason") == dict.fromkeys(DROP_REASONS, 0)
     assert by_label(samples, HOOK_EVENTS_RECEIVED, "event") == dict.fromkeys(EVENT_LABELS, 0)
+    assert by_label(samples, LOKI_QUERIES, "result") == dict.fromkeys(LOKI_RESULTS, 0)
     for metric in (
         AGENTS_RUNNING,
         SESSIONS_ENDED,
@@ -528,6 +533,12 @@ def test_the_listener_stops_before_the_writer(settings: Settings, queue: HookQue
 
         def submit_retention(self, cutoff_ms: int) -> None:
             pass
+
+        def submit_telemetry_close(self, session_id: str, tool_use_id: str, at_ms: int) -> None:
+            pass
+
+        def open_permission_blocks(self) -> list[OpenBlock]:
+            return []
 
         def counts(self) -> WriterCounts:
             return WriterCounts(

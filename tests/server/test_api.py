@@ -172,6 +172,7 @@ def client(settings: Settings, clock: Clock) -> Iterator[TestClient]:
         writer_factory=manual,
         serve_metrics=False,
         sweeps=False,
+        reconcile=False,
     )
     with TestClient(app, base_url=f"http://{GOOD_HOST}") as test_client:
         yield test_client

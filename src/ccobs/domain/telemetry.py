@@ -248,7 +248,11 @@ def _label(metric: Metric, label: str) -> str:
     return label
 
 
-def _quote(value: str) -> str:
+def quote(value: str) -> str:
+    """``value`` as a double-quoted PromQL or LogQL string literal (both use Go's
+    quoting): the characters ``_ESCAPES`` lists escaped, so any value that is valid UTF-8
+    reads back as itself and cannot change the query. Raises ``ValueError`` for a value
+    that is not valid UTF-8 (a lone surrogate)."""
     try:
         value.encode("utf-8")
     except UnicodeEncodeError:
@@ -279,7 +283,7 @@ def selector(metric: Metric, matchers: Mapping[str, str] | None = None) -> str:
     valid UTF-8."""
     if not matchers:
         return metric.name
-    parts = ",".join(f"{_label(metric, key)}={_quote(value)}" for key, value in matchers.items())
+    parts = ",".join(f"{_label(metric, key)}={quote(value)}" for key, value in matchers.items())
     return f"{metric.name}{{{parts}}}"
 
 

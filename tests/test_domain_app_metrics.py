@@ -23,6 +23,8 @@ from ccobs.domain.app_metrics import (
     EVENT_LABELS,
     HOOK_EVENTS_DROPPED,
     HOOK_EVENTS_RECEIVED,
+    LOKI_QUERIES,
+    LOKI_RESULTS,
     METRICS_PATH,
     OTHER_EVENT,
     RECEIVED_EVENTS,
@@ -30,6 +32,7 @@ from ccobs.domain.app_metrics import (
     SESSION_STATES,
     SESSIONS,
     AppMetric,
+    LokiQueryResult,
     event_label,
 )
 from ccobs.domain.hook_config import ASYNC_COMMAND_EVENTS, REGISTERED_HTTP_EVENTS
@@ -55,6 +58,7 @@ def test_the_proposed_series_are_all_there() -> None:
         "ccobs_hook_queue_bytes": ("gauge", ("host",)),
         "ccobs_build_info": ("gauge", ("host", "version")),
         "ccobs_database_wal": ("gauge", ("host",)),
+        "ccobs_loki_queries_total": ("counter", ("host", "result")),
     }
 
 
@@ -121,6 +125,13 @@ def test_the_buckets_suit_human_waits() -> None:
     # Up to an hour; longer waits land in +Inf, which prometheus_client adds.
     assert BLOCK_DURATION_BUCKETS[-1] == 3600
     assert all(bound > 0 for bound in BLOCK_DURATION_BUCKETS)
+
+
+def test_loki_query_results_are_ok_and_error() -> None:
+    # ADR 0029: one series per result, exported with zeros.
+    assert LOKI_RESULTS == ("ok", "error")
+    assert get_args(LokiQueryResult.__value__) == LOKI_RESULTS
+    assert LOKI_QUERIES.labels == (HOST_LABEL, "result")
 
 
 def test_build_info_and_the_listener_constants() -> None:

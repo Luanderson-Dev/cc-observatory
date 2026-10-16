@@ -377,6 +377,7 @@ def client(settings: Settings, clock: Clock) -> Iterator[TestClient]:
         writer_factory=manual,
         serve_metrics=False,
         sweep_intervals=(0.02, 0.02),
+        reconcile=False,
     )
     with TestClient(app, base_url=f"http://{GOOD_HOST}") as test_client:
         yield test_client
@@ -488,14 +489,14 @@ def test_a_silent_session_goes_stale_and_is_deleted_after_retention(
 
 
 def test_create_app_can_leave_the_sweeper_off(settings: Settings) -> None:
-    app = create_app(settings, serve_metrics=False, sweeps=False)
+    app = create_app(settings, serve_metrics=False, sweeps=False, reconcile=False)
     with TestClient(app, base_url=f"http://{GOOD_HOST}"):
         assert app.state.sweeper is None
 
 
 def test_the_default_sweeper_follows_the_settings(settings: Settings) -> None:
     configured = settings.model_copy(update={"retention": timedelta(days=7)})
-    app = create_app(configured, serve_metrics=False)
+    app = create_app(configured, serve_metrics=False, reconcile=False)
     with TestClient(app, base_url=f"http://{GOOD_HOST}"):
         sweeper = app.state.sweeper
         assert isinstance(sweeper, Sweeper)
@@ -536,7 +537,7 @@ def test_the_lifespan_stops_the_sweeper_before_the_writer(
     monkeypatch.setattr(Sweeper, "stop", sweeper_stop)
     monkeypatch.setattr(Writer, "start", writer_start)
     monkeypatch.setattr(Writer, "stop", writer_stop)
-    app = create_app(settings, serve_metrics=False)
+    app = create_app(settings, serve_metrics=False, reconcile=False)
     with TestClient(app, base_url=f"http://{GOOD_HOST}"):
         assert order == ["writer start", "sweeper start"]
 

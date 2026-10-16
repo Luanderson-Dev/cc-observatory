@@ -4,7 +4,8 @@
 one, so that several apps (in tests) never share series. Live state is read at scrape
 time, not pushed: a collector asks the writer for its counts and the queue for its depth,
 bytes and drop counters, so a gauge never goes stale. Only the block-duration histogram
-keeps state of its own, fed by the writer's ``on_block_closed`` callback. Every label
+and the Loki query counter keep state of their own, fed by the writer's
+``on_block_closed`` callback and the reconciler's ``on_query`` (ADR 0029). Every label
 value comes from a closed list (``ccobs.domain.app_metrics``), states, kinds, reasons and
 events are exported with zeros, and there is no ``_created`` series.
 
@@ -20,6 +21,7 @@ import logging
 import socket
 import sys
 import threading
+from collections import Counter
 from collections.abc import Callable, Iterable, Iterator
 from socketserver import TCPServer, ThreadingMixIn
 from typing import Any, Final, Protocol
@@ -50,11 +52,14 @@ from ccobs.domain.app_metrics import (
     HOOK_EVENTS_RECEIVED,
     HOOK_QUEUE_BYTES,
     HOOK_QUEUE_DEPTH,
+    LOKI_QUERIES,
+    LOKI_RESULTS,
     METRICS_PATH,
     SESSION_STATES,
     SESSIONS,
     SESSIONS_ENDED,
     AppMetric,
+    LokiQueryResult,
 )
 from ccobs.domain.sessions import BlockKind
 from ccobs.server.ingest import DROP_REASONS, HookQueue
@@ -114,6 +119,13 @@ class _StateCollector(Collector):
         self._version = version
         self.writer: CountsSource | None = None
         self.wal = False
+        # Fed from the reconciler's thread, read at scrape time.
+        self._loki_lock = threading.Lock()
+        self._loki_queries: Counter[str] = Counter()
+
+    def count_loki_query(self, result: LokiQueryResult) -> None:
+        with self._loki_lock:
+            self._loki_queries[result] += 1
 
     def collect(self) -> Iterator[Metric]:
         host = self._host
@@ -121,6 +133,12 @@ class _StateCollector(Collector):
         build = _gauge(BUILD_INFO)
         build.add_metric([host, self._version], 1)
         yield build
+        with self._loki_lock:
+            queries = dict(self._loki_queries)
+        loki = _counter(LOKI_QUERIES)
+        for result in LOKI_RESULTS:
+            loki.add_metric([host, result], queries.get(result, 0))
+        yield loki
         writer = self.writer
         if writer is None:
             return
@@ -197,6 +215,10 @@ class AppMetrics:
         """Export the writer's counts and whether the database runs in WAL mode."""
         self._state.wal = wal
         self._state.writer = writer
+
+    def count_loki_query(self, result: LokiQueryResult) -> None:
+        """The reconciler's ``on_query``: one query sent to Loki, with its ``result``."""
+        self._state.count_loki_query(result)
 
     def observe_block_closed(self, kind: BlockKind, seconds: float) -> None:
         """The writer's ``on_block_closed``: one closed block of ``kind``, open ``seconds``."""
