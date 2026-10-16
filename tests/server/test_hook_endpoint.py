@@ -778,7 +778,7 @@ def test_seq_skips_no_number_for_requests_dropped_before_the_queue(
 
 
 def _store_event(settings: Settings, seq: int) -> None:
-    engine = create_engine_for(settings.database_path)
+    engine = create_engine_for(settings.database_path, role="writer")
     try:
         upgrade_to_head(engine)
         repository = Repository(engine)
@@ -818,7 +818,7 @@ def test_seq_continues_after_a_restart(settings: Settings) -> None:
 
 def test_an_injected_repository_seeds_seq(settings: Settings, queue: HookQueue) -> None:
     _store_event(settings, 7)
-    engine = create_engine_for(settings.database_path)
+    engine = create_engine_for(settings.database_path, role="writer")
     try:
         with start(
             create_app(
@@ -846,7 +846,7 @@ def test_create_app_touches_no_database(settings: Settings) -> None:
 def test_the_lifespan_migrates_the_database_to_head(settings: Settings) -> None:
     with start(create_app(settings)) as client:
         assert client.get("/healthz").status_code == 200
-        engine = create_engine_for(settings.database_path)
+        engine = create_engine_for(settings.database_path, role="writer")
         try:
             with engine.connect() as connection:
                 version = connection.execute(text("SELECT version_num FROM alembic_version"))

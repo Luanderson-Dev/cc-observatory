@@ -54,7 +54,7 @@ TABLES: Final = (SessionModel, AgentModel, BlockModel, HookEventModel, SessionSt
 
 
 def make_repository(path: Path) -> Repository:
-    engine = create_engine_for(path)
+    engine = create_engine_for(path, role="writer")
     upgrade_to_head(engine)
     return Repository(engine)
 
@@ -165,7 +165,7 @@ def test_a_restart_before_any_event_rebuilds_the_exact_state(tmp_path: Path, pat
         straight(hook_event, at, seq)
         # A restart: a new engine, and the state read back from the database only.
         restarted.repo.engine.dispose()
-        restarted.repo = Repository(create_engine_for(restarted_path))
+        restarted.repo = Repository(create_engine_for(restarted_path, role="writer"))
         restarted.states = restarted.repo.load_open_states()
         if sid not in restarted.states and (loaded := restarted.repo.load_state(sid)):
             restarted.states[sid] = loaded  # an ended session, which can reopen

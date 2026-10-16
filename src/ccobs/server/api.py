@@ -1,10 +1,13 @@
 """The app's read-only JSON API: sessions, their agents and blocks, and their hook events.
 
-Every route reads the database through the ``Repository``, on connections of its own
-(a WAL snapshot per read), and never the writer's memory: the database is the source of
-truth, so a hook shows up once the writer commits its batch, a few tens of milliseconds
-after it was received. The routes are sync ``def``, so FastAPI runs them in its
-threadpool and a read never blocks the event loop.
+Every route reads the database through the readers' ``Repository``, on connections of
+the query-only readers' engine (a WAL snapshot per read), and never the writer's memory:
+the database is the source of truth, so a hook shows up once the writer commits its
+batch, a few tens of milliseconds after it was received. The routes and their
+dependencies are ``async def``, so FastAPI never puts them on its default threadpool:
+each read runs on a worker thread of the read gate (``ccobs.server.reads``, ADR 0033),
+which caps reads at the readers' connections and answers 503 when a read waits too long
+for one. A read never blocks the event loop.
 
 The responses are explicit models of stored metadata only (ADR 0023): every field is a
 database column, times are integer UTC milliseconds, and nothing else is served.
@@ -29,6 +32,7 @@ from starlette.responses import Response
 from ccobs.domain.hooks import is_valid_session_id
 from ccobs.domain.sessions import Agent, Block, SessionStatus
 from ccobs.server.db.repository import HookEventRow, Repository, SessionDetail, SessionView
+from ccobs.server.reads import ReadGate
 
 __all__ = [
     "DEFAULT_LIMIT",
@@ -165,32 +169,50 @@ class EventOut(_Out):
         return cls(**asdict(row))
 
 
-def _repository(request: Request) -> Repository:
-    repository: Repository = request.app.state.repository
+# Async, like the routes: FastAPI runs a sync dependency on its default threadpool.
+async def _repository(request: Request) -> Repository:
+    repository: Repository = request.app.state.read_repository
     return repository
 
 
+async def _reads(request: Request) -> ReadGate:
+    reads: ReadGate = request.app.state.reads
+    return reads
+
+
+def _events(repository: Repository, session_id: str, limit: int) -> list[HookEventRow] | None:
+    """The session's latest ``limit`` events; None if the session is unknown. One read on
+    the gate, so a request holds at most one slot at a time."""
+    if not repository.session_exists(session_id):
+        return None
+    return repository.list_events(session_id, limit)
+
+
 _Repo = Annotated[Repository, Depends(_repository)]
+_Reads = Annotated[ReadGate, Depends(_reads)]
 _Limit = Annotated[int, Query(ge=1, le=MAX_LIMIT)]
 
 router = APIRouter(prefix="/api/v1")
 
 
 @router.get("/sessions")
-def list_sessions(
+async def list_sessions(
     repository: _Repo,
+    reads: _Reads,
     status: SessionStatus | None = None,
     limit: _Limit = DEFAULT_LIMIT,
 ) -> list[SessionOut]:
     """The sessions with the latest activity first, optionally of one status."""
-    views = repository.list_sessions(limit, status)
+    views = await reads.run(repository.list_sessions, limit, status)
     return [SessionOut.of(view) for view in views]
 
 
 @router.get("/sessions/{session_id}")
-def get_session(repository: _Repo, session_id: str) -> SessionDetailOut:
+async def get_session(repository: _Repo, reads: _Reads, session_id: str) -> SessionDetailOut:
     """One session with its agents and blocks."""
-    detail = repository.get_session(session_id) if is_valid_session_id(session_id) else None
+    detail = None
+    if is_valid_session_id(session_id):
+        detail = await reads.run(repository.get_session, session_id)
     if detail is None:
         raise HTTPException(status_code=404, detail=_NOT_FOUND)
     return SessionDetailOut(
@@ -201,13 +223,16 @@ def get_session(repository: _Repo, session_id: str) -> SessionDetailOut:
 
 
 @router.get("/sessions/{session_id}/events")
-def list_events(
-    repository: _Repo, session_id: str, limit: _Limit = DEFAULT_LIMIT
+async def list_events(
+    repository: _Repo, reads: _Reads, session_id: str, limit: _Limit = DEFAULT_LIMIT
 ) -> list[EventOut]:
     """The session's latest ``limit`` hook events, in ``seq`` order."""
-    if not is_valid_session_id(session_id) or not repository.session_exists(session_id):
+    rows = None
+    if is_valid_session_id(session_id):
+        rows = await reads.run(_events, repository, session_id, limit)
+    if rows is None:
         raise HTTPException(status_code=404, detail=_NOT_FOUND)
-    return [EventOut.of(row) for row in repository.list_events(session_id, limit)]
+    return [EventOut.of(row) for row in rows]
 
 
 async def validation_error(_request: Request, error: RequestValidationError) -> Response:

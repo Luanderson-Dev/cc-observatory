@@ -44,6 +44,7 @@ cc-observatory = "ccobs.cli:main"
 [project.optional-dependencies]
 server = [
   "alembic>=1.20.0",
+  "anyio>=4.15.1",
   "fastapi>=0.143.2",
   "httpx>=0.28.1",
   "jinja2>=3.1.6",

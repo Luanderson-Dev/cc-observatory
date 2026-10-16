@@ -13,7 +13,11 @@ from __future__ import annotations
 import inspect
 import json
 import os
+import threading
+import time
 from collections.abc import Iterator, Sequence
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Final
 
@@ -23,14 +27,20 @@ from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 from pydantic import BaseModel, ValidationError
 from sqlalchemy import Engine, select
+from sqlalchemy.pool import QueuePool
 
 from ccobs.domain.hook_config import HOOK_PATH
 from ccobs.server import api
+from ccobs.server import app as app_module
 from ccobs.server.app import create_app
 from ccobs.server.config import Settings
+from ccobs.server.db import engine as db_engine
+from ccobs.server.db.engine import EngineRole
 from ccobs.server.db.models import AgentModel, Base, BlockModel, HookEventModel, SessionModel
-from ccobs.server.db.repository import Repository
+from ccobs.server.db.repository import Repository, SessionView
 from ccobs.server.ingest import HookQueue
+from ccobs.server.migrations import MigrationError
+from ccobs.server.reads import READ_SLOTS, ReadGate
 from ccobs.server.writer import BlockClosedCallback, Writer
 
 HOOK_FIXTURES: Final = Path(__file__).parents[1] / "fixtures" / "hooks"
@@ -59,6 +69,11 @@ UNKNOWN: Final = "00000000-0000-4000-8000-0000000000ff"
 CANARY: Final = "CANARY-5d1e8b"
 NOT_FOUND: Final = {"detail": "session not found"}
 API: Final = "/api/v1/sessions"
+# Upper bound for any wait on another thread: far above what a pass needs.
+PATIENCE_S: Final = 10.0
+# As many reads as Starlette's default threadpool has threads.
+CONCURRENT_READS: Final = 40
+WRITE_DEADLINE_S: Final = 1.0
 
 # Payload fields that ADR 0023 never keeps: a canary goes in each one a payload has.
 CONTENT_FIELDS: Final = (
@@ -157,8 +172,10 @@ def clock() -> Clock:
     return Clock()
 
 
-@pytest.fixture
-def client(settings: Settings, clock: Clock) -> Iterator[TestClient]:
+@contextmanager
+def started(settings: Settings, clock: Clock, **options: Any) -> Iterator[TestClient]:
+    """The app with a manual writer, started, behind a good ``Host``."""
+
     def manual(
         queue: HookQueue, repository: Repository, on_block_closed: BlockClosedCallback
     ) -> ManualWriter:
@@ -173,8 +190,15 @@ def client(settings: Settings, clock: Clock) -> Iterator[TestClient]:
         serve_metrics=False,
         sweeps=False,
         reconcile=False,
+        **options,
     )
     with TestClient(app, base_url=f"http://{GOOD_HOST}") as test_client:
+        yield test_client
+
+
+@pytest.fixture
+def client(settings: Settings, clock: Clock) -> Iterator[TestClient]:
+    with started(settings, clock) as test_client:
         yield test_client
 
 
@@ -487,7 +511,9 @@ def test_no_route_sends_cors_headers(replayed: TestClient, path: str) -> None:
         assert not [name for name in response.headers if name.lower().startswith("access-control")]
 
 
-def test_the_routes_run_in_the_threadpool_and_stay_out_of_the_schema(client: TestClient) -> None:
+def test_the_routes_stay_off_the_default_threadpool_and_out_of_the_schema(
+    client: TestClient,
+) -> None:
     routes = [route for route in api.router.routes if isinstance(route, APIRoute)]
 
     assert sorted(route.path for route in routes) == [
@@ -496,10 +522,168 @@ def test_the_routes_run_in_the_threadpool_and_stay_out_of_the_schema(client: Tes
         "/api/v1/sessions/{session_id}/events",
     ]
     for route in routes:
-        # Sync def: FastAPI runs it in its threadpool, off the event loop.
-        assert not inspect.iscoroutinefunction(route.endpoint)
+        # Async def, dependencies included: FastAPI would run a sync def in its default
+        # threadpool; the database reads go through the read gate instead (ADR 0033).
+        assert inspect.iscoroutinefunction(route.endpoint)
+        calls = [dependency.call for dependency in route.dependant.dependencies]
+        assert calls
+        assert all(inspect.iscoroutinefunction(call) for call in calls)
         assert route.methods == {"GET"}
     assert client.get("/openapi.json").status_code == 404
+
+
+# Readers and the writer (ADR 0033).
+
+
+class BlockedReads:
+    """Holds every session-list read on a reader connection until the test releases it."""
+
+    def __init__(self) -> None:
+        self.release = threading.Event()
+        self._started = 0
+        self._changed = threading.Condition()
+
+    def started(self) -> None:
+        with self._changed:
+            self._started += 1
+            self._changed.notify_all()
+
+    def wait_started(self, count: int) -> None:
+        with self._changed:
+            assert self._changed.wait_for(lambda: self._started >= count, timeout=PATIENCE_S)
+
+
+@pytest.fixture
+def blocked_reads(monkeypatch: pytest.MonkeyPatch) -> Iterator[BlockedReads]:
+    blocked = BlockedReads()
+    original = Repository.list_sessions
+
+    def list_sessions(self: Repository, limit: int, status: str | None = None) -> list[SessionView]:
+        # Holds a connection of the engine it reads through while it waits.
+        with self.engine.connect() as connection:
+            connection.exec_driver_sql("SELECT 1")
+            blocked.started()
+            blocked.release.wait(PATIENCE_S)
+        return original(self, limit, status)
+
+    monkeypatch.setattr(Repository, "list_sessions", list_sessions)
+    try:
+        yield blocked
+    finally:
+        blocked.release.set()
+
+
+def test_the_api_reads_through_a_query_only_engine_of_its_own(client: TestClient) -> None:
+    reader = app_of(client).state.read_repository
+    assert isinstance(reader, Repository)
+    writer_pool = engine_of(client).pool
+    reader_pool = reader.engine.pool
+    assert isinstance(writer_pool, QueuePool)
+    assert isinstance(reader_pool, QueuePool)
+    assert (writer_pool.size(), writer_pool._max_overflow) == (1, 0)
+    assert (reader_pool.size(), reader_pool._max_overflow) == (READ_SLOTS, 0)
+    with reader.engine.connect() as connection:
+        assert connection.exec_driver_sql("PRAGMA query_only").scalar_one() == 1
+    assert isinstance(app_of(client).state.reads, ReadGate)
+
+
+def checked_in(engine: Engine) -> int:
+    pool = engine.pool
+    assert isinstance(pool, QueuePool)
+    return pool.checkedin()
+
+
+def test_shutdown_disposes_both_engines(settings: Settings, clock: Clock) -> None:
+    with started(settings, clock) as test_client:
+        assert ok(test_client, API) == []
+        writer = engine_of(test_client)
+        reader = app_of(test_client).state.read_repository.engine
+        # A connection each, back in its pool.
+        assert (checked_in(reader), checked_in(writer)) == (1, 1)
+    # dispose() swaps in an empty pool.
+    assert (checked_in(reader), checked_in(writer)) == (0, 0)
+
+
+def test_a_failed_migration_opens_no_reader_engine(
+    settings: Settings, clock: Clock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    roles: list[str] = []
+    real_create = db_engine.create_engine_for
+
+    def create_engine_for(path: Path, *, role: EngineRole) -> Engine:
+        roles.append(role)
+        return real_create(path, role=role)
+
+    def upgrade_to_head(_engine: Engine) -> None:
+        raise MigrationError("the migration left 1 foreign key violations")
+
+    monkeypatch.setattr(app_module, "create_engine_for", create_engine_for)
+    monkeypatch.setattr(app_module, "upgrade_to_head", upgrade_to_head)
+
+    with pytest.raises(MigrationError), started(settings, clock):
+        pass
+    assert roles == ["writer"]
+
+
+def test_the_writer_commits_while_reads_hold_every_reader_connection(
+    client: TestClient, clock: Clock, blocked_reads: BlockedReads
+) -> None:
+    writer = app_of(client).state.writer
+    assert isinstance(writer, ManualWriter)
+    # Up to the first prompt: a session opens.
+    first = fixture_payloads(REPLAYED[0])[:3]
+    committed = threading.Event()
+
+    def write() -> None:
+        writer.run_once(0.0)
+        committed.set()
+
+    with ThreadPoolExecutor(max_workers=CONCURRENT_READS) as pool:
+        reads = [pool.submit(client.get, API) for _ in range(CONCURRENT_READS)]
+        # Every reader connection is held; the other reads queue for a slot.
+        blocked_reads.wait_started(READ_SLOTS)
+        post(client, clock, first)
+        thread = threading.Thread(target=write)
+        thread.start()
+        in_time = committed.wait(WRITE_DEADLINE_S)
+        blocked_reads.release.set()
+        thread.join(PATIENCE_S)
+        statuses = [read.result(timeout=PATIENCE_S).status_code for read in reads]
+
+    assert in_time, "the writer waited on the readers"
+    assert statuses == [200] * CONCURRENT_READS
+    assert session_ids(client) == [first[0][1]["session_id"]]
+
+
+def test_a_read_that_finds_no_free_slot_gets_a_neutral_503(
+    settings: Settings, clock: Clock, blocked_reads: BlockedReads
+) -> None:
+    wait_s = 0.2
+    with (
+        started(settings, clock, read_wait_timeout_s=wait_s) as test_client,
+        ThreadPoolExecutor(max_workers=READ_SLOTS) as pool,
+    ):
+        held = [pool.submit(test_client.get, API) for _ in range(READ_SLOTS)]
+        blocked_reads.wait_started(READ_SLOTS)
+        begin = time.monotonic()
+        # The other routes: every read shares the same slots.
+        busy = test_client.get(f"{API}/{SESSION}")
+        busy_events = test_client.get(f"{API}/{SESSION}/events", params={"limit": 7})
+        elapsed = time.monotonic() - begin
+        blocked_reads.release.set()
+        statuses = [read.result(timeout=PATIENCE_S).status_code for read in held]
+        after = test_client.get(API)
+
+    assert busy.status_code == busy_events.status_code == 503
+    assert busy.json() == busy_events.json() == {"detail": "database busy"}
+    assert busy.headers["content-type"] == "application/json"
+    for body in (busy.text, busy_events.text):
+        assert "Traceback" not in body
+        assert SESSION not in body
+    # Two waits; loose, since Windows timers can fire early.
+    assert wait_s <= elapsed < PATIENCE_S
+    assert statuses == [200] * READ_SLOTS
+    assert after.status_code == 200
 
 
 # Privacy: stored metadata only.

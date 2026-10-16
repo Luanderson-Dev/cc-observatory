@@ -132,6 +132,7 @@ source = { editable = "." }
 [package.optional-dependencies]
 server = [
     { name = "alembic" },
+    { name = "anyio" },
     { name = "fastapi" },
     { name = "httpx" },
     { name = "jinja2" },
@@ -158,6 +159,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "alembic", marker = "extra == 'server'", specifier = ">=1.20.0" },
+    { name = "anyio", marker = "extra == 'server'", specifier = ">=4.15.1" },
     { name = "fastapi", marker = "extra == 'server'", specifier = ">=0.143.2" },
     { name = "httpx", marker = "extra == 'server'", specifier = ">=0.28.1" },
     { name = "jinja2", marker = "extra == 'server'", specifier = ">=3.1.6" },

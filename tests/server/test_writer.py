@@ -101,7 +101,7 @@ def payload(name: str, session_id: str = SESSION, **fields: Any) -> dict[str, An
 
 
 def make_repository(path: Path) -> Repository:
-    engine = create_engine_for(path)
+    engine = create_engine_for(path, role="writer")
     upgrade_to_head(engine)
     return Repository(engine)
 
@@ -205,7 +205,7 @@ class FlakyRepository(Repository):
 
 @pytest.fixture
 def repo(tmp_path: Path) -> Iterator[FlakyRepository]:
-    engine = create_engine_for(tmp_path / "ccobs.db")
+    engine = create_engine_for(tmp_path / "ccobs.db", role="writer")
     upgrade_to_head(engine)
     yield FlakyRepository(engine)
     engine.dispose()
@@ -303,7 +303,7 @@ def http_replay(settings: Settings, lines: Sequence[Line]) -> HookQueue:
 
 @contextmanager
 def database(settings: Settings) -> Iterator[Engine]:
-    engine = create_engine_for(settings.database_path)
+    engine = create_engine_for(settings.database_path, role="writer")
     try:
         yield engine
     finally:
@@ -370,7 +370,8 @@ def test_the_lifespan_stops_the_writer_before_disposing_the_engine(
         started = list(order)
         assert "stop" not in started
 
-    assert order == [*started, "stop", "dispose"]
+    # Both engines, the readers' and the writer's (ADR 0033), once the writer is stopped.
+    assert order == [*started, "stop", "dispose", "dispose"]
 
 
 def test_the_lifespan_uses_an_injected_writer_factory(settings: Settings) -> None:

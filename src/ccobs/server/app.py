@@ -11,7 +11,8 @@ port of its own (this app has no ``/metrics`` route), then the sweeper
 then the reconciler (``ccobs.server.reconcile``, ADR 0029), which closes permission
 blocks denied with Esc from Loki. At shutdown it stops the listener, then the
 reconciler, then the sweeper, then the writer, draining the queue, before it disposes the
-engine.
+engines. There are two (ADR 0033): the writer's, with one connection, and the readers',
+query-only, which the API reads through its read gate (``ccobs.server.reads``).
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ import asyncio
 import logging
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Final, Protocol
 
 import httpx
@@ -45,6 +47,7 @@ from ccobs.server.guards import (
 from ccobs.server.ingest import Clock, DropReason, HookQueue, RawHook, SeqAllocator, wall_clock_ms
 from ccobs.server.metrics import AppMetrics, MetricsListener
 from ccobs.server.migrations import upgrade_to_head
+from ccobs.server.reads import READ_WAIT_TIMEOUT_S, ReadGate
 from ccobs.server.reconcile import POLL_INTERVAL_S, Reconciler, ReconcileTarget
 from ccobs.server.sweeps import RETENTION_INTERVAL_S, TICK_INTERVAL_S, Sweeper, SweepTarget
 from ccobs.server.writer import BlockClosedCallback, Writer, WriterCounts
@@ -158,6 +161,7 @@ def create_app(
     reconcile: bool = True,
     reconcile_interval_s: float | None = None,
     loki_transport: httpx.BaseTransport | None = None,
+    read_wait_timeout_s: float = READ_WAIT_TIMEOUT_S,
 ) -> FastAPI:
     """The app, not started: its lifespan migrates the database, seeds ``seq``, runs the
     writer thread and the metrics listener.
@@ -175,7 +179,10 @@ def create_app(
     0029) polls ``settings.loki_url`` every ``reconcile_interval_s`` (2 s by default)
     while permission blocks are open, with the same clock, through ``loki_transport``
     (httpx's by default; tests pass an ``httpx.MockTransport``); it runs only when both
-    ``reconcile`` and ``settings.telemetry_reconcile`` are true.
+    ``reconcile`` and ``settings.telemetry_reconcile`` are true. The API reads through
+    an engine of its own, query-only, on the same database file, which the app always
+    creates and disposes (ADR 0033); a read that waits ``read_wait_timeout_s`` for a free
+    connection answers 503.
     """
     hook_queue = queue or HookQueue(settings.hook_queue_max_items, settings.hook_queue_max_bytes)
     endpoint = HookEndpoint(
@@ -220,12 +227,19 @@ def create_app(
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         owned = repository is None
         if repository is None:
-            repo = Repository(create_engine_for(settings.database_path))
+            repo = Repository(create_engine_for(settings.database_path, role="writer"))
         else:
             repo = repository
+        reader: Repository | None = None
         try:
             # Before the first request: a failed migration stops the app (ADR 0026).
             upgrade_to_head(repo.engine)
+            # The same file as the writer's engine; upgrade_to_head has checked that it
+            # names one. Its connections open lazily, after the migration.
+            database = Path(str(repo.engine.url.database))
+            reader = Repository(create_engine_for(database, role="reader"))
+            app.state.read_repository = reader
+            app.state.reads = ReadGate(wait_timeout_s=read_wait_timeout_s)
             # WAL is set on every connection (ADR 0005), so one check at start-up holds;
             # read before the writer starts, so nothing that can raise sits between
             # writer.start() and the try block that stops it.
@@ -290,6 +304,11 @@ def create_app(
                 await asyncio.to_thread(writer.stop, WRITER_STOP_TIMEOUT_S)
         finally:
             endpoint.seq = None
+            # A read can outlive its request (uvicorn cancels requests after its grace
+            # period, the read gate does not stop a running read): dispose() leaves a
+            # checked-out connection alone, and it closes when the read returns it.
+            if reader is not None:
+                reader.engine.dispose()
             # After the writer has stopped: it writes until then.
             if owned:
                 repo.engine.dispose()

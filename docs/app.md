@@ -259,8 +259,12 @@ so a hook shows up once the writer commits its batch: normally within tens of
 milliseconds of being received (a batch waits up to 50 ms), and longer only when writes
 are backing off after an error. An unknown or malformed session ID gets a 404 with
 `{"detail": "session not found"}`, and a validation error (422) names the parameter and
-the rule without echoing the value sent. The OpenAPI schema and the interactive docs are
-not served.
+the rule without echoing the value sent. The API reads through query-only connections of
+their own, at most 4 reads at once, so readers never hold up the writer
+([ADR 0033](adr/0033-separate-writer-and-reader-engines-and-capped-reads.md)); a read
+that waits more than 5 s for a free connection gets a 503 with
+`{"detail": "database busy"}`, and can simply be retried. The OpenAPI schema and the
+interactive docs are not served.
 
 ~~~bash
 curl -s 'http://127.0.0.1:4300/api/v1/sessions?status=waiting_user'
