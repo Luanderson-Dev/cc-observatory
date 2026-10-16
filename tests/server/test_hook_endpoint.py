@@ -1,8 +1,9 @@
 """The hook route and its queue (ADRs 0011 and 0027).
 
 ``POST /hooks`` validates the request, stamps it with ``received_at_ms`` and ``seq`` and
-offers the raw body to a bounded queue; the writer (stage 8 of milestone 2) parses and
-persists it. Here a test double consumes the queue. Whatever happens, the route answers
+offers the raw body to a bounded queue; the writer thread parses and persists it
+(tests/server/test_writer.py). Here the app runs with an idle writer and the tests take
+the queue's items themselves. Whatever happens, the route answers
 an empty 204 with no content type: any other answer would show up as a hook error in the
 user's transcript (CLAUDE.md).
 """
@@ -43,6 +44,7 @@ from ccobs.server.ingest import (
     wall_clock_ms,
 )
 from ccobs.server.migrations import HEAD, upgrade_to_head
+from ccobs.server.writer import WriterCounts
 
 KIB: Final = 1024
 MIB: Final = 1024 * KIB
@@ -67,6 +69,29 @@ def settings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Settings:
     return Settings(data_dir=tmp_path / "data", hook_body_max_bytes=BODY_MAX)
 
 
+class IdleWriter:
+    """A writer that never takes from the queue, so the tests can inspect it."""
+
+    def start(self) -> None:
+        pass
+
+    def stop(self, timeout_s: float) -> None:
+        pass
+
+    def counts(self) -> WriterCounts:
+        return WriterCounts(
+            sessions_by_status={},
+            open_blocks_by_kind={},
+            running_agents=0,
+            events_processed=0,
+            sessions_ended=0,
+        )
+
+
+def idle_writer(queue: HookQueue, repository: Repository) -> IdleWriter:
+    return IdleWriter()
+
+
 @pytest.fixture
 def queue(settings: Settings) -> HookQueue:
     return HookQueue(settings.hook_queue_max_items, settings.hook_queue_max_bytes)
@@ -74,7 +99,7 @@ def queue(settings: Settings) -> HookQueue:
 
 @pytest.fixture
 def app(settings: Settings, queue: HookQueue) -> FastAPI:
-    return create_app(settings, queue=queue)
+    return create_app(settings, writer_factory=idle_writer, queue=queue)
 
 
 def start(app: FastAPI) -> TestClient:
@@ -535,7 +560,7 @@ def test_a_client_that_disconnects_mid_body_is_dropped(
 
 def test_a_full_queue_by_count_drops_the_hook(settings: Settings) -> None:
     queue = HookQueue(max_items=2, max_bytes=MIB)
-    with start(create_app(settings, queue=queue)) as client:
+    with start(create_app(settings, writer_factory=idle_writer, queue=queue)) as client:
         responses = [client.post(HOOK_PATH, content=body, headers=JSON) for body in BODIES[:3]]
 
     for response in responses:
@@ -546,7 +571,7 @@ def test_a_full_queue_by_count_drops_the_hook(settings: Settings) -> None:
 
 def test_a_full_queue_by_bytes_drops_the_hook(settings: Settings) -> None:
     queue = HookQueue(max_items=100, max_bytes=100)
-    with start(create_app(settings, queue=queue)) as client:
+    with start(create_app(settings, writer_factory=idle_writer, queue=queue)) as client:
         responses = [client.post(HOOK_PATH, content=b"x" * 60, headers=JSON) for _ in range(2)]
 
     for response in responses:
@@ -565,7 +590,7 @@ def test_a_handler_exception_still_answers_204(
 ) -> None:
     queue = ExplodingQueue(max_items=10, max_bytes=MIB)
     caplog.set_level(logging.DEBUG)
-    with start(create_app(settings, queue=queue)) as client:
+    with start(create_app(settings, writer_factory=idle_writer, queue=queue)) as client:
         response = client.post(HOOK_PATH, content=BODIES[0], headers=JSON)
 
     assert_neutral(response)
@@ -579,7 +604,9 @@ def test_a_failing_clock_still_answers_204(settings: Settings, queue: HookQueue)
     def broken_clock() -> int:
         raise OSError("no clock")
 
-    with start(create_app(settings, queue=queue, clock=broken_clock)) as client:
+    with start(
+        create_app(settings, writer_factory=idle_writer, queue=queue, clock=broken_clock)
+    ) as client:
         assert_neutral(client.post(HOOK_PATH, content=b"{}", headers=JSON))
 
     only_drop(queue, "internal")
@@ -649,7 +676,9 @@ def test_other_routes_with_a_slash_are_not_redirected(client: TestClient) -> Non
 
 def test_received_at_comes_from_the_injected_clock(settings: Settings, queue: HookQueue) -> None:
     ticks = iter([1_800_000_000_123, 1_800_000_000_456])
-    with start(create_app(settings, queue=queue, clock=lambda: next(ticks))) as client:
+    with start(
+        create_app(settings, writer_factory=idle_writer, queue=queue, clock=lambda: next(ticks))
+    ) as client:
         client.post(HOOK_PATH, content=b"{}", headers=JSON)
         client.post(HOOK_PATH, content=b"{}", headers=JSON)
 
@@ -679,7 +708,7 @@ def test_received_at_is_taken_once_the_body_is_in(settings: Settings, queue: Hoo
         unread_at_clock.append(len(messages))
         return 1_800_000_000_000
 
-    app = create_app(settings, queue=queue, clock=clock)
+    app = create_app(settings, writer_factory=idle_writer, queue=queue, clock=clock)
     with start(app):
         status, _, _ = asyncio.run(
             _exchange(app, [(b"content-type", b"application/json")], messages)
@@ -699,7 +728,9 @@ def test_the_clock_is_not_read_for_a_dropped_hook(settings: Settings, queue: Hoo
         reads.append(1)
         return 1
 
-    with start(create_app(settings, queue=queue, clock=clock)) as client:
+    with start(
+        create_app(settings, writer_factory=idle_writer, queue=queue, clock=clock)
+    ) as client:
         client.post(HOOK_PATH, content=b"{}", headers={"content-type": "text/plain"})
 
     assert reads == []
@@ -742,7 +773,7 @@ def _store_event(settings: Settings, seq: int) -> None:
 def test_seq_continues_after_the_stored_max(settings: Settings, queue: HookQueue) -> None:
     _store_event(settings, 41)
 
-    with start(create_app(settings, queue=queue)) as client:
+    with start(create_app(settings, writer_factory=idle_writer, queue=queue)) as client:
         client.post(HOOK_PATH, content=b"{}", headers=JSON)
         client.post(HOOK_PATH, content=b"{}", headers=JSON)
 
@@ -751,14 +782,14 @@ def test_seq_continues_after_the_stored_max(settings: Settings, queue: HookQueue
 
 def test_seq_continues_after_a_restart(settings: Settings) -> None:
     first = HookQueue(max_items=10, max_bytes=MIB)
-    with start(create_app(settings, queue=first)) as client:
+    with start(create_app(settings, writer_factory=idle_writer, queue=first)) as client:
         client.post(HOOK_PATH, content=BODIES[2], headers=JSON)
     (item,) = drain(first)
-    # The writer double persists it, as stage 8's writer will.
+    # The test persists it, as the writer would.
     _store_event(settings, item.seq)
 
     second = HookQueue(max_items=10, max_bytes=MIB)
-    with start(create_app(settings, queue=second)) as client:
+    with start(create_app(settings, writer_factory=idle_writer, queue=second)) as client:
         client.post(HOOK_PATH, content=b"{}", headers=JSON)
 
     assert [hook.seq for hook in drain(second)] == [item.seq + 1]
@@ -768,7 +799,11 @@ def test_an_injected_repository_seeds_seq(settings: Settings, queue: HookQueue) 
     _store_event(settings, 7)
     engine = create_engine_for(settings.database_path)
     try:
-        with start(create_app(settings, repository=Repository(engine), queue=queue)) as client:
+        with start(
+            create_app(
+                settings, writer_factory=idle_writer, repository=Repository(engine), queue=queue
+            )
+        ) as client:
             client.post(HOOK_PATH, content=b"{}", headers=JSON)
         # The caller owns the engine: the app does not dispose it.
         assert Repository(engine).max_seq() == 7
@@ -800,12 +835,14 @@ def test_the_lifespan_migrates_the_database_to_head(settings: Settings) -> None:
 
 
 def test_the_app_exposes_its_queue_and_repository(settings: Settings, queue: HookQueue) -> None:
-    app = create_app(settings, queue=queue)
+    app = create_app(settings, writer_factory=idle_writer, queue=queue)
     assert app.state.queue is queue
 
     with start(app):
         assert isinstance(app.state.repository, Repository)
         assert app.state.repository.max_seq() == 0
+        assert isinstance(app.state.writer, IdleWriter)
+        assert app.state.writer.counts().events_processed == 0
 
 
 def test_the_default_queue_follows_the_settings(settings: Settings) -> None:
@@ -839,7 +876,7 @@ class Timing:
 
 def test_the_hook_route_answers_within_50_ms_at_p99(settings: Settings) -> None:
     queue = HookQueue(max_items=1000, max_bytes=64 * MIB)
-    app = create_app(settings, queue=queue)
+    app = create_app(settings, writer_factory=idle_writer, queue=queue)
     samples: list[float] = []
     app.add_middleware(Timing, samples=samples)
 
@@ -886,7 +923,7 @@ def test_logs_never_hold_a_body_or_a_path(
         }
     ).encode()
     queue = HookQueue(max_items=1, max_bytes=MIB)
-    with start(create_app(settings, queue=queue)) as client:
+    with start(create_app(settings, writer_factory=idle_writer, queue=queue)) as client:
         client.post(HOOK_PATH, content=body, headers=JSON)
         client.post(HOOK_PATH, content=body, headers=JSON)  # full
         client.post(HOOK_PATH, content=body, headers={"content-type": "text/plain"})

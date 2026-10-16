@@ -1,17 +1,20 @@
 """The app's HTTP surface: the app factory, its lifespan and the hook route (ADR 0027).
 
 ``POST /hooks`` validates, stamps and enqueues, then answers an empty 204; it never
-parses the body, which the writer (stage 8 of milestone 2) does in the background, so
-the route stays O(1) and far inside Claude Code's hook timeout. Every request on the
-hook route, whatever happens to it, gets the same neutral 204 (CLAUDE.md, ADR 0011).
+parses the body, which the writer thread (``ccobs.server.writer``) does in the
+background, so the route stays O(1) and far inside Claude Code's hook timeout. Every
+request on the hook route, whatever happens to it, gets the same neutral 204 (CLAUDE.md,
+ADR 0011). The lifespan starts the writer once the database is migrated and stops it,
+draining the queue, before it disposes the engine.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
-from typing import Final
+from typing import Final, Protocol
 
 from fastapi import FastAPI
 from starlette.routing import Route
@@ -32,12 +35,31 @@ from ccobs.server.guards import (
 )
 from ccobs.server.ingest import Clock, DropReason, HookQueue, RawHook, SeqAllocator, wall_clock_ms
 from ccobs.server.migrations import upgrade_to_head
+from ccobs.server.writer import Writer, WriterCounts
 
-__all__ = ["HookEndpoint", "create_app"]
+__all__ = ["BackgroundWriter", "HookEndpoint", "WriterFactory", "create_app"]
 
 _log = logging.getLogger("ccobs.server")
 
 _POST: Final = "POST"
+_MS_PER_S: Final = 1000
+# How long shutdown waits for the writer to drain the queue before it counts the rest
+# as dropped; well inside the 30 s stop_grace_period that compose.yaml gives the app.
+WRITER_STOP_TIMEOUT_S: Final = 5.0
+
+
+class BackgroundWriter(Protocol):
+    """What the app needs of the writer: ``Writer``, or a test double."""
+
+    def start(self) -> None: ...
+
+    def stop(self, timeout_s: float) -> None: ...
+
+    def counts(self) -> WriterCounts: ...
+
+
+# Builds the writer once the database is migrated, from the queue and the repository.
+type WriterFactory = Callable[[HookQueue, Repository], BackgroundWriter]
 
 
 class HookEndpoint:
@@ -106,17 +128,26 @@ def create_app(
     repository: Repository | None = None,
     queue: HookQueue | None = None,
     clock: Clock | None = None,
+    writer_factory: WriterFactory | None = None,
 ) -> FastAPI:
-    """The app, not started: its lifespan migrates the database and seeds ``seq``.
+    """The app, not started: its lifespan migrates the database, seeds ``seq`` and runs
+    the writer thread.
 
     ``repository`` is for tests and later stages that own their engine (the app neither
     creates nor disposes one then); ``queue`` and ``clock`` default to a queue bounded by
-    the settings and the wall clock.
+    the settings and the wall clock; ``writer_factory`` to a ``Writer`` with the
+    settings' host label and stale threshold.
     """
     hook_queue = queue or HookQueue(settings.hook_queue_max_items, settings.hook_queue_max_bytes)
     endpoint = HookEndpoint(
         hook_queue, body_max_bytes=settings.hook_body_max_bytes, clock=clock or wall_clock_ms
     )
+
+    def default_writer(hooks: HookQueue, repo: Repository) -> Writer:
+        stale_after_ms = int(settings.session_stale_after.total_seconds() * _MS_PER_S)
+        return Writer(hooks, repo, settings.host_label, stale_after_ms=stale_after_ms)
+
+    make_writer = writer_factory or default_writer
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -130,9 +161,19 @@ def create_app(
             upgrade_to_head(repo.engine)
             endpoint.seq = SeqAllocator(repo.max_seq() + 1)
             app.state.repository = repo
-            yield
+            writer = make_writer(hook_queue, repo)
+            writer.start()
+            app.state.writer = writer
+            try:
+                yield
+            finally:
+                # No new hook enters the queue while the writer drains it.
+                endpoint.seq = None
+                # Off the event loop: the drain can take up to the timeout.
+                await asyncio.to_thread(writer.stop, WRITER_STOP_TIMEOUT_S)
         finally:
             endpoint.seq = None
+            # After the writer has stopped: it writes until then.
             if owned:
                 repo.engine.dispose()
 
