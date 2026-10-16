@@ -16,6 +16,7 @@ from typing import Final
 import pytest
 from app_support import (
     Samples,
+    detail,
     gauges_in,
     get,
     get_json,
@@ -140,15 +141,34 @@ def test_the_gauges_match_the_api_after_a_replay(
 ) -> None:
     assert replayed
 
+    host = (HOST_LABEL, DEFAULT_HOST)
+    idle = (SESSIONS.name, frozenset({host, ("state", "idle")}))
+    waiting = (SESSIONS.name, frozenset({host, ("state", "waiting_user")}))
+    elicitation = (BLOCKS_OPEN.name, frozenset({host, ("kind", "elicitation")}))
+
     def compare_app() -> tuple[Samples, Samples]:
         return live_gauges(app_url, DEFAULT_HOST), gauges_in(_app_gauges(app_metrics_url), GAUGES)
 
-    expected, listener = poll(compare_app, lambda pair: pair[0] == pair[1], STORED_DEADLINE)
+    def settled(pair: tuple[Samples, Samples]) -> bool:
+        # The API and the listener agree after every committed batch, so wait for the
+        # replay's last batch (the open elicitation) too, not just for agreement.
+        api, gauges = pair
+        return api == gauges and all(api.get(key) for key in (idle, waiting, elicitation))
+
+    # The writer commits in queue order, so once the last session sent (the cut
+    # elicitation) is stored, every earlier hook is too, even on a kept stack.
+    last = poll(
+        lambda: detail(app_url, replayed[-1]),
+        lambda found: found is not None and found.get("status") == "waiting_user",
+        STORED_DEADLINE,
+    )
+    assert last is not None
+    assert last.get("status") == "waiting_user"
+    expected, listener = poll(compare_app, settled, STORED_DEADLINE)
     assert listener == expected, f"listener {_describe(listener)} != API {_describe(expected)}"
-    host = (HOST_LABEL, DEFAULT_HOST)
-    assert expected[(SESSIONS.name, frozenset({host, ("state", "idle")}))]
-    assert expected[(SESSIONS.name, frozenset({host, ("state", "waiting_user")}))]
-    assert expected[(BLOCKS_OPEN.name, frozenset({host, ("kind", "elicitation")}))]
+    assert expected.get(idle), _describe(expected)
+    assert expected.get(waiting), _describe(expected)
+    assert expected.get(elicitation), _describe(expected)
     stored = poll(
         lambda: gauges_in(_prometheus_gauges(prometheus_url), GAUGES),
         lambda found: found == expected,
