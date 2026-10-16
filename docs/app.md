@@ -259,6 +259,23 @@ still being built for v0.4.0; this section lists what is there so far.
   settings for the port you opened it on, ready to save for `claude --settings`.
 - **All sessions** (`GET /sessions`): every stored session as a strip, the latest
   activity first, 50 per page; "Older sessions" pages on with a cursor.
+- **Session** (`GET /sessions/{session_id}`, the link of each strip): a header with the
+  project name, the working directory with your home directory shown as `~`, the state
+  in words, how long the session has waited on you, its last error code, when it
+  started, last had an event and ended (and why), and the full session ID. Below it:
+  - **Blocks**: the ones waiting on you now, then the closed ones, newest first, with
+    how long each waited and how it closed (allowed, denied, answered, closed by later
+    activity, ...);
+  - **Agents**: the subagents as a tree, each under the agent that launched it, newest
+    first, with their type, state and how long they ran;
+  - **Hook timeline**: the session's hook events, newest first, with their metadata only
+    (tool, MCP server, agent, notification type, error code, duration, sizes), never
+    prompts, tool inputs or outputs.
+
+  The page shows every open block and running agent, the latest 50 closed blocks and
+  stopped agents, and the latest 50 hook events; "Show older ..." appends the next 50
+  in place (from `/ui/sessions/{session_id}/blocks`, `.../agents` and `.../events`). An
+  unknown session ID gets a "Session not found" page (404).
 - `GET /ui/board` returns the overview's board alone; live updates, which refetch it
   when a session changes, come in a later stage of v0.4.0. Until then, reload the page.
 - **Times** are elapsed times ticking in the browser; hover one for the moment in your

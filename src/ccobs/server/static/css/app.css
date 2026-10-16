@@ -635,6 +635,380 @@ details[open] > .bay__summary .bay__title::before {
   margin-top: var(--space-5);
 }
 
+/* The session page: the header is a strip, enlarged; the lists below are plain
+   sections separated by space and a heading, not boxed cards. Phone: stacked; desktop:
+   blocks and agents in one column, the hook timeline in the other. */
+
+.back-link {
+  margin: var(--space-2) 0 0;
+  font-size: var(--text-sm);
+}
+
+/* The band's colour and the waiting tint come from the strip--<status> classes, so this
+   rule sets neither: declared later with the same specificity, it would win over them. */
+.session-head {
+  display: grid;
+  gap: var(--space-2);
+  margin-top: var(--space-3);
+  padding: var(--space-4) var(--space-5);
+  border-left-width: var(--band-width);
+  border-left-style: solid;
+  border-radius: var(--radius-strip);
+}
+
+/* The surface: :where() has no specificity, so any strip--<status> background wins. */
+:where(.session-head) {
+  background: var(--strip);
+}
+
+/* The header is not a link: it keeps its colours under the pointer. */
+.session-head.strip--waiting_user:hover {
+  background: color-mix(in srgb, var(--waiting) 9%, var(--strip));
+}
+
+.session-head.strip--stale:hover {
+  background: transparent;
+}
+
+.session-head__title {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-1) var(--space-3);
+}
+
+.session-head__project {
+  margin: 0;
+  font-size: var(--text-2xl);
+  overflow-wrap: anywhere;
+}
+
+.session-head__short {
+  color: var(--ink-muted);
+  font-size: var(--text-sm);
+}
+
+.session-head__path {
+  margin: 0;
+  color: var(--ink-muted);
+  overflow-wrap: anywhere;
+}
+
+.session-head__status {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-1) var(--space-4);
+}
+
+.session-head__state {
+  font-weight: var(--weight-semibold);
+}
+
+.strip--waiting_user .session-head__state {
+  color: var(--waiting-text);
+}
+
+/* The one bold element of the page: how long the session has waited on you. */
+.session-head__wait {
+  color: var(--waiting-text);
+  font-size: var(--text-2xl);
+  font-weight: var(--weight-bold);
+  line-height: 1;
+}
+
+.session-head__error {
+  color: var(--error);
+  font-size: var(--text-sm);
+}
+
+.session-head__facts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1) var(--space-5);
+  margin: var(--space-1) 0 0;
+  font-size: var(--text-sm);
+}
+
+.session-head__facts div,
+.event__details div {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.session-head__facts dt,
+.event__details dt {
+  color: var(--ink-muted);
+}
+
+.session-head__facts dd,
+.event__details dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+/* The full ID: one click selects all of it. */
+.session-head__id {
+  user-select: all;
+}
+
+.session-columns {
+  display: grid;
+  gap: var(--space-6) var(--space-7);
+  margin-top: var(--space-6);
+}
+
+.session-columns__side {
+  display: grid;
+  gap: var(--space-6);
+  align-content: start;
+  min-width: 0;
+}
+
+.session-section {
+  min-width: 0;
+}
+
+.session-section__title {
+  margin-bottom: var(--space-3);
+  font-size: var(--text-lg);
+}
+
+.session-section__subtitle {
+  margin: var(--space-4) 0 var(--space-2);
+  color: var(--ink-muted);
+  font-size: var(--text-base);
+}
+
+.session-section__title + .session-section__subtitle {
+  margin-top: 0;
+}
+
+.session-section__lede,
+.session-section__empty {
+  color: var(--ink-muted);
+}
+
+.session-section__lede {
+  font-size: var(--text-sm);
+}
+
+.blocks,
+.agents,
+.timeline {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+/* Rows: separated by a hairline rule, no boxes. */
+.block,
+.agent,
+.event {
+  border-top: 1px solid color-mix(in srgb, var(--ink-muted) 25%, transparent);
+}
+
+.block {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-1) var(--space-4);
+  padding: var(--space-2) 0;
+}
+
+/* An open block is a small waiting strip: the amber band and its timer. */
+.block--open {
+  margin-bottom: var(--space-1);
+  padding: var(--space-2) var(--space-3);
+  border-top: 0;
+  border-left: var(--band-width) solid var(--waiting);
+  border-radius: var(--radius-strip);
+  background: color-mix(in srgb, var(--waiting) 9%, var(--strip));
+}
+
+.block__what {
+  font-weight: var(--weight-semibold);
+}
+
+.block__elapsed {
+  margin-left: auto;
+}
+
+.block__wait {
+  color: var(--waiting-text);
+  font-size: var(--text-lg);
+  font-weight: var(--weight-bold);
+}
+
+.block__scope,
+.block__waited,
+.block__when {
+  color: var(--ink-muted);
+  font-size: var(--text-sm);
+}
+
+.agents__root {
+  margin: 0 0 var(--space-1);
+  color: var(--ink-muted);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-semibold);
+}
+
+/* The tree: each level indented, with a rule on the left; running agents in blue. */
+.agent {
+  padding: var(--space-2) 0 var(--space-2) var(--space-3);
+  border-left: 2px solid color-mix(in srgb, var(--ink-muted) 35%, transparent);
+}
+
+.agent--running {
+  border-left-color: var(--working);
+}
+
+.agent--depth-2 {
+  margin-left: var(--space-5);
+}
+
+.agent--depth-3 {
+  margin-left: calc(2 * var(--space-5));
+}
+
+.agent--depth-4 {
+  margin-left: calc(3 * var(--space-5));
+}
+
+.agent--depth-5 {
+  margin-left: calc(4 * var(--space-5));
+}
+
+.agent--depth-6 {
+  margin-left: calc(5 * var(--space-5));
+}
+
+.agent__head,
+.agent__body {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-1) var(--space-3);
+}
+
+.agent__type {
+  font-weight: var(--weight-semibold);
+  overflow-wrap: anywhere;
+}
+
+.agent__unknown {
+  color: var(--ink-muted);
+  font-style: italic;
+  font-weight: var(--weight-regular);
+}
+
+.agent__head code,
+.agent__body code,
+.block__scope code {
+  color: var(--ink-muted);
+  font-size: var(--text-sm);
+}
+
+.agent__flag {
+  padding: 0 var(--space-1);
+  border: 1px solid color-mix(in srgb, var(--ink-muted) 50%, transparent);
+  border-radius: var(--radius-strip);
+  color: var(--ink-muted);
+  font-size: var(--text-sm);
+}
+
+.agent__body {
+  color: var(--ink-muted);
+  font-size: var(--text-sm);
+}
+
+.agent__status {
+  color: var(--ink);
+  font-weight: var(--weight-semibold);
+}
+
+.event {
+  display: grid;
+  grid-template-columns: 3.5rem minmax(0, 1fr) auto;
+  grid-template-areas:
+    "seq name when"
+    ". details details";
+  align-items: baseline;
+  gap: 0 var(--space-3);
+  padding: var(--space-2) 0;
+}
+
+.event__seq {
+  grid-area: seq;
+  color: var(--ink-muted);
+  font-size: var(--text-sm);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+.event__name {
+  grid-area: name;
+  font-weight: var(--weight-semibold);
+  overflow-wrap: anywhere;
+}
+
+.event__when {
+  grid-area: when;
+  color: var(--ink-muted);
+  font-size: var(--text-sm);
+  white-space: nowrap;
+}
+
+.event__details {
+  grid-area: details;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0 var(--space-4);
+  margin: var(--space-1) 0 0;
+  font-size: var(--text-sm);
+}
+
+/* The control's box stays empty at the end of a list: the margin is on the button. */
+.more__button {
+  margin-top: var(--space-3);
+  padding: var(--space-1) var(--space-4);
+  border: 1px solid var(--ink-muted);
+  border-radius: var(--radius-strip);
+  background: var(--strip);
+  cursor: pointer;
+}
+
+.more__button:hover {
+  background: color-mix(in srgb, var(--ink) 6%, var(--strip));
+}
+
+.more__button:disabled {
+  cursor: progress;
+  opacity: 0.6;
+}
+
+.not-found h1 {
+  color: var(--error);
+}
+
+.not-found__links {
+  display: flex;
+  gap: var(--space-5);
+  margin-bottom: 0;
+}
+
+/* Desktop: blocks and agents beside the timeline. */
+
+@media (min-width: 64rem) {
+  .session-columns {
+    grid-template-columns: minmax(0, 5fr) minmax(0, 7fr);
+    align-items: start;
+  }
+}
+
 /* Tablet. */
 
 @media (max-width: 48rem) {
@@ -662,5 +1036,42 @@ details[open] > .bay__summary .bay__title::before {
       "head elapsed"
       "body body";
     padding-right: var(--space-3);
+  }
+
+  .session-head {
+    padding: var(--space-3) var(--space-3) var(--space-3) var(--space-4);
+  }
+
+  .session-head__project,
+  .session-head__wait {
+    font-size: var(--text-xl);
+  }
+
+  .agent--depth-2 {
+    margin-left: var(--space-3);
+  }
+
+  .agent--depth-3 {
+    margin-left: calc(2 * var(--space-3));
+  }
+
+  .agent--depth-4 {
+    margin-left: calc(3 * var(--space-3));
+  }
+
+  .agent--depth-5 {
+    margin-left: calc(4 * var(--space-3));
+  }
+
+  .agent--depth-6 {
+    margin-left: calc(5 * var(--space-3));
+  }
+
+  .event {
+    grid-template-columns: 2.5rem minmax(0, 1fr);
+    grid-template-areas:
+      "seq name"
+      ". when"
+      ". details";
   }
 }

@@ -297,6 +297,26 @@ def _contrast(first: str, second: str) -> float:
     return (lighter + 0.05) / (darker + 0.05)
 
 
+def test_the_session_header_takes_its_band_and_tint_from_the_strip_classes() -> None:
+    """``.session-head`` comes after ``.strip--<status>`` with the same specificity: a
+    colour or background in it would hide the state's band (a waiting header in grey)."""
+    css = APP_CSS.read_text(encoding="utf-8")
+    # Every rule for the bare selector, the phone layout's included.
+    heads = _blocks(css, ".session-head")
+    properties = {name for head in heads for name in re.findall(r"(?m)^\s*([a-z-]+)\s*:", head)}
+    assert len(heads) == 2
+    assert {"border-left-width", "border-left-style"} <= properties
+    for forbidden in ("border", "border-left", "border-left-color", "border-color"):
+        assert forbidden not in properties, forbidden
+    assert not any(name.startswith("background") for name in properties)
+    # The base surface has no specificity, so strip--waiting_user's tint wins.
+    (surface,) = _blocks(css, ":where(.session-head)")
+    assert "background" in surface
+    for status in ("waiting_user", "working", "idle", "ended", "stale"):
+        assert any("border-left-color" in band for band in _blocks(css, f".strip--{status}"))
+    assert css.index(".strip--waiting_user {") < css.index(".session-head {")
+
+
 def test_the_stylesheet_has_light_and_dark_colour_tokens() -> None:
     css = APP_CSS.read_text(encoding="utf-8")
     (light,) = _blocks(css, ":root")

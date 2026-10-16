@@ -17,7 +17,9 @@ from ccobs.domain.presentation import (
     bay_of,
     board_sort_key,
     describe_activity,
+    describe_agent_stop,
     describe_block,
+    describe_block_close,
     display_path,
     format_duration,
     is_recent_end,
@@ -493,3 +495,41 @@ def test_describe_activity_before_the_first_prompt(
 )
 def test_describe_activity_words_the_end_reason(end_reason: str | None, expected: str) -> None:
     assert describe_activity("ended", end_reason=end_reason) == expected
+
+
+@pytest.mark.parametrize(
+    ("kind", "reason", "expected"),
+    [
+        ("permission", "tool_completed", "Allowed, the tool ran"),
+        ("permission", "tool_failed", "Allowed, the tool failed"),
+        ("elicitation", "tool_completed", "Answered, the tool ran"),
+        ("elicitation", "tool_failed", "Answered, the tool failed"),
+        ("permission", "denied", "Denied"),
+        ("permission", "superseded", "Closed by later activity"),
+        ("elicitation", "elicitation_accept", "Accepted"),
+        ("elicitation", "elicitation_decline", "Declined"),
+        ("elicitation", "elicitation_cancel", "Cancelled"),
+        ("elicitation", "elicitation_other", "Answered"),
+        ("permission", "agent_stopped", "The subagent stopped"),
+        ("elicitation", "session_ended", "The session ended"),
+        ("permission", "stale", "Closed after hours without events"),
+        ("permission", "something_new", "Closed"),
+        ("elicitation", None, "Closed"),
+    ],
+)
+def test_describe_block_close(kind: BlockKind, reason: str | None, expected: str) -> None:
+    assert describe_block_close(kind, reason) == expected
+
+
+@pytest.mark.parametrize(
+    ("reason", "expected"),
+    [
+        ("stopped", "Stopped"),
+        ("session_ended", "Stopped when the session ended"),
+        ("stale", "Stopped after hours without events"),
+        ("something_new", "Stopped"),
+        (None, "Stopped"),
+    ],
+)
+def test_describe_agent_stop(reason: str | None, expected: str) -> None:
+    assert describe_agent_stop(reason) == expected

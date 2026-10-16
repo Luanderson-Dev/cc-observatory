@@ -1,0 +1,5 @@
+{% from "_session.html" import block_row, more_control %}
+{% for b in blocks %}
+{{ block_row(b) }}
+{% endfor %}
+{{ more_control("blocks-more", more, "#closed-blocks", "Show older blocks", oob=True) }}

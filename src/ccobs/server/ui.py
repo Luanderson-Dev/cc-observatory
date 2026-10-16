@@ -5,6 +5,11 @@
 - ``GET /ui/board``: the board alone, for htmx to refetch (one response shape per URL).
 - ``GET /sessions``: every stored session, the latest activity first, paged by a keyset
   cursor (``?before=<last_event_at_ms>-<session_id>``), never by offset.
+- ``GET /sessions/{session_id}``: one session: its header, its blocks (open ones first,
+  then closed ones newest first), its agents as a tree and its hook timeline, newest
+  first. ``/ui/sessions/{session_id}/blocks``, ``.../agents`` and ``.../events`` return
+  the next page of each list for the "Show older" controls, and ``.../events?after=``
+  the events newer than a cursor, for the timeline's tail (see "Session page").
 - ``/static``: the package's ``static/`` directory.
 
 Each request reads the database once, through the read gate (``ccobs.server.reads``,
@@ -13,6 +18,27 @@ with status 503; nothing from the error reaches it. The templates get view objec
 here, never a session row: ``cwd`` becomes ``presentation.project_name`` first, so the
 full path never reaches the HTML (product decision P2). Jinja2 escapes every value
 (autoescape), and an undefined name fails (``StrictUndefined``).
+
+Session page. Every list pages by the repository's keysets, never by offset, and each
+"Show older" control is an htmx button that appends the next page to its list and
+replaces itself out of band (``hx-swap-oob``) with the control for the page after, or
+with nothing at the end. The detail already holds every open block and running agent,
+so the older pages leave them out: they show only closed blocks and stopped agents, and
+nothing appears twice. Agents are a tree (``ccobs.domain.agent_tree``), newest first
+among siblings, so older agents belong at the bottom; an older page is a tree of its own
+agents, whose launchers may be on another page. The timeline's tail is an element that
+refetches ``events?after=<the newest seq shown>`` on the ``ccobs:changed`` event (live
+updates dispatch it, stage 9) and swaps itself: the response prepends the newer rows to
+the timeline out of band and carries a new tail with the new cursor. A trigger during
+a request replaces it (``hx-sync``), so the last change of a burst is never lost, and
+the rows are the same for the same cursor; a tail more than a page behind triggers
+itself again on ``load`` until it catches up. The first rows of a page that had none
+also delete its empty message, out of band. The fragments' error responses are not
+swapped (htmx 2's default ``responseHandling`` leaves 4xx and 5xx out), so a failed page
+or tail request leaves the page as it was. ``app.js`` drops a row an older page repeats
+(a block open, or an agent running, when the page loaded) and keeps the focus on the
+pager. Only the
+metadata ADR 0023 stores reaches the page, and only through the view objects.
 
 Static cache policy: files under ``static/vendor/`` carry their version in their name
 (``tests/server/test_static.py`` checks htmx's), so a new version is a new URL and they
@@ -30,7 +56,7 @@ import logging
 import mimetypes
 import os
 import re
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -45,6 +71,7 @@ from starlette.responses import Response
 from starlette.staticfiles import StaticFiles
 from starlette.types import Scope
 
+from ccobs.domain.agent_tree import AgentRef, build_agent_tree
 from ccobs.domain.hook_config import HOOK_PATH, hook_settings
 from ccobs.domain.hooks import is_valid_session_id
 from ccobs.domain.presentation import (
@@ -53,15 +80,29 @@ from ccobs.domain.presentation import (
     StripFacts,
     board_sort_key,
     describe_activity,
+    describe_agent_stop,
     describe_block,
+    describe_block_close,
+    display_path,
     format_duration,
     project_name,
 )
-from ccobs.server.db.repository import BoardRows, Repository, StripRow
+from ccobs.domain.sessions import Agent, Block
+from ccobs.server.db.repository import (
+    AgentPage,
+    BoardRows,
+    HookEventRow,
+    Repository,
+    SessionDetail,
+    StripRow,
+)
 from ccobs.server.reads import ReadGate
 
 __all__ = [
+    "AGENTS_PAGE_SIZE",
+    "BLOCKS_PAGE_SIZE",
     "CLOSED_BAY_LIMIT",
+    "EVENTS_PAGE_SIZE",
     "IMMUTABLE",
     "REVALIDATE",
     "SESSIONS_PAGE_SIZE",
@@ -83,10 +124,20 @@ REVALIDATE: Final = "no-cache"
 # How many strips each closed bay (ended, stale) shows; the rest are on All sessions.
 CLOSED_BAY_LIMIT: Final = 20
 SESSIONS_PAGE_SIZE: Final = 50
+# The session page's lists: how many rows each "Show older" page adds, and how many
+# events the page starts with.
+BLOCKS_PAGE_SIZE: Final = 50
+AGENTS_PAGE_SIZE: Final = 50
+EVENTS_PAGE_SIZE: Final = 50
+# An agent tree deeper than this is drawn at this depth (the CSS has a class per depth).
+_MAX_DEPTH: Final = 6
+_SEQ: Final = re.compile(r"[0-9]{1,19}")
+_NOT_FOUND: Final = 404
 # The largest last_event_at_ms a cursor may hold: SQLite's signed 64-bit integers.
 _MAX_CURSOR: Final = 2**63 - 1
 _CURSOR: Final = re.compile(r"(?P<ms>[0-9]{1,19})-(?P<session_id>.+)", re.DOTALL)
 _SHORT_ID: Final = 8
+_SECOND_MS: Final = 1000
 _SERVICE_UNAVAILABLE: Final = 503
 _BAD_REQUEST: Final = 400
 
@@ -183,6 +234,15 @@ _BROKEN: Final = ErrorView(
 _BAD_CURSOR: Final = ErrorView(
     title="This page link is not valid",
     detail="Start again from the newest sessions.",
+)
+_BAD_LINK: Final = ErrorView(
+    title="This page link is not valid",
+    detail="Reload the session page.",
+)
+_NO_SESSION: Final = ErrorView(
+    title="Session not found",
+    detail="No stored session has this ID. Retention may have deleted it, or the link "
+    "is incomplete.",
 )
 
 
@@ -453,6 +513,490 @@ def _sessions_page(
 def _next_href(shown: Sequence[StripRow]) -> str:
     last = shown[-1].session
     return "/sessions?" + urlencode({"before": f"{last.last_event_at_ms}-{last.session_id}"})
+
+
+# The session page.
+
+
+@dataclass(frozen=True, kw_only=True)
+class SessionHead:
+    session_id: str
+    short_id: str
+    status: str
+    state_label: str
+    project: str | None
+    path: str | None
+    doing: str | None
+    error_code: str | None
+    waiting: Moment | None
+    started: Moment
+    last_event: Moment
+    ended: Moment | None
+
+
+@dataclass(frozen=True, kw_only=True)
+class BlockView:
+    block_id: int
+    is_open: bool
+    what: str
+    scope: str | None
+    opened: Moment
+    waited: str | None
+    closed: Moment | None
+    close: str | None
+
+
+@dataclass(frozen=True, kw_only=True)
+class AgentView:
+    agent_id: str
+    short_id: str
+    agent_type: str | None
+    depth: int
+    launched_by: str | None
+    running: bool
+    status_text: str
+    internal: bool
+    background: bool
+    started: Moment | None
+    stopped: Moment | None
+    ran: str | None
+
+
+@dataclass(frozen=True, kw_only=True)
+class Detail:
+    """One field of a timeline row: a label, a value and whether the value is an
+    identifier (shown in mono)."""
+
+    label: str
+    value: str
+    mono: bool = False
+
+
+@dataclass(frozen=True, kw_only=True)
+class EventView:
+    seq: int
+    name: str
+    at: Moment
+    details: list[Detail]
+
+
+@dataclass(frozen=True, kw_only=True)
+class More:
+    """A "Show older" control: the URL of the next page, or ``None`` at the end."""
+
+    href: str | None
+
+
+@dataclass(frozen=True, kw_only=True)
+class Tail:
+    """The timeline's tail: the URL of the events after the newest one shown, and
+    whether to fetch it at once (more than a page was new)."""
+
+    href: str
+    now: bool
+
+
+@dataclass(frozen=True, kw_only=True)
+class SessionRead:
+    detail: SessionDetail
+    # Newest first, one more than a page when an older page exists.
+    events: list[HookEventRow]
+
+
+def _session_href(session_id: str, suffix: str, **query: object) -> str:
+    return (
+        "/ui/sessions/"
+        + quote(session_id, safe="")
+        + "/"
+        + suffix
+        + "?"
+        + urlencode({key: str(value) for key, value in query.items()})
+    )
+
+
+def _session_head(detail: SessionDetail, now_ms: int) -> SessionHead:
+    session = detail.session
+    waiting = None
+    if session.status == "waiting_user":
+        open_blocks = [block for block in detail.blocks if block.closed_at_ms is None]
+        oldest = min(open_blocks, key=lambda block: block.opened_at_ms, default=None)
+        doing = (
+            None
+            if oldest is None
+            else describe_block(oldest.kind, oldest.tool_name, oldest.mcp_server_name)
+        )
+        since = session.last_event_at_ms if oldest is None else oldest.opened_at_ms
+        waiting = _moment(since, now_ms)
+    else:
+        running = sum(
+            1 for agent in detail.agents if agent.status == "running" and not agent.internal
+        )
+        doing = describe_activity(
+            session.status,
+            compacting=session.compacting,
+            running_subagents=running,
+            idle_notified=session.idle_notified_at_ms is not None,
+            prompted=session.last_prompt_id is not None,
+            end_reason=session.end_reason,
+        )
+    state_label = _STATE_LABELS[session.status]
+    ended = session.ended_at_ms
+    return SessionHead(
+        session_id=session.session_id,
+        short_id=session.session_id[:_SHORT_ID],
+        status=session.status,
+        state_label=state_label,
+        project=project_name(session.cwd),
+        path=display_path(session.cwd),
+        # Ended for no known reason: "Ended" once, not twice.
+        doing=None if doing == state_label else doing,
+        error_code=session.last_error_code,
+        waiting=waiting,
+        started=_moment(session.started_at_ms, now_ms),
+        last_event=_moment(session.last_event_at_ms, now_ms),
+        ended=None if ended is None else _moment(ended, now_ms),
+    )
+
+
+def _block_view(block: Block, now_ms: int) -> BlockView:
+    closed_at = block.closed_at_ms
+    return BlockView(
+        block_id=block.block_id,
+        is_open=closed_at is None,
+        what=describe_block(block.kind, block.tool_name, block.mcp_server_name),
+        scope=None if block.scope is None else block.scope[:_SHORT_ID],
+        opened=_moment(block.opened_at_ms, now_ms),
+        waited=None if closed_at is None else format_duration(closed_at - block.opened_at_ms),
+        closed=None if closed_at is None else _moment(closed_at, now_ms),
+        close=None if closed_at is None else describe_block_close(block.kind, block.close_reason),
+    )
+
+
+def _agent_views(
+    agents: Sequence[Agent], parents: Mapping[str, str | None], now_ms: int
+) -> list[AgentView]:
+    """The agents as a tree, in pre-order: newest first among siblings (``agents`` is in
+    first-seen order), each subagent right under the agent that launched it. The tree
+    gives only the depth: "Launched by" is the stored parent, which may be on another
+    page (or cut from a cycle) while the agent hangs from the main thread."""
+    by_id = {agent.agent_id: agent for agent in agents}
+    tree = build_agent_tree(
+        AgentRef(
+            agent_id=agent.agent_id,
+            parent_agent_id=parents.get(agent.agent_id),
+            order=-position,
+        )
+        for position, agent in enumerate(agents)
+    )
+    views = []
+    for node in tree.rows:
+        # Every row of the tree comes from an agent: only the root has no ID.
+        agent = by_id[str(node.agent_id)]
+        started, stopped = agent.started_at_ms, agent.stopped_at_ms
+        running = agent.status == "running"
+        parent = parents.get(agent.agent_id)
+        views.append(
+            AgentView(
+                agent_id=agent.agent_id,
+                short_id=agent.agent_id[:_SHORT_ID],
+                agent_type=agent.agent_type,
+                depth=min(node.depth, _MAX_DEPTH),
+                launched_by=(
+                    None if parent is None or parent == agent.agent_id else parent[:_SHORT_ID]
+                ),
+                running=running,
+                status_text="Running" if running else describe_agent_stop(agent.stop_reason),
+                internal=agent.internal,
+                background=agent.background,
+                started=None if started is None else _moment(started, now_ms),
+                stopped=None if stopped is None else _moment(stopped, now_ms),
+                ran=(
+                    None
+                    if started is None or stopped is None
+                    else format_duration(stopped - started)
+                ),
+            )
+        )
+    return views
+
+
+def _took(duration_ms: int) -> str:
+    """A tool call's duration: milliseconds under a second, else ``format_duration``."""
+    return f"{duration_ms} ms" if duration_ms < _SECOND_MS else format_duration(duration_ms)
+
+
+def _count(value: int | None, unit: str) -> str | None:
+    return None if value is None else f"{value} {unit}"
+
+
+def _event_details(row: HookEventRow) -> list[Detail]:
+    """The fields of a timeline row: stored metadata only (ADR 0023), never content.
+    IDs other than the agent's (prompt, tool use, elicitation) are left out: they only
+    link rows to each other."""
+    fields: list[tuple[str, str | None, bool]] = [
+        ("Tool", row.tool_name, True),
+        ("MCP server", row.mcp_server_name, True),
+        ("Agent", None if row.agent_id is None else row.agent_id[:_SHORT_ID], True),
+        ("Agent type", row.agent_type, False),
+        ("Notification", row.notification_type, True),
+        ("Source", row.start_source, False),
+        ("Trigger", row.compact_trigger, False),
+        ("Reason", row.end_reason, False),
+        ("Action", row.elicitation_action, False),
+        ("Status", row.tool_response_status, False),
+        ("Error", row.error_code, True),
+        ("Took", None if row.duration_ms is None else _took(row.duration_ms), False),
+        ("Outcome", "Interrupted" if row.is_interrupt else None, False),
+        ("Prompt", _count(row.prompt_length, "characters"), False),
+        ("Input", _count(row.tool_input_bytes, "bytes"), False),
+        ("Output", _count(row.tool_response_bytes, "bytes"), False),
+    ]
+    return [
+        Detail(label=label, value=value, mono=mono)
+        for label, value, mono in fields
+        if value is not None
+    ]
+
+
+def _event_view(row: HookEventRow, now_ms: int) -> EventView:
+    return EventView(
+        seq=row.seq,
+        name=row.hook_event_name,
+        at=_moment(row.received_at_ms, now_ms),
+        details=_event_details(row),
+    )
+
+
+def _tail(session_id: str, after: int, *, now: bool) -> Tail:
+    return Tail(href=_session_href(session_id, "events", after=after), now=now)
+
+
+def _session_read(repository: Repository, session_id: str, limit: int) -> SessionRead | None:
+    detail = repository.get_session(session_id)
+    if detail is None:
+        return None
+    events = repository.list_events(session_id, limit)
+    return SessionRead(detail=detail, events=events[::-1])
+
+
+def _not_found_page() -> HTMLResponse:
+    return _render("not_found.html", status_code=_NOT_FOUND, nav=None, error=_NO_SESSION)
+
+
+@router.get("/sessions/{session_id}", response_class=HTMLResponse)
+async def session_page(
+    request: Request, repository: _Repo, reads: _Reads, session_id: str
+) -> Response:
+    """One session: its header, blocks, agents and hook timeline."""
+    if not is_valid_session_id(session_id):
+        return _not_found_page()
+    now_ms = _now_ms(request)
+    found = await _read(reads, _session_read, repository, session_id, EVENTS_PAGE_SIZE + 1)
+    if isinstance(found, ErrorView):
+        return _render("session.html", status_code=_SERVICE_UNAVAILABLE, nav=None, error=found)
+    if found is None:
+        return _not_found_page()
+    detail = found.detail
+    blocks = [_block_view(block, now_ms) for block in detail.blocks]
+    # Closed ones newest first: the detail lists blocks in block_id order.
+    closed_blocks = [block for block in reversed(blocks) if not block.is_open]
+    blocks_next = None
+    if detail.blocks_total > len(detail.blocks) and closed_blocks:
+        blocks_next = _session_href(session_id, "blocks", before=closed_blocks[-1].block_id)
+    stopped = [agent for agent in detail.agents if agent.status != "running"]
+    agents_next = None
+    if detail.agents_total > len(detail.agents) and stopped:
+        # The oldest stopped agent shown: every running one is on this page already.
+        agents_next = _session_href(session_id, "agents", before=stopped[0].agent_id)
+    events = found.events[:EVENTS_PAGE_SIZE]
+    events_next = None
+    if len(found.events) > EVENTS_PAGE_SIZE:
+        events_next = _session_href(session_id, "events", before=events[-1].seq)
+    return _render(
+        "session.html",
+        nav=None,
+        error=None,
+        head=_session_head(detail, now_ms),
+        open_blocks=[block for block in blocks if block.is_open],
+        closed_blocks=closed_blocks,
+        blocks_total=detail.blocks_total,
+        blocks_more=More(href=blocks_next),
+        agents=_agent_views(detail.agents, detail.parents, now_ms),
+        agents_total=detail.agents_total,
+        agents_more=More(href=agents_next),
+        events=[_event_view(row, now_ms) for row in events],
+        events_more=More(href=events_next),
+        tail=_tail(session_id, events[0].seq if events else 0, now=False),
+    )
+
+
+# The session page's fragments. Each reads once, through one call on the gate; None
+# means the session is unknown. Their error responses (400, 404, 503) are fragments too,
+# but htmx 2's default responseHandling does not swap a 4xx or 5xx response: the "Show
+# older" button or the tail stays as it was, and a later click or change retries.
+
+
+def _parse_seq(value: str | None) -> int | None:
+    if value is None or _SEQ.fullmatch(value) is None:
+        return None
+    number = int(value)
+    return number if number <= _MAX_CURSOR else None
+
+
+def _fragment_error(error: ErrorView, status_code: int) -> HTMLResponse:
+    return _render("_error.html", status_code=status_code, error=error)
+
+
+def _blocks_read(
+    repository: Repository, session_id: str, limit: int, before: int
+) -> list[Block] | None:
+    if not repository.session_exists(session_id):
+        return None
+    return repository.list_blocks(session_id, limit, before)
+
+
+@router.get("/ui/sessions/{session_id}/blocks", response_class=HTMLResponse)
+async def blocks_fragment(
+    request: Request,
+    repository: _Repo,
+    reads: _Reads,
+    session_id: str,
+    before: str | None = None,
+) -> Response:
+    """The closed blocks just older than block ``before``, newest first, and the next
+    "Show older blocks" control, out of band."""
+    if not is_valid_session_id(session_id):
+        return _fragment_error(_NO_SESSION, _NOT_FOUND)
+    cursor = _parse_seq(before)
+    if cursor is None:
+        return _fragment_error(_BAD_LINK, _BAD_REQUEST)
+    now_ms = _now_ms(request)
+    found = await _read(reads, _blocks_read, repository, session_id, BLOCKS_PAGE_SIZE + 1, cursor)
+    if isinstance(found, ErrorView):
+        return _fragment_error(found, _SERVICE_UNAVAILABLE)
+    if found is None:
+        return _fragment_error(_NO_SESSION, _NOT_FOUND)
+    # Oldest first, one more than a page when an older page exists.
+    page = found[-BLOCKS_PAGE_SIZE:]
+    next_href = None
+    if len(found) > BLOCKS_PAGE_SIZE:
+        next_href = _session_href(session_id, "blocks", before=page[0].block_id)
+    # Open blocks are on the session page already, all of them.
+    rows = [
+        _block_view(block, now_ms) for block in reversed(page) if block.closed_at_ms is not None
+    ]
+    return _render("_blocks_page.html", blocks=rows, more=More(href=next_href))
+
+
+class _UnknownAgent:
+    """An agent cursor that names no agent of the session."""
+
+
+_UNKNOWN_AGENT: Final = _UnknownAgent()
+
+
+def _agents_read(
+    repository: Repository, session_id: str, limit: int, before: str
+) -> AgentPage | _UnknownAgent | None:
+    if not repository.session_exists(session_id):
+        return None
+    page = repository.list_agents(session_id, limit, before)
+    return _UNKNOWN_AGENT if page is None else page
+
+
+@router.get("/ui/sessions/{session_id}/agents", response_class=HTMLResponse)
+async def agents_fragment(
+    request: Request,
+    repository: _Repo,
+    reads: _Reads,
+    session_id: str,
+    before: str | None = None,
+) -> Response:
+    """The stopped agents first seen just before agent ``before``, as a tree, and the
+    next "Show older agents" control, out of band."""
+    if not is_valid_session_id(session_id):
+        return _fragment_error(_NO_SESSION, _NOT_FOUND)
+    if before is None or not is_valid_session_id(before):
+        return _fragment_error(_BAD_LINK, _BAD_REQUEST)
+    now_ms = _now_ms(request)
+    found = await _read(reads, _agents_read, repository, session_id, AGENTS_PAGE_SIZE + 1, before)
+    if isinstance(found, ErrorView):
+        return _fragment_error(found, _SERVICE_UNAVAILABLE)
+    if isinstance(found, _UnknownAgent):
+        return _fragment_error(_BAD_LINK, _BAD_REQUEST)
+    if found is None:
+        return _fragment_error(_NO_SESSION, _NOT_FOUND)
+    # Oldest first, one more than a page when an older page exists.
+    page = found.agents[-AGENTS_PAGE_SIZE:]
+    next_href = None
+    if len(found.agents) > AGENTS_PAGE_SIZE:
+        next_href = _session_href(session_id, "agents", before=page[0].agent_id)
+    # Running agents are on the session page already, all of them.
+    stopped = [agent for agent in page if agent.status != "running"]
+    return _render(
+        "_agents_page.html",
+        agents=_agent_views(stopped, found.parents, now_ms),
+        more=More(href=next_href),
+    )
+
+
+def _events_read(
+    repository: Repository,
+    session_id: str,
+    limit: int,
+    before: int | None,
+    after: int | None,
+) -> list[HookEventRow] | None:
+    if not repository.session_exists(session_id):
+        return None
+    return repository.list_events(session_id, limit, before_seq=before, after_seq=after)
+
+
+@router.get("/ui/sessions/{session_id}/events", response_class=HTMLResponse)
+async def events_fragment(
+    request: Request,
+    repository: _Repo,
+    reads: _Reads,
+    session_id: str,
+    before: str | None = None,
+    after: str | None = None,
+) -> Response:
+    """With ``before``: the events just older than it, newest first, and the next "Show
+    older events" control, out of band. With ``after``: the events newer than it, to
+    prepend to the timeline out of band, and a new tail. One of the two, never both."""
+    if not is_valid_session_id(session_id):
+        return _fragment_error(_NO_SESSION, _NOT_FOUND)
+    older, newer = _parse_seq(before), _parse_seq(after)
+    if (before is None) == (after is None) or (older is None and newer is None):
+        return _fragment_error(_BAD_LINK, _BAD_REQUEST)
+    now_ms = _now_ms(request)
+    found = await _read(
+        reads, _events_read, repository, session_id, EVENTS_PAGE_SIZE + 1, older, newer
+    )
+    if isinstance(found, ErrorView):
+        return _fragment_error(found, _SERVICE_UNAVAILABLE)
+    if found is None:
+        return _fragment_error(_NO_SESSION, _NOT_FOUND)
+    if newer is not None:
+        # Oldest first from the cursor: the page is the next EVENTS_PAGE_SIZE events.
+        page = found[:EVENTS_PAGE_SIZE]
+        cursor = page[-1].seq if page else newer
+        return _render(
+            "_events_tail.html",
+            events=[_event_view(row, now_ms) for row in reversed(page)],
+            tail=_tail(session_id, cursor, now=len(found) > EVENTS_PAGE_SIZE),
+            # A tail from 0 belongs to a page that showed no event, and its empty message.
+            first=newer == 0,
+        )
+    page = found[-EVENTS_PAGE_SIZE:]
+    next_href = None
+    if len(found) > EVENTS_PAGE_SIZE:
+        next_href = _session_href(session_id, "events", before=page[0].seq)
+    return _render(
+        "_events_page.html",
+        events=[_event_view(row, now_ms) for row in reversed(page)],
+        more=More(href=next_href),
+    )
 
 
 # Static files.

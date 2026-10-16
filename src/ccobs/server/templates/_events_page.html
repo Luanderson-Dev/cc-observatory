@@ -1,0 +1,5 @@
+{% from "_session.html" import event_row, more_control %}
+{% for e in events %}
+{{ event_row(e) }}
+{% endfor %}
+{{ more_control("events-more", more, "#timeline", "Show older events", oob=True) }}

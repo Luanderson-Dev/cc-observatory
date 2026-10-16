@@ -60,7 +60,9 @@ __all__ = [
     "bay_of",
     "board_sort_key",
     "describe_activity",
+    "describe_agent_stop",
     "describe_block",
+    "describe_block_close",
     "display_path",
     "format_duration",
     "is_recent_end",
@@ -279,3 +281,43 @@ def describe_activity(
     if not prompted:
         return "Ready"
     return "Waiting for your next prompt" if idle_notified else "Turn finished"
+
+
+# How a block closed (ADR 0024's close reasons, a bounded set); an unknown one reads as
+# "Closed". The tool outcomes depend on the kind: a permission was allowed, an MCP
+# server's question was answered, and then the tool ran or failed.
+_CLOSE_WORDING: Final = {
+    "denied": "Denied",
+    "superseded": "Closed by later activity",
+    "elicitation_accept": "Accepted",
+    "elicitation_decline": "Declined",
+    "elicitation_cancel": "Cancelled",
+    "elicitation_other": "Answered",
+    "agent_stopped": "The subagent stopped",
+    "session_ended": "The session ended",
+    "stale": "Closed after hours without events",
+}
+_TOOL_OUTCOMES: Final = {"tool_completed": "the tool ran", "tool_failed": "the tool failed"}
+_GRANTED: Final[dict[BlockKind, str]] = {"permission": "Allowed", "elicitation": "Answered"}
+
+
+def describe_block_close(kind: BlockKind, reason: str | None) -> str:
+    """How a closed block ended, such as ``Denied`` or ``Allowed, the tool ran``, from
+    its ``kind`` and ``close_reason``."""
+    outcome = _TOOL_OUTCOMES.get(reason or "")
+    if outcome is not None:
+        return f"{_GRANTED[kind]}, {outcome}"
+    return _CLOSE_WORDING.get(reason or "", "Closed")
+
+
+# Why an agent stopped (``AgentStopReason``); an unknown one reads as "Stopped".
+_STOP_WORDING: Final = {
+    "stopped": "Stopped",
+    "session_ended": "Stopped when the session ended",
+    "stale": "Stopped after hours without events",
+}
+
+
+def describe_agent_stop(reason: str | None) -> str:
+    """How a stopped agent ended, from its ``stop_reason``."""
+    return _STOP_WORDING.get(reason or "", "Stopped")

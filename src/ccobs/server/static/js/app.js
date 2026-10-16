@@ -8,6 +8,10 @@
  * - The theme toggle (system, light, dark), stored in localStorage; theme.js applies it
  *   before the first paint.
  * - The copy button of the hook settings.
+ * - After a "Show older" page lands: drops the rows already on the page (a block that
+ *   was open, or an agent that was running, when the page loaded may come again in an
+ *   older page), and moves the focus that the replaced button held to the new button,
+ *   or to the first new row at the end of the list.
  *
  * Everything runs again after htmx swaps a fragment in.
  */
@@ -153,6 +157,88 @@
     };
   }
 
+  // Rows that stand for one block or agent; a second one of the same ID is a repeat.
+  var ROW_KEYS = ["data-block-id", "data-agent-id"];
+
+  // Removes from the rows of list from index firstNew on those whose ID is already on
+  // the page, outside them, and returns the rows that remain.
+  function dropRepeats(root, list, firstNew) {
+    var fresh = Array.prototype.slice.call(list.children, firstNew);
+    for (var k = 0; k < ROW_KEYS.length; k += 1) {
+      var key = ROW_KEYS[k];
+      var seen = Object.create(null);
+      var all = root.querySelectorAll("[" + key + "]");
+      for (var index = 0; index < all.length; index += 1) {
+        if (fresh.indexOf(all[index]) === -1) {
+          seen[all[index].getAttribute(key)] = true;
+        }
+      }
+      fresh = fresh.filter(function (row) {
+        if (row.hasAttribute(key) && seen[row.getAttribute(key)] === true) {
+          list.removeChild(row);
+          return false;
+        }
+        return true;
+      });
+    }
+    return fresh;
+  }
+
+  window.ccobsDropRepeats = dropRepeats;
+
+  // The "Show older" swap in progress: its list, how many rows it had, the control it
+  // replaces and whether that control's button had the focus.
+  var pending = null;
+  // The "Show older" button that had the focus when it was pressed: read before htmx
+  // disables it for the request, which may move the focus to the body.
+  var pressed = null;
+
+  function isPager(element) {
+    return Boolean(element && element.classList && element.classList.contains("more__button"));
+  }
+
+  function pagerRequest(event) {
+    var button = event.detail.elt;
+    if (isPager(button)) {
+      pressed = document.activeElement === button ? button : null;
+    }
+  }
+
+  function beforePager(event) {
+    var button = event.detail.requestConfig && event.detail.requestConfig.elt;
+    // An error response is not swapped (htmx's default): nothing to follow up.
+    if (!isPager(button) || !event.detail.shouldSwap) {
+      return;
+    }
+    pending = {
+      list: event.detail.target,
+      count: event.detail.target.children.length,
+      control: button.parentNode.id,
+      focused: pressed === button,
+    };
+    pressed = null;
+  }
+
+  function afterPager() {
+    if (!pending) {
+      return;
+    }
+    var done = pending;
+    pending = null;
+    var fresh = dropRepeats(document, done.list, done.count);
+    if (!done.focused) {
+      return;
+    }
+    var control = document.getElementById(done.control);
+    var next = control && control.querySelector("button");
+    if (next) {
+      next.focus();
+    } else if (fresh.length) {
+      fresh[0].setAttribute("tabindex", "-1");
+      fresh[0].focus();
+    }
+  }
+
   function refresh() {
     tick();
     localTimes();
@@ -169,6 +255,9 @@
       }
     }, TICK_MS);
     document.body.addEventListener("htmx:afterSwap", refresh);
+    document.body.addEventListener("htmx:beforeRequest", pagerRequest);
+    document.body.addEventListener("htmx:beforeSwap", beforePager);
+    document.body.addEventListener("htmx:afterSettle", afterPager);
   }
 
   if (document.readyState === "loading") {

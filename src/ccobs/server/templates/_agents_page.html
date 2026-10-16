@@ -1,0 +1,5 @@
+{% from "_session.html" import agent_row, more_control %}
+{% for a in agents %}
+{{ agent_row(a) }}
+{% endfor %}
+{{ more_control("agents-more", more, "#agents", "Show older agents", oob=True) }}
