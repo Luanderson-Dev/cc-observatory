@@ -374,3 +374,16 @@ def loki_url(stack: Stack) -> str:
 def tempo_url(stack: Stack) -> str:
     """Base URL of Tempo's HTTP API, published by the debug override."""
     return stack.url("CCOBS_TEMPO_PORT")
+
+
+@pytest.fixture(scope="session")
+def app_url(stack: Stack) -> str:
+    """Base URL of the app: its hook route, API and /healthz. ``http.client`` sends
+    ``Host: 127.0.0.1:<port>``, which the app's allowlist accepts (ADR 0027)."""
+    return stack.url("CCOBS_APP_PORT")
+
+
+@pytest.fixture(scope="session")
+def app_metrics_url(stack: Stack) -> str:
+    """Base URL of the app's metrics listener, published by the debug override."""
+    return stack.url("CCOBS_APP_METRICS_PORT")

@@ -15,6 +15,13 @@ that states the rule for every service, each read from the running service:
 - Prometheus: no remote write or read, no Alertmanager and no service discovery; it
   scrapes only itself and services of the stack.
 - The collector: its only exporters are the stack's three backends.
+- The app: it calls only Loki (ADR 0029). A snapshot of its sockets, read from
+  ``/proc/net`` inside its container (after the app tests when the whole suite runs,
+  since test_app_*.py sort first), must listen only on its two ports, and every other
+  socket must be an answer on those ports, a loopback one (the healthcheck, Docker's
+  DNS) or a connection to Loki's port on one of Loki's addresses. A snapshot only sees
+  the sockets open at that moment, and may hold no connection to Loki at all, so it
+  does not require one.
 - Networks: the backend network is internal, so Docker drops its traffic to any other
   network. That Prometheus, Loki and Tempo join only backend is checked on compose.yaml
   by tests/test_compose.py; this project also runs compose.debug.yaml, which attaches
@@ -29,6 +36,7 @@ tools/stack/compose.egress-sink.yaml.
 from __future__ import annotations
 
 import http.client
+import ipaddress
 import json
 import re
 import subprocess
@@ -140,6 +148,24 @@ BACKEND_EXPORTERS: Final = frozenset({"otlp_http/loki", "otlp_http/prometheus", 
 STORAGE_SERVICES: Final = frozenset({"prometheus", "loki", "tempo"})
 # A container Compose names <project>-<service>-<number>.
 CONTAINER_NAME: Final = re.compile(rf"^{re.escape(PROJECT)}-(?P<service>.+)-\d+$")
+# The app: its own ports inside the container (ADRs 0027 and 0028), Loki's, and the
+# script that prints its sockets as JSON lists of [table, local, remote, state], the
+# fields of /proc/net/{tcp,tcp6,udp,udp6}.
+APP: Final = "app"
+APP_PORTS: Final = frozenset({4300, 9464})
+LOKI_SERVICE: Final = "loki"
+LOKI_PORT: Final = 3100
+LISTEN: Final = "0A"
+SOCKETS_SCRIPT: Final = (
+    "import json\n"
+    "rows = []\n"
+    "for table in ('tcp', 'tcp6', 'udp', 'udp6'):\n"
+    "    with open('/proc/net/' + table) as file:\n"
+    "        for line in file.readlines()[1:]:\n"
+    "            fields = line.split()\n"
+    "            rows.append([table, fields[1], fields[2], fields[3]])\n"
+    "print(json.dumps(rows))\n"
+)
 
 
 @dataclass(frozen=True)
@@ -412,6 +438,87 @@ def test_collector_exports_only_to_the_stacks_backends(prometheus_url: str) -> N
         SCRAPE_DEADLINE,
     )
     assert exporters == BACKEND_EXPORTERS
+
+
+# The app.
+
+type Address = tuple[ipaddress.IPv4Address | ipaddress.IPv6Address, int]
+
+
+def _address(text: str) -> Address:
+    """A /proc/net address, ``<hex IP>:<hex port>``: an IPv4 address is one 32-bit word
+    and an IPv6 address four, each in the kernel's byte order (little-endian on the
+    amd64 and arm64 that Docker runs). An IPv4-mapped IPv6 address becomes IPv4."""
+    host, port = text.split(":")
+    raw = bytes.fromhex(host)
+    swapped = b"".join(raw[index : index + 4][::-1] for index in range(0, len(raw), 4))
+    address: ipaddress.IPv4Address | ipaddress.IPv6Address = ipaddress.ip_address(swapped)
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+        address = address.ipv4_mapped
+    return address, int(port, 16)
+
+
+def test_proc_net_addresses_are_read_in_kernel_byte_order() -> None:
+    # From the app's own /proc/net/tcp and tcp6 (172.20.0.5:57574 to 172.20.0.6:3100).
+    assert _address("050014AC:E0E6") == (ipaddress.ip_address("172.20.0.5"), 0xE0E6)
+    assert _address("060014AC:0C1C") == (ipaddress.ip_address("172.20.0.6"), LOKI_PORT)
+    assert _address("0000000000000000FFFF0000060014AC:0C1C") == (
+        ipaddress.ip_address("172.20.0.6"),
+        LOKI_PORT,
+    )
+    assert _address("00000000000000000000000001000000:24F8") == (
+        ipaddress.ip_address("::1"),
+        9464,
+    )
+
+
+def _service_addresses(
+    network_inspect: Callable[[str], dict[str, object]], service: str
+) -> set[ipaddress.IPv4Address | ipaddress.IPv6Address]:
+    """The addresses of ``service``'s container on the project's networks."""
+    found: set[ipaddress.IPv4Address | ipaddress.IPv6Address] = set()
+    for network in ("backend", "edge"):
+        containers = _mapping(network_inspect(network).get("Containers"), "Containers")
+        for item in containers.values():
+            entry = _mapping(item, "container")
+            match = CONTAINER_NAME.fullmatch(str(entry.get("Name")))
+            if match is None or match["service"] != service:
+                continue
+            for key in ("IPv4Address", "IPv6Address"):
+                value = str(entry.get(key) or "")
+                if value:
+                    found.add(ipaddress.ip_interface(value).ip)
+    return found
+
+
+def test_the_app_connects_to_nothing_but_loki(
+    compose: Callable[..., subprocess.CompletedProcess[str]],
+    network_inspect: Callable[[str], dict[str, object]],
+) -> None:
+    loki = _service_addresses(network_inspect, LOKI_SERVICE)
+    assert loki, "Loki has no address on the project's networks"
+    rows = json.loads(compose("exec", "-T", APP, "python", "-c", SOCKETS_SCRIPT).stdout)
+    listening: set[int] = set()
+    unexpected: list[str] = []
+    to_loki = 0
+    for table, local_text, remote_text, state in rows:
+        (local, local_port), (remote, remote_port) = _address(local_text), _address(remote_text)
+        tcp = table.startswith("tcp")
+        if tcp and state == LISTEN:
+            if not local.is_loopback:
+                listening.add(local_port)
+            continue
+        if remote.is_unspecified and remote_port == 0:
+            continue  # an unconnected UDP socket
+        if local_port in APP_PORTS or remote.is_loopback:
+            continue  # an answer on the app's ports, or loopback (healthcheck, DNS)
+        if tcp and remote in loki and remote_port == LOKI_PORT:
+            to_loki += 1
+            continue
+        unexpected.append(f"{table} {local}:{local_port} -> {remote}:{remote_port} ({state})")
+    assert listening == APP_PORTS
+    assert not unexpected, unexpected
+    print(f"app sockets: {len(rows)}, to Loki: {to_loki}")
 
 
 # Networks.
