@@ -22,15 +22,21 @@ import httpx2
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-from starlette.types import Message, Receive
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from ccobs.domain.hook_config import HOOK_PATH
+from ccobs.server import api
 from ccobs.server import app as server_app
 from ccobs.server.config import Settings
 from ccobs.server.guards import (
     ALLOWED_HOSTS,
+    HOOK_PATHS,
     ClientDisconnectedError,
+    FetchMetadataGuard,
+    HostGuard,
+    SecurityHeaders,
     declared_length,
+    header_values,
     host_allowed,
     is_json_media_type,
     read_body,
@@ -78,10 +84,11 @@ class Exchange:
     headers: dict[bytes, bytes]
     body: bytes
     receive_calls: int
+    raw_headers: list[tuple[bytes, bytes]]
 
 
 async def _exchange(
-    app: FastAPI,
+    app: ASGIApp,
     *,
     method: str,
     path: str,
@@ -124,6 +131,7 @@ async def _exchange(
         headers=dict(start.get("headers", [])),
         body=b"".join(message.get("body", b"") for message in sent[1:]),
         receive_calls=receive_calls,
+        raw_headers=list(start.get("headers", [])),
     )
 
 
@@ -526,3 +534,380 @@ def test_json_media_types(value: bytes) -> None:
 )
 def test_other_media_types(value: bytes) -> None:
     assert not is_json_media_type(value)
+
+
+# Response headers (ADR 0034): on every response but the hook route's.
+
+CSP: Final = (
+    "default-src 'none'; script-src 'self'; style-src 'self'; font-src 'self'; "
+    "img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'none'; "
+    "frame-ancestors 'none'"
+)
+EXPECTED_HEADERS: Final = {
+    "content-security-policy": CSP,
+    "x-content-type-options": "nosniff",
+    "referrer-policy": "no-referrer",
+    "cross-origin-resource-policy": "same-origin",
+    "cross-origin-opener-policy": "same-origin",
+}
+ADDED_HEADERS: Final = (*EXPECTED_HEADERS, "cache-control")
+SESSION_ID: Final = "0b6f2b1e-4c1a-4d55-9a57-3f0c3f0f8a10"
+
+
+def assert_security_headers(headers: httpx2.Headers) -> None:
+    for name, value in EXPECTED_HEADERS.items():
+        assert headers.get_list(name) == [value], name
+    assert headers.get_list("cache-control") == ["no-store"]
+
+
+def assert_no_added_headers(headers: httpx2.Headers) -> None:
+    assert [name for name in ADDED_HEADERS if name in headers] == []
+
+
+def fetch_metadata(mode: str, dest: str, *, site: str = "cross-site") -> dict[str, str]:
+    return {"sec-fetch-site": site, "sec-fetch-mode": mode, "sec-fetch-dest": dest}
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/healthz",
+        "/api/v1/sessions",
+        f"/api/v1/sessions/{SESSION_ID}",
+        f"/api/v1/sessions/{SESSION_ID}/events",
+        "/api/v1/sessions?limit=0",
+        "/nowhere",
+    ],
+)
+def test_every_response_carries_the_security_headers(client: TestClient, path: str) -> None:
+    response = client.get(path)
+
+    assert response.status_code in (200, 404, 422)
+    assert_security_headers(response.headers)
+
+
+def test_a_405_carries_the_security_headers(client: TestClient) -> None:
+    response = client.post("/healthz")
+
+    assert response.status_code == 405
+    assert_security_headers(response.headers)
+
+
+def test_a_bad_host_400_carries_the_security_headers(client: TestClient) -> None:
+    response = client.get("/api/v1/sessions", headers={"host": "evil.example"})
+
+    assert response.status_code == 400
+    assert_security_headers(response.headers)
+
+
+def test_an_unhandled_500_carries_no_security_headers_and_a_generic_body(
+    settings: Settings,
+) -> None:
+    # Starlette's ServerErrorMiddleware wraps every user middleware, so its 500 is sent
+    # after SecurityHeaders has seen no response start: no headers, a generic body that
+    # quotes neither the request nor the exception (ADR 0034).
+    app = create_app(settings)
+
+    @app.get("/boom")
+    async def boom() -> None:
+        raise RuntimeError("detail that must not leak")
+
+    with TestClient(
+        app, base_url=f"http://{GOOD_HOST}", raise_server_exceptions=False
+    ) as test_client:
+        response = test_client.get("/boom")
+
+    assert response.status_code == 500
+    assert response.text == "Internal Server Error"
+    assert_no_added_headers(response.headers)
+
+
+def test_a_fetch_metadata_403_carries_the_security_headers(client: TestClient) -> None:
+    response = client.get("/healthz", headers=fetch_metadata("no-cors", "image"))
+
+    assert response.status_code == 403
+    assert_security_headers(response.headers)
+
+
+@pytest.mark.parametrize("path", sorted(HOOK_PATHS))
+@pytest.mark.parametrize("host", [GOOD_HOST, "evil.example"])
+def test_the_hook_route_gets_no_added_header(client: TestClient, path: str, host: str) -> None:
+    response = client.post(path, content=b"{}", headers={**JSON, "host": host})
+
+    assert_neutral(response)
+    assert_no_added_headers(response.headers)
+
+
+async def _headers_app(scope: Scope, receive: Receive, send: Send) -> None:
+    """Answers with the headers listed in the request's ``x-set`` header."""
+    extra: list[tuple[bytes, bytes]] = []
+    for value in header_values(scope["headers"], b"x-set"):
+        for item in value.split(b","):
+            name, _, header = item.partition(b"=")
+            extra.append((name, header))
+    await send({"type": "http.response.start", "status": 200, "headers": extra})
+    await send({"type": "http.response.body", "body": b"ok"})
+
+
+def _wrapped(path: str, headers: Sequence[tuple[bytes, bytes]] = ()) -> Exchange:
+    return asyncio.run(
+        _exchange(
+            SecurityHeaders(_headers_app), method="GET", path=path, headers=headers, chunks=(b"",)
+        )
+    )
+
+
+def _values(exchange: Exchange, name: bytes) -> list[bytes]:
+    return [value for key, value in exchange.raw_headers if key.lower() == name]
+
+
+def test_a_header_the_route_set_is_neither_duplicated_nor_overwritten() -> None:
+    set_by_route = b"cache-control=max-age=60,content-security-policy=default-src 'self'"
+    exchange = _wrapped("/page", [(b"x-set", set_by_route)])
+
+    assert _values(exchange, b"cache-control") == [b"max-age=60"]
+    assert _values(exchange, b"content-security-policy") == [b"default-src 'self'"]
+    assert _values(exchange, b"x-content-type-options") == [b"nosniff"]
+
+
+def test_header_names_set_by_the_route_match_in_any_case() -> None:
+    exchange = _wrapped("/page", [(b"x-set", b"Cache-Control=max-age=60")])
+
+    assert _values(exchange, b"cache-control") == [b"max-age=60"]
+
+
+@pytest.mark.parametrize("path", ["/static/vendor/htmx-2.0.11.min.js", "/static/css/app.css"])
+def test_static_files_get_the_security_headers_but_no_cache_policy(path: str) -> None:
+    exchange = _wrapped(path)
+
+    assert _values(exchange, b"content-security-policy") == [CSP.encode()]
+    assert _values(exchange, b"x-content-type-options") == [b"nosniff"]
+    assert _values(exchange, b"cache-control") == []
+
+
+@pytest.mark.parametrize("path", ["/staticx", "/static", "/ui/static/x.css"])
+def test_a_path_outside_static_gets_no_store(path: str) -> None:
+    assert _values(_wrapped(path), b"cache-control") == [b"no-store"]
+
+
+async def _nothing() -> Message:
+    return {"type": "http.disconnect"}
+
+
+async def _nothing_sent(message: Message) -> None:
+    raise AssertionError("nothing is sent")
+
+
+@pytest.mark.parametrize("middleware", [SecurityHeaders, FetchMetadataGuard])
+@pytest.mark.parametrize("kind", ["lifespan", "websocket"])
+def test_the_lifespan_and_good_websockets_pass_through(
+    middleware: type[SecurityHeaders | FetchMetadataGuard], kind: str
+) -> None:
+    seen: list[str] = []
+
+    async def inner(scope: Scope, receive: Receive, send: Send) -> None:
+        seen.append(scope["type"])
+
+    scope = {"type": kind, "path": "/ws", "headers": []}
+    asyncio.run(middleware(inner)(scope, _nothing, _nothing_sent))
+
+    assert seen == [kind]
+
+
+# Fetch Metadata (ADR 0034).
+
+
+@pytest.mark.parametrize("site", ["cross-site", "same-site"])
+@pytest.mark.parametrize(
+    ("mode", "dest"),
+    [
+        ("no-cors", "image"),
+        ("no-cors", "script"),
+        ("no-cors", "style"),
+        ("no-cors", "empty"),
+        ("cors", "empty"),
+        ("navigate", "iframe"),
+        ("navigate", "frame"),
+        ("navigate", "object"),
+    ],
+)
+@pytest.mark.parametrize(
+    "path", ["/healthz", "/api/v1/sessions", "/static/css/app.css", "/ui/stream", "/nowhere"]
+)
+def test_foreign_subresource_requests_are_refused_with_403(
+    client: TestClient, site: str, mode: str, dest: str, path: str
+) -> None:
+    response = client.get(path, headers=fetch_metadata(mode, dest, site=site))
+
+    assert response.status_code == 403
+    assert response.content == b"forbidden\n"
+    assert response.headers["content-type"].startswith("text/plain")
+    assert_no_cors(response.headers)
+
+
+@pytest.mark.parametrize("site", ["cross-site", "same-site"])
+@pytest.mark.parametrize("method", ["POST", "PUT", "DELETE", "HEAD"])
+def test_foreign_navigations_other_than_get_are_refused(
+    client: TestClient, site: str, method: str
+) -> None:
+    response = client.request(
+        method, "/api/v1/sessions", headers=fetch_metadata("navigate", "document", site=site)
+    )
+
+    assert response.status_code == 403
+
+
+@pytest.mark.parametrize("site", ["cross-site", "same-site"])
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {"sec-fetch-mode": "navigate", "sec-fetch-dest": "document"},
+        {"sec-fetch-mode": "navigate", "sec-fetch-dest": "document", "sec-fetch-user": "?1"},
+        # A browser that sends Sec-Fetch-Mode but not Sec-Fetch-Dest.
+        {"sec-fetch-mode": "navigate"},
+    ],
+    ids=["link", "user-activated", "no-dest"],
+)
+def test_a_foreign_top_level_navigation_is_allowed(
+    client: TestClient, site: str, headers: dict[str, str]
+) -> None:
+    response = client.get("/healthz", headers={"sec-fetch-site": site, **headers})
+
+    assert response.status_code == 200
+    assert_security_headers(response.headers)
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {},
+        fetch_metadata("cors", "empty", site="same-origin"),
+        fetch_metadata("no-cors", "script", site="same-origin"),
+        fetch_metadata("navigate", "document", site="same-origin"),
+        fetch_metadata("navigate", "document", site="none"),
+        {"sec-fetch-mode": "cors"},
+        {"sec-fetch-dest": "image"},
+        {"sec-fetch-site": "Same-Origin"},
+    ],
+    ids=[
+        "none-sent",
+        "same-origin-fetch",
+        "same-origin-script",
+        "same-origin-navigation",
+        "typed-url",
+        "mode-only",
+        "dest-only",
+        "any-case",
+    ],
+)
+def test_own_and_non_browser_requests_are_allowed(
+    client: TestClient, headers: dict[str, str]
+) -> None:
+    assert client.get("/healthz", headers=headers).status_code == 200
+
+
+@pytest.mark.parametrize("value", ["", "cross-origin", "evil", "same-origin, cross-site"])
+def test_an_unknown_sec_fetch_site_is_refused(client: TestClient, value: str) -> None:
+    response = client.get("/healthz", headers={"sec-fetch-site": value, "sec-fetch-mode": "cors"})
+
+    assert response.status_code == 403
+
+
+def test_two_sec_fetch_site_headers_are_refused(app: FastAPI) -> None:
+    headers = [
+        (b"host", GOOD_HOST.encode()),
+        (b"sec-fetch-site", b"same-origin"),
+        (b"sec-fetch-site", b"same-origin"),
+    ]
+    exchange = raw_request(app, method="GET", path="/healthz", headers=headers, chunks=(b"",))
+
+    assert exchange.status == 403
+    assert exchange.receive_calls == 0
+
+
+@pytest.mark.parametrize("path", sorted(HOOK_PATHS))
+@pytest.mark.parametrize("mode", ["no-cors", "cors", "navigate"])
+def test_the_hook_route_ignores_fetch_metadata(
+    client: TestClient, queue: HookQueue, path: str, mode: str
+) -> None:
+    response = client.post(path, content=b"{}", headers={**JSON, **fetch_metadata(mode, "empty")})
+
+    assert_neutral(response)
+    assert_no_added_headers(response.headers)
+    assert queue.depth == 1
+
+
+@pytest.mark.parametrize("site", [b"cross-site", b"same-site"])
+def test_a_foreign_websocket_is_closed_with_1008(app: FastAPI, site: bytes) -> None:
+    headers = [
+        (b"host", GOOD_HOST.encode()),
+        (b"sec-fetch-site", site),
+        (b"sec-fetch-mode", b"websocket"),
+    ]
+
+    assert _websocket(app, headers, "/ws") == [{"type": "websocket.close", "code": 1008}]
+
+
+def test_a_same_origin_websocket_reaches_the_app(app: FastAPI) -> None:
+    headers = [
+        (b"host", GOOD_HOST.encode()),
+        (b"sec-fetch-site", b"same-origin"),
+        (b"sec-fetch-mode", b"websocket"),
+    ]
+    sent = _websocket(app, headers, "/ws")
+
+    assert [message["type"] for message in sent] == ["websocket.close"]
+    assert sent[0].get("code") != 1008
+
+
+def test_the_middlewares_wrap_in_order(app: FastAPI) -> None:
+    # Outermost first: the Host guard, then the headers (so that a 403 carries them),
+    # then Fetch Metadata.
+    classes: list[object] = [middleware.cls for middleware in app.user_middleware]
+
+    assert classes == [
+        HostGuard,
+        SecurityHeaders,
+        FetchMetadataGuard,
+    ]
+
+
+# Read-only (ADR 0034): every route but the hook route answers only GET.
+
+
+# The routers that create_app includes: FastAPI lists an included router in app.routes
+# as one entry without a path, so their routes are read from the routers themselves.
+INCLUDED_ROUTERS: Final = (api.router,)
+
+
+def _route_paths(app: FastAPI) -> list[str]:
+    routes = [*app.routes, *(route for router in INCLUDED_ROUTERS for route in router.routes)]
+    paths = []
+    for route in routes:
+        path: str | None = getattr(route, "path", None)
+        if path is None or path in HOOK_PATHS:
+            continue
+        paths.append(path.replace("{session_id}", SESSION_ID))
+    return sorted(paths)
+
+
+def test_the_read_only_check_sees_every_route(app: FastAPI) -> None:
+    paths = _route_paths(app)
+
+    assert "/healthz" in paths
+    assert f"/api/v1/sessions/{SESSION_ID}/events" in paths
+    assert not any("{" in path for path in paths)
+    # A router included without being added to INCLUDED_ROUTERS fails here.
+    without_path = [route for route in app.routes if getattr(route, "path", None) is None]
+    assert len(without_path) == len(INCLUDED_ROUTERS)
+
+
+@pytest.mark.parametrize("method", ["POST", "PUT", "PATCH", "DELETE"])
+def test_every_route_but_the_hook_route_is_read_only(
+    client: TestClient, app: FastAPI, method: str
+) -> None:
+    for path in _route_paths(app):
+        response = client.request(method, path)
+
+        assert response.status_code == 405, path
+        assert_security_headers(response.headers)

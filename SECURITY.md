@@ -114,6 +114,16 @@ to each part from the release that ships it.
       The read-only JSON API serves the working directory (`cwd`), which contains your
       OS username, and it reaches only clients on localhost that send an allowed
       `Host`. The app serves no OpenAPI schema or interactive docs.
+    - From v0.4.0 the app also refuses, with a 403, any browser request from another
+      site, other `localhost` ports such as Grafana's included, unless it is a top-level
+      `GET` navigation (a link or a typed URL), using the browser's Fetch Metadata
+      headers; so a page cannot load the app's responses as images or scripts, fetch
+      from it, frame it or hold its live event stream. Its responses carry a strict
+      Content Security Policy, `Cross-Origin-Resource-Policy: same-origin`, no referrer
+      and, outside its static files, `Cache-Control: no-store`, and every route but the
+      hook endpoint is read-only
+      ([ADR 0034](docs/adr/0034-browser-hardening-csp-fetch-metadata-and-response-headers.md)).
+      The hook endpoint keeps its empty 204 whatever these headers say.
     - The app's `/metrics` is on a separate listener that compose never publishes, so
       a browser on your machine cannot reach it
       ([ADR 0028](docs/adr/0028-app-metrics-and-their-listener.md)). Two exceptions,

@@ -399,6 +399,24 @@ which has no login, defends itself
   `application/json` is dropped, still with an empty 204. A cross-site page can send
   JSON only after a CORS preflight, which fails.
 - **No CORS.** No response carries an `Access-Control-Allow-*` header.
+- **Fetch Metadata** ([ADR 0034](adr/0034-browser-hardening-csp-fetch-metadata-and-response-headers.md)).
+  A browser request whose `Sec-Fetch-Site` is `cross-site` or `same-site` (any other
+  `localhost` port, Grafana's included) gets a 403 with the body `forbidden`, unless it
+  is a top-level `GET` navigation, such as a link or a typed URL; a websocket gets close
+  code 1008. Requests without `Sec-Fetch-Site` (curl, Prometheus) and from the app's own
+  pages pass.
+- **Response headers** (ADR 0034). Every response that the app's routes and guards
+  produce, but the hook route's, carries a strict `Content-Security-Policy` (only the
+  app's own scripts, styles, fonts and images, no inline or eval'd code, no framing, no
+  form submission), `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`,
+  `Cross-Origin-Resource-Policy: same-origin` and
+  `Cross-Origin-Opener-Policy: same-origin`, plus `Cache-Control: no-store` outside
+  `/static/`. A header a route sets itself is kept. An unhandled 500 from Starlette's
+  error middleware carries none of them; its body is generic.
+- **Read-only.** Every route but the hook route serves only `GET`; any other method gets
+  a 405.
+- **The hook route is outside all of this.** It answers its empty 204 with no added
+  header, whatever `Sec-Fetch-*` headers say (Claude Code sends none).
 - **Nothing extra.** No `/docs`, `/redoc` or `/openapi.json`, no access log, no
   `X-Forwarded-*` trust and no `Server` header on the app's port.
 - **Metrics on an unpublished port.** A browser cannot reach a container port that

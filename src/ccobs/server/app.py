@@ -37,7 +37,9 @@ from ccobs.server.db.repository import Repository
 from ccobs.server.guards import (
     HOOK_PATHS,
     ClientDisconnectedError,
+    FetchMetadataGuard,
     HostGuard,
+    SecurityHeaders,
     declared_length,
     header_values,
     is_json_media_type,
@@ -333,7 +335,12 @@ def create_app(
     async def healthz() -> dict[str, str]:
         return {"status": "ok"}
 
-    # The read-only JSON API, behind the same Host guard.
+    # The read-only JSON API, behind the same guards.
     app.include_router(api.router)
+    # The last one added is the outermost (ADR 0034): the Host guard, then the response
+    # headers (so that a 403 carries them), then Fetch Metadata. The hook route passes
+    # through the inner two untouched.
+    app.add_middleware(FetchMetadataGuard)
+    app.add_middleware(SecurityHeaders)
     app.add_middleware(HostGuard, queue=hook_queue)
     return app
