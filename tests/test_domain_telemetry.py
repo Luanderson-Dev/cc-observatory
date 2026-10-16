@@ -84,7 +84,7 @@ UNIT_SUFFIXES: Final = {"": "", "s": "seconds", "tokens": "tokens", "USD": "USD"
 # ccobs.domain.hooks is a domain module, held to these same rules: the session reducer
 # consumes its events (ADR 0024).
 ALLOWED_IMPORTS: Final = frozenset(
-    {"__future__", "collections.abc", "dataclasses", "datetime", "json", "re", "typing"}
+    {"__future__", "collections.abc", "dataclasses", "datetime", "enum", "json", "re", "typing"}
     # Domain modules, each one checked by the same test.
     | {
         "ccobs.domain.durations",
