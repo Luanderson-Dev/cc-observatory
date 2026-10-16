@@ -54,8 +54,8 @@ IMPORT_SETS = (
 )
 
 # Top-level names outside sys.stdlib_module_names that the child may hold. Each one was
-# observed in the child both with and without coverage; `_distutils_hack` never showed
-# up (setuptools is not installed), so it is not allowed.
+# observed in the child, locally or on a CI runner; `_distutils_hack` never showed up
+# (setuptools is not installed), so it is not allowed.
 ALLOWED_TOP_LEVEL = frozenset(
     {
         # The package under test.
@@ -72,8 +72,16 @@ ALLOWED_TOP_LEVEL = frozenset(
         # uses for process-wide singletons.
         "coverage",
         "$coverage",
+        # The interpreter installation's site hook, imported by `site` at startup when the
+        # Python build ships one (the CI runners' Linux builds do); not a dependency.
+        "sitecustomize",
     }
 )
+
+# Standard library modules generated per platform at build time (sysconfig's build data,
+# such as `_sysconfigdata__linux_x86_64-linux-gnu` or `_sysconfigdata__darwin_darwin`),
+# which `sys.stdlib_module_names` does not list.
+STDLIB_GENERATED_PREFIX = "_sysconfigdata_"
 
 
 @functools.cache
@@ -123,6 +131,7 @@ def test_import_loads_only_the_stdlib_and_ccobs(imports: tuple[str, ...]) -> Non
         for name in _loaded_modules(imports)
         if name.partition(".")[0] not in sys.stdlib_module_names
         and name.partition(".")[0] not in ALLOWED_TOP_LEVEL
+        and not name.startswith(STDLIB_GENERATED_PREFIX)
     )
 
     assert third_party == []
