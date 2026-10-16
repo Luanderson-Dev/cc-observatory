@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import functools
 import json
 import logging
 import os
@@ -32,7 +33,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from ccobs.domain.hook_config import HOOK_PATH
 from ccobs.domain.hooks import parse_hook
 from ccobs.domain.sessions import apply
-from ccobs.server.app import create_app
+from ccobs.server import app as server_app
 from ccobs.server.config import Settings
 from ccobs.server.db.engine import create_engine_for
 from ccobs.server.db.repository import Repository, hook_event_row
@@ -44,8 +45,10 @@ from ccobs.server.ingest import (
     wall_clock_ms,
 )
 from ccobs.server.migrations import HEAD, upgrade_to_head
-from ccobs.server.writer import WriterCounts
+from ccobs.server.writer import BlockClosedCallback, WriterCounts
 
+# The app without its metrics listener: only tests/server/test_metrics.py opens sockets.
+create_app: Final = functools.partial(server_app.create_app, serve_metrics=False)
 KIB: Final = 1024
 MIB: Final = 1024 * KIB
 BODY_MAX: Final = 64 * KIB
@@ -88,7 +91,9 @@ class IdleWriter:
         )
 
 
-def idle_writer(queue: HookQueue, repository: Repository) -> IdleWriter:
+def idle_writer(
+    queue: HookQueue, repository: Repository, on_block_closed: BlockClosedCallback
+) -> IdleWriter:
     return IdleWriter()
 
 

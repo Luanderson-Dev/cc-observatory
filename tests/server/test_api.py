@@ -31,7 +31,7 @@ from ccobs.server.config import Settings
 from ccobs.server.db.models import AgentModel, Base, BlockModel, HookEventModel, SessionModel
 from ccobs.server.db.repository import Repository
 from ccobs.server.ingest import HookQueue
-from ccobs.server.writer import Writer
+from ccobs.server.writer import BlockClosedCallback, Writer
 
 HOOK_FIXTURES: Final = Path(__file__).parents[1] / "fixtures" / "hooks"
 # Agents and a permission block; an elicitation block and idle; compaction and a
@@ -159,11 +159,13 @@ def clock() -> Clock:
 
 @pytest.fixture
 def client(settings: Settings, clock: Clock) -> Iterator[TestClient]:
-    def manual(queue: HookQueue, repository: Repository) -> ManualWriter:
+    def manual(
+        queue: HookQueue, repository: Repository, on_block_closed: BlockClosedCallback
+    ) -> ManualWriter:
         return ManualWriter(queue, repository, HOST, stale_after_ms=12 * HOUR_MS, batch_wait_s=0)
 
     queue = HookQueue(settings.hook_queue_max_items, settings.hook_queue_max_bytes)
-    app = create_app(settings, queue=queue, clock=clock, writer_factory=manual)
+    app = create_app(settings, queue=queue, clock=clock, writer_factory=manual, serve_metrics=False)
     with TestClient(app, base_url=f"http://{GOOD_HOST}") as test_client:
         yield test_client
 

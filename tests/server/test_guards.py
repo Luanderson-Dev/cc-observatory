@@ -11,6 +11,7 @@ cross-site page cannot read any of them or pass a CORS preflight.
 from __future__ import annotations
 
 import asyncio
+import functools
 import os
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
@@ -24,7 +25,7 @@ from fastapi.testclient import TestClient
 from starlette.types import Message, Receive
 
 from ccobs.domain.hook_config import HOOK_PATH
-from ccobs.server.app import create_app
+from ccobs.server import app as server_app
 from ccobs.server.config import Settings
 from ccobs.server.guards import (
     ALLOWED_HOSTS,
@@ -36,6 +37,8 @@ from ccobs.server.guards import (
 )
 from ccobs.server.ingest import HookQueue
 
+# The app without its metrics listener: only tests/server/test_metrics.py opens sockets.
+create_app: Final = functools.partial(server_app.create_app, serve_metrics=False)
 KIB: Final = 1024
 BODY_MAX: Final = 64 * KIB
 GOOD_HOST: Final = "127.0.0.1:4300"

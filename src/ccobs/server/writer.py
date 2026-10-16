@@ -32,9 +32,10 @@ import threading
 import time
 from collections import Counter
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Final
 
+from ccobs.domain.app_metrics import event_label
 from ccobs.domain.hooks import HookEvent, parse_hook
 from ccobs.domain.sessions import (
     BlockClosed,
@@ -118,7 +119,9 @@ class WriterCounts:
     neither ended nor stale. ``events_processed`` counts the hook events persisted since
     the writer started, and ``sessions_ended`` the sessions that moved to ``ended`` from
     another status (a new session whose first event is SessionEnd included); both are
-    cumulative, for counters.
+    cumulative, for counters. ``events_received`` counts the hooks parsed since the
+    writer started, persisted or not, by event label (``event_label``: the registered
+    events and ``other``, so its keys are a closed set); cumulative too.
     """
 
     sessions_by_status: dict[str, int]
@@ -126,6 +129,7 @@ class WriterCounts:
     running_agents: int
     events_processed: int
     sessions_ended: int
+    events_received: dict[str, int] = field(default_factory=dict)
 
 
 class _LoadError(Exception):
@@ -212,6 +216,7 @@ class Writer:
         self._states = repository.load_open_states()
         self._events = 0
         self._ended = 0
+        self._received: Counter[str] = Counter()
         # Per run_once: whether to back off, and the seqs already persisted or counted.
         self._failing = False
         self._settled: set[int] = set()
@@ -284,6 +289,7 @@ class Writer:
             states = list(self._states.values())
             events = self._events
             ended = self._ended
+            received = dict(self._received)
         return WriterCounts(
             sessions_by_status=dict(Counter(state.session.status for state in states)),
             open_blocks_by_kind=dict(
@@ -298,6 +304,7 @@ class Writer:
             ),
             events_processed=events,
             sessions_ended=ended,
+            events_received=received,
         )
 
     def state(self, session_id: str) -> SessionState | None:
@@ -356,7 +363,12 @@ class Writer:
         return items
 
     def _process(self, hooks: Sequence[RawHook], controls: Sequence[Control]) -> None:
-        ops: list[_Op] = [op for item in hooks if (op := self._parse(item)) is not None]
+        parsed = [op for item in hooks if (op := self._parse(item)) is not None]
+        if parsed:
+            received = Counter(event_label(op.event.hook_event_name) for op in parsed)
+            with self._lock:
+                self._received.update(received)
+        ops: list[_Op] = list(parsed)
         for control in controls:
             if isinstance(control, Retention):
                 # After the writes queued before it, so it sees their effects.

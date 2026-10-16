@@ -9,11 +9,13 @@ serialized. ``run_once`` drives it synchronously; a few tests run the real threa
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import os
 import threading
 import time
+from collections import Counter
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from datetime import timedelta
@@ -25,10 +27,11 @@ from fastapi.testclient import TestClient
 from sqlalchemy import Engine, func, select
 from sqlalchemy.exc import OperationalError
 
+from ccobs.domain.app_metrics import EVENT_LABELS, event_label
 from ccobs.domain.hook_config import HOOK_PATH
 from ccobs.domain.hooks import parse_hook
 from ccobs.domain.sessions import SessionState, apply
-from ccobs.server.app import create_app
+from ccobs.server import app as server_app
 from ccobs.server.config import Settings
 from ccobs.server.db.engine import create_engine_for
 from ccobs.server.db.models import (
@@ -41,8 +44,10 @@ from ccobs.server.db.models import (
 from ccobs.server.db.repository import Applied, HookEventRow, Repository, hook_event_row
 from ccobs.server.ingest import DROP_REASONS, HookQueue, RawHook
 from ccobs.server.migrations import upgrade_to_head
-from ccobs.server.writer import Writer, WriterCounts
+from ccobs.server.writer import BlockClosedCallback, Writer, WriterCounts
 
+# The app without its metrics listener: only tests/server/test_metrics.py opens sockets.
+create_app: Final = functools.partial(server_app.create_app, serve_metrics=False)
 HOOK_FIXTURES: Final = Path(__file__).parents[1] / "fixtures" / "hooks"
 FIXTURES: Final = sorted(HOOK_FIXTURES.glob("*.jsonl"))
 TOOLS: Final = HOOK_FIXTURES / "headless-tools-subagent.jsonl"
@@ -388,7 +393,9 @@ def test_the_lifespan_uses_an_injected_writer_factory(settings: Settings) -> Non
 
     recorder = Recorder()
 
-    def factory(queue: HookQueue, repository: Repository) -> Recorder:
+    def factory(
+        queue: HookQueue, repository: Repository, on_block_closed: BlockClosedCallback
+    ) -> Recorder:
         calls.append(("factory", repository.max_seq()))
         return recorder
 
@@ -984,10 +991,14 @@ def test_counts_match_the_database(
 ) -> None:
     closed: list[tuple[str, float]] = []
     writer = make_writer(on_block_closed=lambda kind, seconds: closed.append((kind, seconds)))
+    fed: list[Line] = []
     for path in FIXTURES:
-        feed.lines(fixture_lines(path))
-    feed.lines(with_session(PERMISSION_PREFIX, SESSION))  # one block left open
+        fed += fixture_lines(path)
+    fed += with_session(PERMISSION_PREFIX, SESSION)  # one block left open
+    feed.lines(fed)
     run_all(writer)
+    # Every fed line parses; registered events by name, the rest as other.
+    received = Counter(event_label(document["hook_event_name"]) for _, document in fed)
 
     with repo.engine.connect() as connection:
         statuses = dict(
@@ -1031,7 +1042,9 @@ def test_counts_match_the_database(
         running_agents=running,
         events_processed=count(repo.engine, HookEventModel),
         sessions_ended=ended,
+        events_received=dict(received),
     )
+    assert set(received) <= set(EVENT_LABELS)
     assert writer.counts().open_blocks_by_kind == {"permission": 1}
     assert sorted(closed) == durations
     assert len(closed) >= 5
