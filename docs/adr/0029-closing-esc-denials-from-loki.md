@@ -189,13 +189,17 @@ pure half (the query, the window, the parser and the matching) and
   order. The reconciler is off with `telemetry_reconcile=False`.
 - `tests/test_domain_app_metrics.py` and `tests/server/test_metrics.py` check the new
   series, its zeros and the total of 65.
-- Unverified until the integration test of stage 14 of milestone 2 runs against the
-  real Loki 3.7.8: that the `tool_use_id` attribute comes back as structured metadata
-  under that name (ADR 0015 observed `decision` and the rule for other attributes, but
-  its integration test does not list `tool_use_id`); that Loki's entry timestamp is the
-  record's `timeUnixNano`; that the query above selects the replayed reject and only
-  rejects; that Loki 3.7.8 accepts an `end` up to 10 min in the future without clamping
-  or rejecting it; and the end-to-end delay from the denial to the close.
+- `tests/integration/test_app_reconcile.py` replays the fixture's hooks and log records
+  through the isolated stack, against the real Loki 3.7.8, and confirms: that the
+  `tool_use_id` attribute comes back as structured metadata under that name; that
+  Loki's entry timestamp equals the record's `timeUnixNano`, in nanoseconds; that the
+  query above selects the replayed reject and returns only rejects; that Loki accepts
+  an `end` 10 min in the future and does not clamp it to now, as far as records stamped
+  about 2 min ahead show; that a `direction=backward` answer has the shape the parser
+  reads; and that the replayed block closes as `denied` from `telemetry` at the reject's
+  time. The reconciler's delay is about 2.5 to 3 s from the reject's timestamp; that is
+  not the delay a person sees after pressing Esc, which adds Claude Code's log export
+  interval (1 s in the capture, 5 s by default).
 - Also unverified: that every Esc denial produces a reject carrying its `tool_use_id`
   (the capture has one), and the delay between the Esc and the event's export.
 

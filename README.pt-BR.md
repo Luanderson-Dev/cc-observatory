@@ -52,10 +52,9 @@ planejado.
   trabalhando, esperando por você, ociosas ou encerradas (v0.4.0).
 - **Árvore de agentes**: o agente principal de cada sessão e os subagentes que ele
   iniciou (v0.4.0).
-- **Bloqueios**: sessões esperando por você, como um pedido de permissão, um aviso de
-  ociosidade, uma elicitação de um servidor MCP ou uma requisição à API que falhou, e há
-  quanto tempo cada uma está esperando (registrados a partir da v0.3.0 e exibidos na
-  interface web a partir da v0.4.0).
+- **Bloqueios**: sessões esperando por você, como um pedido de permissão ou uma
+  elicitação de um servidor MCP, e há quanto tempo cada uma está esperando (registrados
+  a partir da v0.3.0 e exibidos na interface web a partir da v0.4.0).
 - **Eventos e logs** de cada sessão (v0.4.0).
 - **Tokens e custo** (v0.4.0) por dia, modelo e tipo de agente (com os nomes dos agentes
   embutidos; os seus próprios agentes aparecem como `custom`, a menos que você ative os
@@ -110,9 +109,10 @@ de decisão de arquitetura em [docs/adr/](docs/adr/README.md) (em inglês).
 ## Como rodar a stack de observabilidade (a partir da v0.2.0)
 
 A partir da v0.2.0 você pode rodar a stack de observabilidade com um clone deste
-repositório e ver as métricas e os eventos do Claude Code no Grafana. O app (hooks,
-sessões e bloqueios) chega na v0.3.0, a interface web dele na v0.4.0 e o `ccobs setup`
-na v0.5.0; até lá, você aponta o Claude Code para a stack manualmente.
+repositório e ver as métricas e os eventos do Claude Code no Grafana. A partir da v0.3.0
+a stack também roda o app (hooks, sessões e bloqueios; veja "Experimente o app" mais
+abaixo). A interface web dele chega na v0.4.0 e o `ccobs setup` na v0.5.0; até lá, você
+aponta o Claude Code para a stack manualmente.
 
 1. Suba a stack:
 
@@ -122,10 +122,10 @@ na v0.5.0; até lá, você aponta o Claude Code para a stack manualmente.
    docker compose up -d
    ~~~
 
-   A primeira subida baixa cerca de 750 MB de imagens e faz o build da imagem do
-   collector. O `docker compose ps` mostra cada serviço e se ele está saudável. Para
-   guardar também os traces do Claude Code, um recurso beta, suba a stack com
-   `docker compose --profile traces up -d`, que acrescenta o Tempo, e passe
+   A primeira subida baixa cerca de 750 MB de imagens e faz o build das imagens do
+   collector e do app. O `docker compose ps` mostra cada serviço e se ele está
+   saudável. Para guardar também os traces do Claude Code, um recurso beta, suba a stack
+   com `docker compose --profile traces up -d`, que acrescenta o Tempo, e passe
    `--profile traces` toda vez que subir ou atualizar a stack.
 
 2. Abra o Grafana em <http://localhost:4330>. Use `localhost`: o Grafana redireciona para
@@ -184,6 +184,49 @@ na v0.5.0; até lá, você aponta o Claude Code para a stack manualmente.
   Docker na inicialização.
 - **Mais.** O [docs/stack.md](docs/stack.md) (em inglês) cobre como parar e atualizar a
   stack, as configurações, os dados e a retenção, a memória e a solução de problemas.
+
+## Experimente o app (a partir da v0.3.0)
+
+A partir da v0.3.0, o `docker compose up -d` também faz o build da imagem do app a
+partir do seu clone e o inicia em <http://127.0.0.1:4300>. O app recebe os hooks do
+Claude Code e acompanha sessões, agentes e bloqueios no SQLite. A interface web dele
+chega na v0.4.0; até lá, você pode ver o que ele acompanha pela API JSON somente
+leitura.
+
+1. Suba ou atualize a stack como acima. O `docker compose ps` mostra o `app` como
+   saudável assim que ele passa a atender requisições.
+
+2. Aponte o Claude Code para o app. Até o `ccobs setup` gravar os hooks por você na
+   v0.5.0, salve o bloco de hooks do
+   [docs/app.md](docs/app.md#point-claude-code-at-the-app) (em inglês) como
+   `ccobs-hooks.json` no seu diretório pessoal (no Windows, troque `/dev/null` por `NUL`
+   nele, como aquela página explica) e inicie o Claude Code com ele:
+
+   ~~~bash
+   claude --settings "$HOME/ccobs-hooks.json"
+   ~~~
+
+   O seu `~/.claude/settings.json` continua como está, e só as sessões que você iniciar
+   assim enviam hooks. A URL dos hooks usa `127.0.0.1`, não `localhost`.
+
+3. Veja as sessões:
+
+   ~~~bash
+   curl -s http://127.0.0.1:4300/api/v1/sessions
+   ~~~
+
+   Cada sessão traz o estado dela (`working`, `waiting_user`, `idle`, `ended` ou
+   `stale`), e `/api/v1/sessions/<session_id>` acrescenta os agentes e os bloqueios
+   dela.
+
+- **Stack fora do ar.** Enquanto a stack estiver fora do ar, as sessões iniciadas com
+  esses hooks mostram na transcrição um aviso de erro de hook na maioria dos eventos de
+  hook; inicie o Claude Code sem `--settings` até a stack voltar.
+- **Negações com Esc.** Um pedido de permissão negado com Esc não dispara nenhum hook; o
+  app o fecha a partir dos eventos do Claude Code no Loki, então mantenha as
+  configurações de telemetria do passo 3 da seção anterior.
+- **Mais.** O [docs/app.md](docs/app.md) (em inglês) cobre a API, as métricas do app no
+  Grafana, as configurações e a retenção dele, a privacidade e a solução de problemas.
 
 ## Início rápido (planejado, disponível a partir da v0.5.0)
 
@@ -268,12 +311,14 @@ uma página web ainda consegue fazer, e para saber como relatar uma vulnerabilid
   Desktop no Windows e no macOS, ou os pacotes do próprio Docker no Linux, onde o Docker
   Engine 28.0 ou mais recente também impede que outros hosts da rede local alcancem as
   portas publicadas em `127.0.0.1`.
-- Memória: deixe no Docker pelo menos cerca de 2 GB para a stack (2,5 GB com o Tempo), a
+- Memória: deixe no Docker pelo menos 2304 MiB para a stack (2816 MiB com o Tempo), a
   soma dos limites de memória dela. O uso medido foi de cerca de 260 a 290 MiB em
   repouso e de 420 a 450 MiB enquanto as consultas do dashboard rodavam pela API do
-  Grafana; carregar a interface do Grafana no navegador levou, por pouco tempo, só o
-  Grafana a cerca de 630 MiB.
-- Disco: cerca de 3 GB para as imagens, mais os dados.
+  Grafana, antes de o app entrar na stack; o app, medido sozinho, usou cerca de 64 a 70
+  MiB. Carregar a interface do Grafana no navegador levou, por pouco tempo, só o Grafana
+  a cerca de 630 MiB.
+- Disco: cerca de 3 GB para as imagens, mais cerca de 250 MB para a imagem do app, mais
+  os dados.
 - Testado no Linux e no Windows 11 com o Docker Desktop, ambos em amd64; macOS e arm64
   não foram testados. Os detalhes estão em
   [docs/stack.md](docs/stack.md#requirements) (em inglês).

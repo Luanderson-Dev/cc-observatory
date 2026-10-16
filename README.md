@@ -49,9 +49,9 @@ v0.2.0 (see "Run the observability stack" below); the rest is planned.
 - **Live overview** of the Claude Code sessions on your machine: which ones are working,
   waiting on you, idle or ended (v0.4.0).
 - **Agent tree**: each session's main agent and the subagents it started (v0.4.0).
-- **Blocks**: sessions waiting on you, such as a permission prompt, an idle prompt, an
-  MCP elicitation or a failed API request, with how long each one has been waiting
-  (tracked from v0.3.0, shown in the web UI from v0.4.0).
+- **Blocks**: sessions waiting on you, such as a permission prompt or an MCP
+  elicitation, with how long each one has been waiting (tracked from v0.3.0, shown in
+  the web UI from v0.4.0).
 - **Events and logs** for each session (v0.4.0).
 - **Tokens and cost** (v0.4.0) by day, model and agent type (built-in agent names; your
   own agents show as `custom` unless you opt in to tool details) and by project (joined
@@ -103,9 +103,9 @@ The decisions behind this design, and their reasons, are recorded as architectur
 ## Run the observability stack (from v0.2.0)
 
 From v0.2.0 you can run the observability stack from a clone of this repository and see
-Claude Code's metrics and events in Grafana. The app (hooks, sessions and blocks) comes
-in v0.3.0, its web UI in v0.4.0 and `ccobs setup` in v0.5.0, so until then you point
-Claude Code at the stack by hand.
+Claude Code's metrics and events in Grafana. From v0.3.0 the stack also runs the app
+(hooks, sessions and blocks; see "Try the app" below). Its web UI comes in v0.4.0 and
+`ccobs setup` in v0.5.0, so until then you point Claude Code at the stack by hand.
 
 1. Start the stack:
 
@@ -115,9 +115,9 @@ Claude Code at the stack by hand.
    docker compose up -d
    ~~~
 
-   The first start downloads about 750 MB of images and builds the collector's image.
-   `docker compose ps` shows each service and whether it is healthy. To also store
-   Claude Code's traces, a beta feature, start it with
+   The first start downloads about 750 MB of images and builds the collector's and the
+   app's images. `docker compose ps` shows each service and whether it is healthy. To
+   also store Claude Code's traces, a beta feature, start it with
    `docker compose --profile traces up -d`, which adds Tempo, and pass
    `--profile traces` every time you start or update the stack.
 
@@ -177,6 +177,48 @@ Claude Code at the stack by hand.
   Docker service at boot.
 - **More.** [docs/stack.md](https://github.com/Luanderson-Dev/cc-observatory/blob/main/docs/stack.md)
   covers stopping and updating the stack, its settings, data and retention, memory, and
+  troubleshooting.
+
+## Try the app (from v0.3.0)
+
+From v0.3.0, `docker compose up -d` also builds the app's image from your clone and
+starts it at <http://127.0.0.1:4300>. The app receives Claude Code's hooks and tracks
+sessions, agents and blocks in SQLite. Its web UI comes in v0.4.0; until then you can
+see what it tracks through its read-only JSON API.
+
+1. Start or update the stack as above. `docker compose ps` shows `app` as healthy once
+   it serves requests.
+
+2. Point Claude Code at the app. Until `ccobs setup` writes the hooks for you in v0.5.0,
+   save the hooks block from
+   [docs/app.md](https://github.com/Luanderson-Dev/cc-observatory/blob/main/docs/app.md#point-claude-code-at-the-app)
+   as `ccobs-hooks.json` in your home directory (on Windows, change `/dev/null` to `NUL`
+   in it, as that page explains), and start Claude Code with it:
+
+   ~~~bash
+   claude --settings "$HOME/ccobs-hooks.json"
+   ~~~
+
+   Your `~/.claude/settings.json` stays as it is, and only the sessions you start this
+   way send hooks. The hook URL uses `127.0.0.1`, not `localhost`.
+
+3. See the sessions:
+
+   ~~~bash
+   curl -s http://127.0.0.1:4300/api/v1/sessions
+   ~~~
+
+   Each session has its state (`working`, `waiting_user`, `idle`, `ended` or `stale`),
+   and `/api/v1/sessions/<session_id>` adds its agents and blocks.
+
+- **Stack down.** While the stack is down, sessions started with these hooks show a
+  hook-error notice in the transcript on most hook events; start Claude Code without
+  `--settings` until the stack is back.
+- **Esc denials.** A permission prompt denied with Esc fires no hook; the app closes it
+  from Claude Code's events in Loki, so keep the telemetry settings from step 3 of the
+  previous section.
+- **More.** [docs/app.md](https://github.com/Luanderson-Dev/cc-observatory/blob/main/docs/app.md)
+  covers the API, the app's metrics in Grafana, its settings and retention, privacy and
   troubleshooting.
 
 ## Quick start (planned, available from v0.5.0)
@@ -260,11 +302,13 @@ can still do, and how to report a vulnerability.
   the Buildx plugin is installed, Buildx 0.17.0 or later): Docker Desktop on Windows and
   macOS, or Docker's own packages on Linux, where Docker Engine 28.0 or later also keeps
   ports published to `127.0.0.1` out of reach of other hosts on the local network.
-- Memory: leave Docker at least about 2 GB for the stack (2.5 GB with Tempo), the sum of
+- Memory: leave Docker at least 2304 MiB for the stack (2816 MiB with Tempo), the sum of
   its memory limits. Measured use was about 260 to 290 MiB idle and 420 to 450 MiB
-  while the dashboard's queries ran through Grafana's API; loading Grafana's UI in a
-  browser briefly took Grafana alone to about 630 MiB.
-- Disk: about 3 GB for the images, plus the data.
+  while the dashboard's queries ran through Grafana's API, before the app joined the
+  stack; the app, measured on its own, used about 64 to 70 MiB. Loading Grafana's UI in
+  a browser briefly took Grafana alone to about 630 MiB.
+- Disk: about 3 GB for the images, plus about 250 MB for the app's image, plus the
+  data.
 - Tested on Linux and on Windows 11 with Docker Desktop, both on amd64; macOS and arm64
   have not been tested. Details are in
   [docs/stack.md](https://github.com/Luanderson-Dev/cc-observatory/blob/main/docs/stack.md#requirements).
