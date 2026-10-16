@@ -1,0 +1,25 @@
+# The build context of the app's image (stack/app/Dockerfile, ADR 0030), which compose
+# builds from the repository root. An allowlist: everything is left out, then only what
+# the build reads comes back, so a new file (a secret, a local database, raw captures)
+# never reaches the build by default. Left out with the rest: .env and .env.*, .git,
+# .venv, tests, docs, tools (tools/capture/out included), .github, the caches, dist,
+# build and local databases.
+*
+
+# The lockfile and the project's metadata, with the files the build backend reads
+# (readme and license-files in pyproject.toml).
+!pyproject.toml
+!uv.lock
+!README.md
+!LICENSE
+!.python-version
+
+# The package.
+!src
+
+# Never from inside the package: bytecode and local databases.
+**/__pycache__
+**/*.py[cod]
+**/*.db
+**/*.db-wal
+**/*.db-shm

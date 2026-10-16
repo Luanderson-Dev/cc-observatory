@@ -51,3 +51,11 @@ the ADR wins.
 | [0020](0020-compose-conventions.md)                          | Compose conventions for a no-extra-steps start on Linux, macOS and Windows            | Accepted |
 | [0021](0021-collector-privacy-filters.md)                    | Privacy filters in the collector                                                      | Accepted |
 | [0022](0022-the-host-label.md)                               | The host label: one configured value, set by the collector on every signal            | Accepted |
+| [0023](0023-per-event-allowlist-of-hook-metadata.md)         | The app keeps a per-event allowlist of hook metadata                                  | Accepted |
+| [0024](0024-session-agent-and-block-state-machine.md)        | A hook-driven reducer derives session, agent and block state                          | Accepted |
+| [0025](0025-registered-hook-events.md)                       | Register only the hook events the state machine needs                                 | Accepted |
+| [0026](0026-app-database-schema-migrations-and-retention.md) | The app database: metadata-only schema, Alembic at start-up, retention by last event  | Accepted |
+| [0027](0027-the-app-http-surface-and-hook-queue.md)          | The app's HTTP surface: guarded routes, a neutral hook route and a bounded queue      | Accepted |
+| [0028](0028-app-metrics-and-their-listener.md)               | The app's metrics: fixed-cardinality series on a separate, unpublished listener       | Accepted |
+| [0029](0029-closing-esc-denials-from-loki.md)                | Permission blocks denied with Esc are closed from Loki's `tool_decision` rejects      | Accepted |
+| [0030](0030-the-app-container.md)                            | The app container: built locally from the clone, non-root, published on loopback      | Accepted |

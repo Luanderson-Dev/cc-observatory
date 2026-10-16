@@ -41,6 +41,9 @@ DEFAULT_PORTS: Final[Mapping[str, int]] = MappingProxyType(
         "CCOBS_PROMETHEUS_PORT": 24390,
         "CCOBS_LOKI_PORT": 24310,
         "CCOBS_TEMPO_PORT": 24320,
+        "CCOBS_APP_PORT": 24300,
+        # Published only by compose.debug.yaml, which the project always applies.
+        "CCOBS_APP_METRICS_PORT": 24301,
     }
 )
 OVERRIDE_PREFIX: Final = "CCOBS_IT_"

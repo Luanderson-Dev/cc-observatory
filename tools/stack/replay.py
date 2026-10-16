@@ -11,9 +11,17 @@ sessions. ``prepare`` turns one scenario into requests that look fresh:
   collector must delete or drop them (identity and content attributes, ADR 0021).
 
 It also computes the total each metric series should reach once stored. ``post_otlp`` and
-``send`` deliver the requests. Run it from the repository root::
+``send`` deliver the requests.
+
+The hook fixtures in ``tests/fixtures/hooks/`` replay to the app's hook route the same
+way: ``prepare_hooks`` gives a scenario's hook payloads the run's session ID (pass the
+``session_id`` of ``prepare``'s result, so that hooks and telemetry of one scenario share
+it; ``fresh_session_id`` makes one), optionally with canaries in every content field
+(ADR 0023), and ``send_hooks`` POSTs them in file order, each answered with an empty 204
+or the replay fails. Run it from the repository root::
 
     uv run python -m tools.stack.replay --endpoint http://127.0.0.1:4318 --dry-run
+    uv run python -m tools.stack.replay --hooks-endpoint http://127.0.0.1:4300 --hooks-only
 
 Developer tool, standard library only; not part of the published package.
 """
@@ -30,7 +38,7 @@ import sys
 import time
 import uuid
 from collections import defaultdict
-from collections.abc import Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -125,6 +133,58 @@ SPAN_CANARY_KEYS: Final = (
 # metadata that the collector keeps, deleting identity and host paths from them.
 SPAN_EVENT_CANARY_KEYS: Final = (*IDENTITY_CANARY_KEYS, *HOST_PATHS_CANARY_KEYS)
 
+# Hook canaries: values planted in every hook field the app must never store (ADR 0023),
+# on every line. Each key gets a string canary, which replaces any value it had, except
+# where a value holds metadata the app keeps next to content:
+#   - tool_response keeps its status (async_launched starts a background subagent);
+#   - effort, mcp_server and each background_tasks item keep their keys and get one
+#     more, with the canary;
+#   - error on StopFailure is an error code the app keeps; elsewhere it is free text;
+#   - reason is kept on SessionEnd, and free text only on PermissionDenied.
+# So the app's state comes out the same as without canaries.
+HOOK_CONTENT_CANARY_KEYS: Final = (
+    "prompt",
+    "tool_input",
+    "tool_calls",
+    "last_assistant_message",
+    "error_details",
+    "message",
+    "title",
+    "requested_schema",
+    "permission_suggestions",
+    "custom_instructions",
+    "compact_summary",
+    "task_id",
+    "task_subject",
+    "task_description",
+    "session_title",
+    "transcript_path",
+    "scratchpad_dir",
+    "agent_transcript_path",
+    "file_path",
+    "url",
+    "content",
+    "globs",
+    "trigger_file_path",
+    "parent_file_path",
+    "session_crons",
+    "description",
+    "command",
+    # A key Claude Code does not send: unknown keys are dropped too.
+    "x_ccobs_unknown",
+)
+# Objects whose other keys are kept as they are; the canary goes under this key.
+HOOK_NESTED_CANARY_KEYS: Final = ("tool_response", "effort", "mcp_server", "background_tasks")
+HOOK_NESTED_KEY: Final = "x_ccobs_canary"
+# Keys that are free text on some events only (see above): error on every event but
+# StopFailure, reason on PermissionDenied.
+HOOK_ERROR_CODE_EVENT: Final = "StopFailure"
+HOOK_REASON_TEXT_EVENT: Final = "PermissionDenied"
+DEFAULT_HOOKS_ENDPOINT: Final = "http://127.0.0.1:4300"
+HOOKS_PATH: Final = "/hooks"
+# The app's only answer to a hook (ADR 0027).
+HOOK_STATUS: Final = 204
+
 # Export request layout per signal: resource list -> scope list -> item list.
 _LAYOUT: Final[dict[Signal, tuple[str, str, str]]] = {
     "metrics": ("resourceMetrics", "scopeMetrics", "metrics"),
@@ -157,13 +217,15 @@ class ReplayError(Exception):
 
 @dataclass(frozen=True)
 class Scenario:
-    """One fixture scenario: its original session ID and export requests per signal."""
+    """One fixture scenario: its original session ID, export requests per signal and
+    hook lines (``{"offset_ms", "transport", "payload"}`` objects, in file order)."""
 
     name: str
     session_id: str
     metrics: tuple[JSONObject, ...] = ()
     logs: tuple[JSONObject, ...] = ()
     traces: tuple[JSONObject, ...] = ()
+    hooks: tuple[JSONObject, ...] = ()
 
     def requests(self, signal: Signal) -> tuple[JSONObject, ...]:
         """The export requests of ``signal``, in file order."""
@@ -192,33 +254,50 @@ def _files(entry: JSONObject) -> set[str]:
     return {path for path in files if isinstance(path, str)} if isinstance(files, list) else set()
 
 
-def scenario_names(fixtures_dir: Path = DEFAULT_FIXTURES, *, with_otlp: bool = False) -> list[str]:
-    """Scenario names in manifest order; with ``with_otlp``, only those with OTLP data."""
+def _hooks_path(name: str) -> str:
+    return f"hooks/{name}.jsonl"
+
+
+def scenario_names(
+    fixtures_dir: Path = DEFAULT_FIXTURES, *, with_otlp: bool = False, with_hooks: bool = False
+) -> list[str]:
+    """Scenario names in manifest order. With ``with_otlp`` or ``with_hooks``, only those
+    that have OTLP data or hook lines; with both, those that have either."""
     names: list[str] = []
     for entry in _manifest_scenarios(fixtures_dir):
         name = entry.get("name")
         if not isinstance(name, str):
             continue
-        if with_otlp and not any(_otlp_path(name, signal) in _files(entry) for signal in SIGNALS):
+        files = _files(entry)
+        has_otlp = any(_otlp_path(name, signal) in files for signal in SIGNALS)
+        has_hooks = _hooks_path(name) in files
+        if (with_otlp or with_hooks) and not (
+            (with_otlp and has_otlp) or (with_hooks and has_hooks)
+        ):
             continue
         names.append(name)
     return names
 
 
-def _read_requests(path: Path) -> tuple[JSONObject, ...]:
-    requests: list[JSONObject] = []
+def _read_objects(path: Path, what: str) -> tuple[JSONObject, ...]:
+    objects: list[JSONObject] = []
     for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
         if not line.strip():
             continue
-        request = json.loads(line)
-        if not isinstance(request, dict):
-            raise ValueError(f"{path}:{number}: expected an OTLP export request object")
-        requests.append(request)
-    return tuple(requests)
+        item = json.loads(line)
+        if not isinstance(item, dict):
+            raise ValueError(f"{path}:{number}: expected {what} object")
+        objects.append(item)
+    return tuple(objects)
+
+
+def _read_requests(path: Path) -> tuple[JSONObject, ...]:
+    return _read_objects(path, "an OTLP export request")
 
 
 def load_scenario(name: str, fixtures_dir: Path = DEFAULT_FIXTURES) -> Scenario:
-    """The scenario ``name`` of the manifest; a hooks-only scenario has no requests."""
+    """The scenario ``name`` of the manifest; a hooks-only scenario has no requests, and
+    a scenario without a hook fixture no hook lines."""
     entries = {entry.get("name"): entry for entry in _manifest_scenarios(fixtures_dir)}
     entry = entries.get(name)
     if entry is None:
@@ -232,7 +311,9 @@ def load_scenario(name: str, fixtures_dir: Path = DEFAULT_FIXTURES) -> Scenario:
         path = _otlp_path(name, signal)
         return _read_requests(fixtures_dir / path) if path in files else ()
 
-    return Scenario(name, session_id, read("metrics"), read("logs"), read("traces"))
+    hooks_path = _hooks_path(name)
+    hooks = _read_objects(fixtures_dir / hooks_path, "a hook line") if hooks_path in files else ()
+    return Scenario(name, session_id, read("metrics"), read("logs"), read("traces"), hooks)
 
 
 # Attributes and series.
@@ -743,6 +824,18 @@ def _plant_canaries(requests: Mapping[Signal, list[JSONObject]], marker: str) ->
     return frozenset(planted)
 
 
+def fresh_session_id(rng: RandomBits | None = None) -> str:
+    """A new UUID4 session ID, from ``rng`` (``random.SystemRandom`` by default). Pass
+    one value to ``prepare`` and ``prepare_hooks`` so that a scenario's telemetry and
+    hooks share it."""
+    source: RandomBits = rng if rng is not None else random.SystemRandom()
+    return str(uuid.UUID(int=source.getrandbits(128), version=4))
+
+
+def _new_marker(rng: RandomBits) -> str:
+    return f"{CANARY_PREFIX}{rng.getrandbits(64):016x}"
+
+
 def prepare(
     scenario: Scenario,
     *,
@@ -760,7 +853,7 @@ def prepare(
     constants and ``CONTENT_EVENT_NAMES``)."""
     source: RandomBits = rng if rng is not None else random.SystemRandom()
     if session_id is None:
-        session_id = str(uuid.UUID(int=source.getrandbits(128), version=4))
+        session_id = fresh_session_id(source)
     requests: dict[Signal, list[JSONObject]] = {
         signal: copy.deepcopy(list(scenario.requests(signal))) for signal in SIGNALS
     }
@@ -778,7 +871,7 @@ def prepare(
     marker: str | None = None
     planted: frozenset[str] = frozenset()
     if canaries:
-        marker = f"{CANARY_PREFIX}{source.getrandbits(64):016x}"
+        marker = _new_marker(source)
         _add_content_events(requests["logs"], session_id)
         planted = _plant_canaries(requests, marker)
     if temporality == "cumulative":
@@ -793,6 +886,149 @@ def prepare(
         expected=expected,
         canary_marker=marker,
         canary_values=planted,
+    )
+
+
+# Preparing the hooks.
+
+
+@dataclass(frozen=True)
+class HookLine:
+    """One hook of a scenario: how long after the scenario's first hook Claude Code sent
+    it (``offset_ms``), through which transport (``http``, or ``command`` for the async
+    SessionStart hook, which posts the same JSON to the same route; ADR 0011), and the
+    payload to POST."""
+
+    offset_ms: int
+    transport: str
+    payload: JSONObject
+
+
+@dataclass(frozen=True)
+class PreparedHooks:
+    """A scenario's hook lines ready to POST, in file order. ``canary_values`` holds
+    every planted value; each one starts with ``canary_marker`` and names its place."""
+
+    scenario: str
+    session_id: str
+    lines: tuple[HookLine, ...]
+    canary_marker: str | None = None
+    canary_values: frozenset[str] = frozenset()
+
+    def summary(self) -> JSONObject:
+        """A JSON summary: session ID, line count and canary marker."""
+        return {
+            "scenario": self.scenario,
+            "session_id": self.session_id,
+            "hook_lines": len(self.lines),
+            "canary_marker": self.canary_marker,
+            "canary_value_count": len(self.canary_values),
+        }
+
+
+def _hook_line(item: JSONObject, where: str) -> tuple[int, str, JSONObject]:
+    offset, transport, payload = item.get("offset_ms"), item.get("transport"), item.get("payload")
+    if (
+        isinstance(offset, bool)
+        or not isinstance(offset, int)
+        or not isinstance(transport, str)
+        or not isinstance(payload, dict)
+    ):
+        raise ValueError(f"{where}: expected an integer offset_ms, a transport and a payload")
+    return offset, transport, payload
+
+
+def _replace_text(node: JSON, old: str, new: str) -> JSON:
+    """``node`` with ``old`` replaced by ``new`` in every string value (keys stay)."""
+    if isinstance(node, str):
+        return node.replace(old, new)
+    if isinstance(node, list):
+        return [_replace_text(value, old, new) for value in node]
+    if isinstance(node, dict):
+        return _replace_in_object(node, old, new)
+    return node
+
+
+def _replace_in_object(node: JSONObject, old: str, new: str) -> JSONObject:
+    return {key: _replace_text(value, old, new) for key, value in node.items()}
+
+
+def _plant_hook_canaries(payload: JSONObject, marker: str, place: str, planted: set[str]) -> None:
+    """Plant canaries in ``payload`` in place (see ``HOOK_CONTENT_CANARY_KEYS``)."""
+
+    def canary(key: str) -> str:
+        value = f"{marker}:{place}:{key}"
+        planted.add(value)
+        return value
+
+    event = payload.get("hook_event_name")
+    for key in HOOK_CONTENT_CANARY_KEYS:
+        payload[key] = canary(key)
+    if event != HOOK_ERROR_CODE_EVENT:
+        payload["error"] = canary("error")
+    if event == HOOK_REASON_TEXT_EVENT:
+        payload["reason"] = canary("reason")
+    for key in HOOK_NESTED_CANARY_KEYS:
+        current = payload.get(key)
+        if key == "background_tasks":
+            # Only the tasks that are there: a new task would change the app's state.
+            if isinstance(current, list):
+                payload[key] = [
+                    {**item, HOOK_NESTED_KEY: canary(f"{key}.{index}")}
+                    if isinstance(item, dict)
+                    else item
+                    for index, item in enumerate(current)
+                ]
+        elif isinstance(current, dict):
+            payload[key] = {**current, HOOK_NESTED_KEY: canary(key)}
+        else:
+            payload[key] = {HOOK_NESTED_KEY: canary(key)}
+
+
+def prepare_hooks(
+    scenario: Scenario,
+    *,
+    session_id: str | None = None,
+    canaries: bool = False,
+    canary_marker: str | None = None,
+    rng: RandomBits | None = None,
+) -> PreparedHooks:
+    """Fresh hook payloads for ``scenario``, which is left untouched.
+
+    The scenario's session ID becomes ``session_id`` (a new UUID4 by default) in every
+    string of every payload, so that ``transcript_path`` and the like follow it; pass the
+    ``session_id`` of ``prepare``'s result to share it with the telemetry. With
+    ``canaries``, a canary goes in every content field (``HOOK_CONTENT_CANARY_KEYS``),
+    under ``canary_marker`` (a new one by default; pass ``prepare``'s to search both with
+    one marker). Offsets and transports stay as they were. Raises ``ValueError`` on a
+    malformed line, or on a payload whose ``session_id`` is not the scenario's (it would
+    keep its own ID, which the replacement above misses)."""
+    source: RandomBits = rng if rng is not None else random.SystemRandom()
+    if session_id is None:
+        session_id = fresh_session_id(source)
+    marker = (canary_marker or _new_marker(source)) if canaries else None
+    planted: set[str] = set()
+    lines: list[HookLine] = []
+    for number, item in enumerate(scenario.hooks):
+        where = f"{scenario.name} hook line {number + 1}"
+        offset, transport, payload = _hook_line(item, where)
+        if "session_id" in payload and payload["session_id"] != scenario.session_id:
+            raise ValueError(f"{where}: the payload's session_id is not the scenario's")
+        fresh = (
+            _replace_in_object(payload, scenario.session_id, session_id)
+            if scenario.session_id
+            else copy.deepcopy(payload)
+        )
+        fresh["session_id"] = session_id
+        if marker is not None:
+            _plant_hook_canaries(fresh, marker, f"hooks.line{number}", planted)
+        lines.append(HookLine(offset, transport, fresh))
+    return PreparedHooks(
+        scenario=scenario.name,
+        session_id=session_id,
+        lines=tuple(lines),
+        canary_marker=marker,
+        canary_values=frozenset(planted),
     )
 
 
@@ -842,15 +1078,13 @@ def _rejections(reply: bytes) -> str | None:
     return f"rejected {', '.join(counts)}{detail}"
 
 
-def post_otlp(
-    endpoint: str, signal: Signal, request: JSONObject, *, timeout: float = DEFAULT_TIMEOUT
-) -> int:
-    """POST one export request as JSON to ``{endpoint}/v1/{signal}``; return the status.
-
-    Raises ``ReplayError`` on a non-2xx answer (with the status and the start of the
-    body), on a 2xx answer whose ``partialSuccess`` reports rejected data points, log
-    records or spans, when the collector cannot be reached or does not answer within
-    ``timeout``, or when ``endpoint`` is not http(s)."""
+def _post_json(
+    endpoint: str, suffix: str, document: JSONObject, *, timeout: float
+) -> tuple[str, int, bytes]:
+    """POST ``document`` as JSON to ``{endpoint}{suffix}`` on a connection of its own;
+    return the URL, the status and the start of the body. Raises ``ReplayError`` when
+    the server cannot be reached or does not answer within ``timeout``, or when
+    ``endpoint`` is not http(s)."""
     parts = urlsplit(endpoint)
     try:
         port = parts.port
@@ -858,13 +1092,13 @@ def post_otlp(
         raise ReplayError(f"invalid endpoint {endpoint!r}: {error}") from None
     if parts.scheme not in ("http", "https") or not parts.hostname:
         raise ReplayError(f"the endpoint must be an http:// or https:// URL, got {endpoint!r}")
-    path = f"{parts.path.rstrip('/')}/v1/{signal}"
+    path = f"{parts.path.rstrip('/')}{suffix}"
     url = f"{parts.scheme}://{parts.netloc}{path}"
     connection_type = (
         http.client.HTTPSConnection if parts.scheme == "https" else http.client.HTTPConnection
     )
     connection = connection_type(parts.hostname, port, timeout=timeout)
-    body = json.dumps(request, separators=(",", ":")).encode()
+    body = json.dumps(document, separators=(",", ":")).encode()
     try:
         try:
             connection.connect()
@@ -879,6 +1113,19 @@ def post_otlp(
             raise ReplayError(f"POST {url} got no answer: {error}") from error
     finally:
         connection.close()
+    return url, status, reply
+
+
+def post_otlp(
+    endpoint: str, signal: Signal, request: JSONObject, *, timeout: float = DEFAULT_TIMEOUT
+) -> int:
+    """POST one export request as JSON to ``{endpoint}/v1/{signal}``; return the status.
+
+    Raises ``ReplayError`` on a non-2xx answer (with the status and the start of the
+    body), on a 2xx answer whose ``partialSuccess`` reports rejected data points, log
+    records or spans, when the collector cannot be reached or does not answer within
+    ``timeout``, or when ``endpoint`` is not http(s)."""
+    url, status, reply = _post_json(endpoint, f"/v1/{signal}", request, timeout=timeout)
     if not 200 <= status < 300:
         text = _bounded(reply.decode("utf-8", errors="replace"))
         raise ReplayError(f"POST {url} answered {status}: {text}")
@@ -905,57 +1152,188 @@ def send(
     return sent
 
 
+def post_hook(endpoint: str, payload: JSONObject, *, timeout: float = DEFAULT_TIMEOUT) -> None:
+    """POST one hook payload as JSON to ``{endpoint}/hooks``, the app's hook route.
+
+    Raises ``ReplayError`` unless the answer is the app's neutral one, a 204 with an empty
+    body (ADR 0027), and as ``post_otlp`` does for an unreachable or silent server or an
+    endpoint that is not http(s)."""
+    url, status, reply = _post_json(endpoint, HOOKS_PATH, payload, timeout=timeout)
+    if status != HOOK_STATUS or reply:
+        text = _bounded(reply.decode("utf-8", errors="replace"))
+        raise ReplayError(
+            f"POST {url} answered {status} with a {len(reply)}-byte body, not an empty "
+            f"{HOOK_STATUS}: {text}"
+        )
+
+
+def send_hooks(
+    endpoint: str,
+    lines: Iterable[HookLine],
+    *,
+    speed: float | None = None,
+    timeout: float = DEFAULT_TIMEOUT,
+    sleep: Callable[[float], object] | None = None,
+    monotonic: Callable[[], float] | None = None,
+) -> list[float]:
+    """POST ``lines`` (a ``PreparedHooks``'s, or a part of them) in order, each on a
+    connection of its own; return how long each POST took, in seconds, connecting
+    included. Stops at the first ``ReplayError``.
+
+    By default the lines go back to back: the app stamps each hook with its own receive
+    time and its state machine depends only on the order (ADRs 0024 and 0027), so the
+    real gaps (the longest scenario spans more than two minutes) would add only wall
+    time. With ``speed``, each line waits until ``offset_ms / speed`` after the first one
+    went out (``1.0`` is real time, ``10.0`` ten times faster), for what does depend on
+    time, such as the reconciler's grace period or a live view. ``sleep`` defaults to
+    ``time.sleep`` and ``monotonic`` to ``time.perf_counter``, a monotonic clock with
+    sub-millisecond resolution (``time.monotonic`` ticks every 15.6 ms on Windows)."""
+    if speed is not None and not speed > 0:
+        raise ValueError(f"speed must be positive, got {speed}")
+    sleep = sleep or time.sleep
+    monotonic = monotonic or time.perf_counter
+    durations: list[float] = []
+    started: float | None = None
+    first_ms = 0
+    for line in lines:
+        if started is None:
+            started, first_ms = monotonic(), line.offset_ms
+        elif speed is not None:
+            delay = started + (line.offset_ms - first_ms) / 1000 / speed - monotonic()
+            if delay > 0:
+                sleep(delay)
+        before = monotonic()
+        post_hook(endpoint, line.payload, timeout=timeout)
+        durations.append(monotonic() - before)
+    return durations
+
+
 # Command line.
+
+
+@dataclass(frozen=True)
+class _Run:
+    """One scenario of the command line: its telemetry and, if asked, its hooks."""
+
+    telemetry: Prepared
+    hooks: PreparedHooks | None
+
+    def summary(self, *, otlp: bool) -> JSONObject:
+        summary = self.telemetry.summary()
+        if not otlp:
+            summary["requests"] = dict.fromkeys(SIGNALS, 0)
+        if self.hooks is not None:
+            # The hooks' own marker when no telemetry canary was planted (--hooks-only).
+            summary["canary_marker"] = self.telemetry.canary_marker or self.hooks.canary_marker
+            summary["hook_lines"] = len(self.hooks.lines)
+            summary["hook_canary_value_count"] = len(self.hooks.canary_values)
+        return summary
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     """Prepare and send scenarios, then print a JSON summary of the scenarios sent (all
-    of them with ``--dry-run``). On a send error, stop: the summary also names the failed
-    scenario (possibly sent in part), one line goes to stderr, and the result is 1."""
+    of them with ``--dry-run``). With ``--hooks-endpoint``, each scenario's hooks go to
+    the app first, with the session ID of its telemetry. On a send error, stop: the
+    summary also names the failed scenario (possibly sent in part), one line goes to
+    stderr, and the result is 1."""
     parser = argparse.ArgumentParser(
         prog="python -m tools.stack.replay",
-        description="Replay the OTLP fixtures to an OpenTelemetry Collector (OTLP/HTTP JSON).",
+        description=(
+            "Replay the OTLP fixtures to an OpenTelemetry Collector (OTLP/HTTP JSON), and "
+            "optionally the hook fixtures to the app."
+        ),
     )
     parser.add_argument(
-        "--endpoint", default=DEFAULT_ENDPOINT, help=f"OTLP/HTTP base URL ({DEFAULT_ENDPOINT})"
+        "--endpoint",
+        help=f"OTLP/HTTP base URL ({DEFAULT_ENDPOINT}); not with --hooks-only",
+    )
+    parser.add_argument(
+        "--hooks-endpoint",
+        metavar="URL",
+        help=f"also POST the hooks to the app at this base URL (such as {DEFAULT_HOOKS_ENDPOINT})",
+    )
+    parser.add_argument(
+        "--hooks-only", action="store_true", help="send the hooks only, no telemetry"
+    )
+    parser.add_argument(
+        "--speed",
+        type=float,
+        metavar="FACTOR",
+        help="pace the hooks at offset_ms / FACTOR (1 is real time; default: back to back)",
     )
     parser.add_argument(
         "--scenario",
         action="append",
         choices=scenario_names(),
         metavar="NAME",
-        help="scenario to replay, repeatable (default: every scenario with OTLP data)",
+        help=(
+            "scenario to replay, repeatable (default: every scenario with data to send: "
+            "OTLP data, hooks, or either)"
+        ),
     )
     parser.add_argument("--temporality", choices=TEMPORALITIES, default="delta")
     parser.add_argument("--canaries", action="store_true", help="plant privacy canaries")
     parser.add_argument("--dry-run", action="store_true", help="prepare and print, send nothing")
     parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT, help="seconds per POST")
     args = parser.parse_args(argv)
+    hooks_endpoint: str | None = args.hooks_endpoint
+    if hooks_endpoint is None:
+        for flag, given in (("--hooks-only", args.hooks_only), ("--speed", args.speed is not None)):
+            if given:
+                parser.error(f"{flag} needs --hooks-endpoint")
+    if args.speed is not None and not args.speed > 0:
+        parser.error(f"--speed must be positive, got {args.speed}")
+    if args.hooks_only and args.endpoint is not None:
+        parser.error("--endpoint does not go with --hooks-only, which sends no telemetry")
+    otlp = not args.hooks_only
+    endpoint: str = args.endpoint or DEFAULT_ENDPOINT
 
-    names: list[str] = args.scenario or scenario_names(with_otlp=True)
+    names: list[str] = args.scenario or scenario_names(
+        with_otlp=otlp, with_hooks=hooks_endpoint is not None
+    )
     temporality: Temporality = "cumulative" if args.temporality == "cumulative" else "delta"
     now_ns = time.time_ns()
-    runs = [
-        prepare(load_scenario(name), now_ns=now_ns, temporality=temporality, canaries=args.canaries)
-        for name in names
-    ]
+    runs: list[_Run] = []
+    for name in names:
+        scenario = load_scenario(name)
+        telemetry = prepare(
+            scenario, now_ns=now_ns, temporality=temporality, canaries=args.canaries and otlp
+        )
+        hooks = (
+            prepare_hooks(
+                scenario,
+                session_id=telemetry.session_id,
+                canaries=args.canaries,
+                canary_marker=telemetry.canary_marker,
+            )
+            if hooks_endpoint is not None
+            else None
+        )
+        runs.append(_Run(telemetry, hooks))
     done = list(runs) if args.dry_run else []
     failed: JSONObject | None = None
     if not args.dry_run:
         for run in runs:
             try:
-                send(args.endpoint, run, timeout=args.timeout)
+                if run.hooks is not None and hooks_endpoint is not None:
+                    send_hooks(
+                        hooks_endpoint, run.hooks.lines, speed=args.speed, timeout=args.timeout
+                    )
+                if otlp:
+                    send(endpoint, run.telemetry, timeout=args.timeout)
             except ReplayError as error:
-                print(f"replay failed: {run.scenario}: {error}", file=sys.stderr)
-                failed = {"scenario": run.scenario, "session_id": run.session_id}
+                scenario_name = run.telemetry.scenario
+                print(f"replay failed: {scenario_name}: {error}", file=sys.stderr)
+                failed = {"scenario": scenario_name, "session_id": run.telemetry.session_id}
                 failed["error"] = str(error)
                 break
             done.append(run)
     output: JSONObject = {
-        "endpoint": args.endpoint,
+        "endpoint": endpoint if otlp else None,
+        "hooks_endpoint": hooks_endpoint,
         "sent": not args.dry_run,
         "now_ns": now_ns,
-        "scenarios": [run.summary() for run in done],
+        "scenarios": [run.summary(otlp=otlp) for run in done],
         "failed": failed,
     }
     print(json.dumps(output, indent=2))
