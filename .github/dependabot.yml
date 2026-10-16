@@ -127,8 +127,9 @@ updates:
           - "version-update:semver-major"
       # uv stays within [tool.uv] required-version (>=0.12.23,<0.13) of pyproject.toml,
       # which uv enforces: a new minor is moved by hand, with that range and the
-      # uv_build bound.
-      - dependency-name: ghcr.io/astral-sh/uv
+      # uv_build bound. Dependabot names the image without its registry. The 7-day
+      # cooldown does not apply to it either: GHCR gives no publication date.
+      - dependency-name: astral-sh/uv
         update-types:
           - "version-update:semver-minor"
           - "version-update:semver-major"
