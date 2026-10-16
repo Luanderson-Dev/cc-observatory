@@ -563,6 +563,13 @@ def test_list_sessions_orders_by_last_event_and_filters_by_status(repo: Reposito
     assert repo.load_open_states().keys() == {SESSION, OTHER}
 
 
+def test_session_exists(repo: Repository) -> None:
+    Writer(repo)(event("UserPromptSubmit"), BASE)
+
+    assert repo.session_exists(SESSION)
+    assert not repo.session_exists(OTHER)
+
+
 def test_unknown_sessions(repo: Repository) -> None:
     assert repo.get_session(SESSION) is None
     assert repo.load_state(SESSION) is None

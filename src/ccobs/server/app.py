@@ -17,9 +17,11 @@ from contextlib import asynccontextmanager
 from typing import Final, Protocol
 
 from fastapi import FastAPI
+from fastapi.exceptions import RequestValidationError
 from starlette.routing import Route
 from starlette.types import Receive, Scope, Send
 
+from ccobs.server import api
 from ccobs.server.config import Settings
 from ccobs.server.db.engine import create_engine_for
 from ccobs.server.db.repository import Repository
@@ -186,6 +188,8 @@ def create_app(
         # No 307 from /hooks/ to /hooks (or anywhere): the hook route answers only 204,
         # and HOOK_PATHS serves it with and without the slash.
         redirect_slashes=False,
+        # A 422 that echoes no request value (the API's query parameters).
+        exception_handlers={RequestValidationError: api.validation_error},
     )
     app.state.queue = hook_queue
     for path in sorted(HOOK_PATHS):
@@ -195,5 +199,7 @@ def create_app(
     async def healthz() -> dict[str, str]:
         return {"status": "ok"}
 
+    # The read-only JSON API, behind the same Host guard.
+    app.include_router(api.router)
     app.add_middleware(HostGuard, queue=hook_queue)
     return app

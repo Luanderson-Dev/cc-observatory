@@ -391,6 +391,11 @@ class Repository:
             rows = connection.execute(statement.limit(limit)).mappings()
             return [SessionView(host=row["host"], session=_session(row)) for row in rows]
 
+    def session_exists(self, session_id: str) -> bool:
+        with self.engine.connect() as connection:
+            statement = select(SessionModel.session_id).where(SessionModel.session_id == session_id)
+            return connection.execute(statement).first() is not None
+
     def get_session(self, session_id: str) -> SessionDetail | None:
         with self.engine.connect() as connection:
             row = (

@@ -900,6 +900,18 @@ def test_required_fields_at_the_limit_are_accepted() -> None:
     assert (len(event.session_id), len(event.hook_event_name)) == (LIMIT, LIMIT)
 
 
+@pytest.mark.parametrize("value", ["", "x" * (LIMIT + 1), *BAD_TEXT])
+def test_session_ids_outside_the_bounds_are_not_valid(value: str) -> None:
+    assert not hooks.is_valid_session_id(value)
+
+
+@pytest.mark.parametrize("value", [SESSION, "s", "s" * LIMIT, "../etc", "é"])
+def test_session_ids_within_the_bounds_are_valid(value: str) -> None:
+    # The same rule parse_hook applies, so every stored session_id passes it.
+    assert hooks.is_valid_session_id(value)
+    assert parse_hook(payload("Stop") | {"session_id": value}).session_id == value
+
+
 def test_prompt_length_is_not_bounded_by_the_string_limit() -> None:
     event = parse_hook(payload("UserPromptSubmit", prompt="line\n" * 1000 + "\ud800"))
 

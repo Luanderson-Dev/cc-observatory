@@ -51,6 +51,7 @@ __all__ = [
     "ToolEvent",
     "UnknownHookEvent",
     "UserPromptSubmit",
+    "is_valid_session_id",
     "parse_hook",
 ]
 
@@ -266,6 +267,13 @@ def _safe_text(value: object, limit: int = _MAX_TEXT) -> str | None:
     if not isinstance(value, str) or len(value) > limit or _UNSAFE_CHARACTER.search(value):
         return None
     return value
+
+
+def is_valid_session_id(value: str) -> bool:
+    """Whether ``parse_hook`` would accept ``value`` as a ``session_id``: non-empty, at most
+    256 characters, no control character and no lone surrogate. Every stored session ID
+    passes it, so a reader can refuse any other value without a lookup."""
+    return bool(_safe_text(value))
 
 
 def _str(payload: _Payload, key: str, limit: int = _MAX_TEXT) -> str | None:
