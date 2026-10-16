@@ -17,6 +17,9 @@ from urllib.parse import urlsplit
 
 import yaml
 
+from ccobs.domain.app_metrics import SCRAPE_JOB
+from ccobs.server.config import Settings
+
 ROOT: Final = Path(__file__).resolve().parents[1]
 CONFIG: Final = ROOT / "stack" / "prometheus" / "prometheus.yaml"
 COMPOSE: Final = ROOT / "compose.yaml"
@@ -52,6 +55,9 @@ SCRAPE_KEYS: Final = frozenset(
 # Prometheus scrapes itself and the collector's own telemetry (otelcol_*).
 SELF_TARGET: Final = "localhost:9090"
 COLLECTOR_SERVICE: Final = "otel-collector"
+# The app's metrics listener, never published (ADR 0028), scraped at the global interval.
+APP_SERVICE: Final = "app"
+SCRAPE_INTERVAL: Final = "15s"
 DURATION: Final = re.compile(r"(?P<amount>\d+)(?P<unit>h|d|w|y)")
 _HOURS: Final = {"h": 1, "d": 24, "w": 24 * 7, "y": 24 * 365}
 
@@ -246,10 +252,34 @@ def test_scrape_job_names_are_unique() -> None:
     assert len(names) == len(set(names)), names
 
 
-def test_prometheus_scrapes_itself_and_the_collector_telemetry() -> None:
+def _app_target() -> str:
+    return f"{APP_SERVICE}:{Settings.model_fields['metrics_port'].default}"
+
+
+def test_prometheus_scrapes_itself_the_collector_telemetry_and_the_app() -> None:
     targets = {target for job in _scrape_configs() for target in _targets(job)}
     collector = yaml.safe_load(COLLECTOR_CONFIG.read_text(encoding="utf-8"))
     readers = _list(_at(collector, "service", "telemetry", "metrics", "readers"), "readers")
     ports = {_at(reader, "pull", "exporter", "prometheus", "port") for reader in readers}
     assert len(ports) == 1, f"expected one Prometheus reader, got ports {ports}"
-    assert targets == {SELF_TARGET, f"{COLLECTOR_SERVICE}:{ports.pop()}"}
+    assert targets == {SELF_TARGET, f"{COLLECTOR_SERVICE}:{ports.pop()}", _app_target()}
+
+
+def test_the_app_job_scrapes_its_metrics_listener_at_the_global_interval() -> None:
+    # ADR 0028: job ccobs-app, target app:9464, every 15 s (the global interval).
+    assert _mapping(_config().get("global"), "global").get("scrape_interval") == SCRAPE_INTERVAL
+    (job,) = [job for job in _scrape_configs() if job.get("job_name") == SCRAPE_JOB]
+    assert _targets(job) == [_app_target()]
+    assert "scrape_interval" not in job
+    assert job.get("metrics_path", "/metrics") == "/metrics"
+
+
+def test_the_app_job_keeps_the_app_host_label() -> None:
+    # The app labels every series with host (ADR 0028). Prometheus renames a scraped
+    # label to exported_<name> only when a target label has the same name; the targets
+    # carry only job and instance, so host is stored as the app sent it, with no
+    # honor_labels (which would also let scraped job and instance labels win).
+    (job,) = [job for job in _scrape_configs() if job.get("job_name") == SCRAPE_JOB]
+    assert "honor_labels" not in job
+    for group in _list(job.get("static_configs"), "static_configs"):
+        assert "labels" not in _mapping(group, "static_configs entry")

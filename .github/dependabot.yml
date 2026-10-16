@@ -84,6 +84,9 @@ updates:
       # images are updated by the docker entry below; its tag follows the contrib version,
       # changed by hand in the same pull request.
       - dependency-name: cc-observatory-otel-collector
+      # The app's image, built locally from stack/app with the repository's own code and
+      # never pushed (ADR 0030); its base images are updated by the /stack/app entry.
+      - dependency-name: cc-observatory-app
 
   # The collector's Dockerfile: the contrib image and the busybox image it copies from
   # (both FROM lines, pinned like the compose images).
@@ -101,3 +104,31 @@ updates:
     commit-message:
       prefix: build
       include: scope
+
+  # The app's Dockerfile: the Python base image (builder and runtime stages) and the uv
+  # image it copies uv from, all FROM lines pinned like the compose images (ADR 0030).
+  # No group: a Python patch and a uv patch are tested on their own.
+  - package-ecosystem: docker
+    directory: /stack/app
+    target-branch: develop
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: build
+      include: scope
+    ignore:
+      # Python stays on the line of .python-version and the CI matrix's lowest version
+      # (3.12): a new minor is moved by hand, together with them.
+      - dependency-name: python
+        update-types:
+          - "version-update:semver-minor"
+          - "version-update:semver-major"
+      # uv stays within [tool.uv] required-version (>=0.12.23,<0.13) of pyproject.toml,
+      # which uv enforces: a new minor is moved by hand, with that range and the
+      # uv_build bound.
+      - dependency-name: ghcr.io/astral-sh/uv
+        update-types:
+          - "version-update:semver-minor"
+          - "version-update:semver-major"

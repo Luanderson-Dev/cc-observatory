@@ -13,6 +13,7 @@ import uvicorn
 from fastapi import FastAPI
 
 from ccobs.server import __main__ as server_main
+from ccobs.server import app as server_app
 
 
 @pytest.fixture(autouse=True)
@@ -92,9 +93,30 @@ def test_good_settings_run_one_uvicorn_worker(
         "proxy_headers": False,
         "server_header": False,
         "date_header": True,
+        "timeout_graceful_shutdown": 5,
     }
     # The app is built, not started: no database yet.
     assert not (tmp_path / "data" / "ccobs.db").exists()
+
+
+def test_graceful_shutdown_fits_the_compose_stop_grace_period(
+    runs: list[tuple[Any, dict[str, Any]]],
+) -> None:
+    # After SIGTERM uvicorn waits at most this long for open requests, then runs the
+    # lifespan's shutdown: the reconciler, the sweeper and the writer get 5 s each. The
+    # sum stays well inside compose's 30 s stop_grace_period (ADR 0030), so Docker never
+    # has to kill the app (exit 137) with hooks still queued.
+    server_main.main()
+
+    ((_, kwargs),) = runs
+    budget = (
+        kwargs["timeout_graceful_shutdown"]
+        + server_app.RECONCILER_STOP_TIMEOUT_S
+        + server_app.SWEEPER_STOP_TIMEOUT_S
+        + server_app.WRITER_STOP_TIMEOUT_S
+    )
+    assert kwargs["timeout_graceful_shutdown"] == 5
+    assert budget <= 30 * 2 / 3
 
 
 def test_listen_host_comes_from_the_settings(

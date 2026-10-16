@@ -66,6 +66,11 @@ def main() -> None:
         # RFC 9110 (section 6.6.1) asks an origin server with a clock for a Date header;
         # it reveals nothing.
         date_header=True,
+        # After SIGTERM, wait at most 5 s for open requests before the lifespan's
+        # shutdown (reconciler, sweeper and writer, 5 s each), so the whole stop stays
+        # well inside compose's 30 s stop_grace_period (ADR 0030). Without it uvicorn
+        # waits for every open connection, however long.
+        timeout_graceful_shutdown=5,
     )
 
 

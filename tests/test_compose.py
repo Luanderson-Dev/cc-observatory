@@ -9,6 +9,7 @@ services; the explicit tests at the end pin what exists now.
 from __future__ import annotations
 
 import itertools
+import os
 import re
 from collections.abc import Iterator, Mapping
 from pathlib import Path
@@ -18,6 +19,7 @@ import pytest
 import yaml
 
 from ccobs.domain.telemetry import DEFAULT_HOST, HOST_VALUE_PATTERN
+from ccobs.server.config import ENV_PREFIX, Settings
 
 ROOT: Final = Path(__file__).resolve().parents[1]
 COMPOSE: Final = ROOT / "compose.yaml"
@@ -61,9 +63,9 @@ VERSION_TAG: Final = re.compile(r"^v?\d+\.\d+\.\d+(?:-[a-z0-9]+)*$")
 LOKI_REPOSITORY: Final = "grafana/loki"
 TEMPO_REPOSITORY: Final = "grafana/tempo"
 GRAFANA_REPOSITORY: Final = "grafana/grafana"
-# The services that publish ports in compose.yaml: OTLP for Claude Code and Grafana for
-# the browser (ADR 0018); the app joins them in milestone 2.
-PUBLISHING_SERVICES: Final = frozenset({"otel-collector", "grafana"})
+# The services that publish ports in compose.yaml: OTLP for Claude Code, Grafana and the
+# app for the browser, and the app's hook route for Claude Code (ADRs 0018 and 0030).
+PUBLISHING_SERVICES: Final = frozenset({"otel-collector", "grafana", "app"})
 # Optional services, by compose profile: Tempo, because tracing is a beta feature of
 # Claude Code and off by default (ADR 0003).
 OPTIONAL_SERVICES: Final = {"tempo": ["traces"]}
@@ -82,6 +84,8 @@ CONTRIB_MENTION: Final = re.compile(r"\bcontrib (?P<version>v?\d+(?:\.\d+)+)")
 # .env.example allows in its value.
 HOST_VARIABLE: Final = "CCOBS_HOST_LABEL"
 HOST_VALUE: Final = HOST_VALUE_PATTERN
+# The services that read the host label: the collector (ADR 0022) and the app (ADR 0030).
+HOST_LABEL_SERVICES: Final = frozenset({"otel-collector", "app"})
 _UNITS: Final = {"b": 1, "k": 1024, "m": 1024**2, "g": 1024**3}
 _GO_UNITS: Final = {"B": 1, "KiB": 1024, "MiB": 1024**2, "GiB": 1024**3}
 
@@ -319,6 +323,12 @@ def test_go_service_sets_gomemlimit_below_mem_limit(name: str) -> None:
     assert 0.7 <= ratio <= 0.9, f"{name}: GOMEMLIMIT is {ratio:.0%} of mem_limit"
 
 
+@pytest.mark.parametrize("name", sorted(set(SERVICES) - GO_SERVICES))
+def test_only_go_services_set_gomemlimit(name: str) -> None:
+    # GOMEMLIMIT tunes Go's garbage collector; anywhere else it does nothing and misleads.
+    assert "GOMEMLIMIT" not in _environment(_services(COMPOSE)[name])
+
+
 @pytest.mark.parametrize("name", sorted(BACKEND_ONLY.intersection(SERVICES)))
 def test_storage_service_is_only_on_backend_and_publishes_nothing(name: str) -> None:
     service = _services(COMPOSE)[name]
@@ -332,9 +342,9 @@ def test_tempo_runs_only_in_the_traces_profile(name: str) -> None:
 
 
 @pytest.mark.parametrize("name", SERVICES)
-def test_only_the_collector_and_grafana_publish_ports(name: str) -> None:
-    # By default only OTLP and Grafana listen on the host (ADR 0018); a service that
-    # publishes a port joins edge to do so.
+def test_only_the_publishing_services_publish_ports(name: str) -> None:
+    # By default only OTLP, Grafana and the app listen on the host (ADRs 0018 and 0030);
+    # a service that publishes a port joins edge to do so.
     service = _services(COMPOSE)[name]
     if name in PUBLISHING_SERVICES:
         assert service.get("ports"), f"{name} must publish its port"
@@ -473,11 +483,21 @@ def test_dockerfile_base_images_are_pinned(dockerfile: Path) -> None:
 
 @pytest.mark.parametrize("name", [name for name in SERVICES if "build" in _services(COMPOSE)[name]])
 def test_built_service_uses_a_dockerfile_under_stack(name: str) -> None:
+    # Either the context is a directory under stack/ with its Dockerfile (the collector),
+    # or the context is the repository root, which the app needs for its source, with a
+    # Dockerfile under stack/ and the root .dockerignore keeping the rest out (ADR 0030).
     build = _services(COMPOSE)[name]["build"]
-    context = build if isinstance(build, str) else _mapping(build, "build").get("context")
-    path = (ROOT / str(context)).resolve()
-    assert path.is_relative_to(STACK)
-    assert (path / "Dockerfile").is_file()
+    settings = {"context": build} if isinstance(build, str) else _mapping(build, "build")
+    assert set(settings) <= {"context", "dockerfile"}, f"{name}: build {settings}"
+    context = (ROOT / str(settings["context"])).resolve()
+    dockerfile = (context / str(settings.get("dockerfile", "Dockerfile"))).resolve()
+    assert dockerfile.is_relative_to(STACK), f"{name}: {dockerfile} is not under stack/"
+    assert dockerfile.name == "Dockerfile"
+    assert dockerfile.is_file()
+    if context == ROOT:
+        assert (ROOT / ".dockerignore").is_file(), "a root build context needs .dockerignore"
+    else:
+        assert context.is_relative_to(STACK), f"{name}: build context {context}"
 
 
 # What exists now (milestone 1, stage 10).
@@ -567,20 +587,24 @@ def test_collector_memory_settings() -> None:
     assert _environment(service).get("GOMEMLIMIT") == "204MiB"
 
 
-def test_collector_gets_the_host_label_with_its_default() -> None:
-    # The collector sets it on every signal (ADR 0022): local unless .env says otherwise,
-    # never the machine's hostname, which is personal data (ADR 0021).
-    environment = _environment(_services(COMPOSE)["otel-collector"])
+@pytest.mark.parametrize("name", sorted(HOST_LABEL_SERVICES))
+def test_the_host_label_reaches_the_collector_and_the_app_with_its_default(name: str) -> None:
+    # The collector sets it on every signal (ADR 0022) and the app on its series and rows
+    # (ADRs 0026, 0028 and 0030): local unless .env says otherwise, never the machine's
+    # hostname, which is personal data (ADR 0021).
+    environment = _environment(_services(COMPOSE)[name])
     assert environment.get(HOST_VARIABLE) == f"${{{HOST_VARIABLE}:-{DEFAULT_HOST}}}"
     assert _env_example().get(HOST_VARIABLE) == DEFAULT_HOST
     assert HOST_VALUE.fullmatch(DEFAULT_HOST)
-    # Only the collector reads it.
-    others = [
+
+
+def test_only_the_collector_and_the_app_read_the_host_label() -> None:
+    readers = {
         name
         for name, service in _services(COMPOSE).items()
-        if name != "otel-collector" and HOST_VARIABLE in _environment(service)
-    ]
-    assert not others, others
+        if HOST_VARIABLE in _environment(service)
+    }
+    assert readers == HOST_LABEL_SERVICES
 
 
 def test_env_example_documents_the_host_label() -> None:
@@ -807,3 +831,128 @@ def test_debug_override_is_a_valid_compose_mapping() -> None:
     keys = {key for key in document if not key.startswith("x-")}
     assert keys <= {"services", "networks", "volumes"}
     assert "name" not in document
+
+
+# The app (milestone 2, stage 13; ADR 0030).
+
+APP: Final = "app"
+APP_DOCKERFILE: Final = "stack/app/Dockerfile"
+APP_IMAGE: Final = "cc-observatory-app:local"
+# The app's settings that the image fixes: compose never passes them, so the container's
+# ports, address and data directory always match what the Dockerfile, the healthcheck,
+# the port mappings, the scrape target and the volume expect.
+APP_FIXED_VARIABLES: Final = frozenset(
+    {"CCOBS_LISTEN_HOST", "CCOBS_PORT", "CCOBS_METRICS_PORT", "CCOBS_DATA_DIR"}
+)
+APP_HEALTHCHECK: Final = [
+    "CMD",
+    "python",
+    "-c",
+    "import urllib.request as u; "
+    "u.build_opener(u.ProxyHandler({})).open('http://127.0.0.1:4300/healthz', timeout=2)",
+]
+
+
+def _settings_variables() -> dict[str, str]:
+    """Each Settings field's environment variable, by field name."""
+    return {
+        name: field.validation_alias
+        if isinstance(field.validation_alias, str)
+        else f"{ENV_PREFIX}{name.upper()}"
+        for name, field in Settings.model_fields.items()
+    }
+
+
+def _app() -> dict[str, object]:
+    return _services(COMPOSE)[APP]
+
+
+def test_compose_defines_the_app_built_from_the_clone() -> None:
+    # Built on the user's machine from the clone, under a local name that no registry
+    # has; GHCR images come in milestone 7 (ADR 0008).
+    service = _app()
+    assert service.get("build") == {"context": ".", "dockerfile": APP_DOCKERFILE}
+    assert service.get("image") == APP_IMAGE
+    assert service.get("pull_policy") == "build"
+
+
+def test_app_uses_the_shared_service_settings() -> None:
+    # The x-service anchor: restart, stop_grace_period, privileges and log rotation.
+    text = COMPOSE.read_text(encoding="utf-8")
+    block = re.search(r"^  app:\n((?:    .*\n|[ \t]*\n)+)", text, re.M)
+    assert block, "compose.yaml has no app service"
+    assert re.search(r"^    <<: \*service$", block[1], re.M), "app must merge *service"
+    assert _app().get("stop_grace_period") == "30s"
+
+
+def test_app_publishes_its_port_on_loopback_with_a_configurable_port() -> None:
+    port = Settings.model_fields["port"].default
+    assert _app().get("ports") == [f"127.0.0.1:${{CCOBS_APP_PORT:-{port}}}:{port}"]
+
+
+def test_app_joins_backend_and_edge() -> None:
+    # backend reaches Loki, and Prometheus scrapes the app there; edge publishes its port
+    # (ADR 0018).
+    assert _networks(_app()) == {"backend", "edge"}
+
+
+def test_app_keeps_its_database_in_a_named_volume() -> None:
+    data_dir = Settings.model_fields["data_dir"].default
+    assert _app().get("volumes") == [f"app-data:{data_dir.as_posix()}"]
+    assert "app-data" in _mapping(_load(COMPOSE).get("volumes"), "volumes")
+
+
+def test_app_memory_limit() -> None:
+    assert _app().get("mem_limit") == "256m"
+
+
+def test_app_healthcheck_requests_healthz_on_loopback_without_a_proxy() -> None:
+    # /healthz is behind the Host guard, and urllib sends Host: 127.0.0.1:4300, which it
+    # allows; no proxy from the environment, so a proxy Docker injects is never used.
+    healthcheck = _mapping(_app()["healthcheck"], "healthcheck")
+    assert healthcheck["test"] == APP_HEALTHCHECK
+    collector = _mapping(_services(COMPOSE)["otel-collector"]["healthcheck"], "healthcheck")
+    for key in ("interval", "timeout", "retries", "start_period", "start_interval"):
+        assert healthcheck.get(key) == collector.get(key), key
+
+
+def test_app_starts_without_waiting_for_loki() -> None:
+    # Loki serves only the reconciler, which tolerates it being down (ADR 0029); hooks
+    # must be accepted from the first second.
+    assert "depends_on" not in _app()
+
+
+def test_app_environment_passes_every_setting_but_the_fixed_ones() -> None:
+    variables = set(_settings_variables().values())
+    assert variables >= APP_FIXED_VARIABLES
+    expected = {name: f"${{{name}:-" for name in variables - APP_FIXED_VARIABLES}
+    environment = _environment(_app())
+    assert set(environment) == set(expected)
+    for name, prefix in expected.items():
+        assert environment[name].startswith(prefix), f"{name}: {environment[name]}"
+    assigned = _env_example()
+    for name in APP_FIXED_VARIABLES:
+        assert name not in assigned, f".env.example must not offer {name}: compose ignores it"
+
+
+def test_app_compose_defaults_are_the_settings_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The value compose passes when .env is silent gives the same Settings as no
+    # variable at all, so the defaults of config.py, compose.yaml and .env.example agree.
+    for name in [key for key in os.environ if key.upper().startswith(ENV_PREFIX)]:
+        monkeypatch.delenv(name)
+    defaults = Settings().model_dump()
+    environment = _environment(_app())
+    for name, value in environment.items():
+        interpolation = INTERPOLATION.fullmatch(value)
+        assert interpolation, f"{name}: {value}"
+        match = WITH_DEFAULT.fullmatch(interpolation["inner"])
+        assert match, f"{name}: {value}"
+        monkeypatch.setenv(name, match["default"])
+    assert Settings().model_dump() == defaults
+
+
+def test_debug_override_publishes_the_app_metrics_on_loopback() -> None:
+    port = Settings.model_fields["metrics_port"].default
+    override = _services(COMPOSE_DEBUG)[APP]
+    assert override.get("ports") == [f"127.0.0.1:${{CCOBS_APP_METRICS_PORT:-4301}}:{port}"]
+    assert set(override) == {"ports"}

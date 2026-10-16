@@ -158,8 +158,9 @@ jobs:
           docker compose -f compose.yaml -f compose.debug.yaml config --quiet
           docker compose -f compose.yaml -f compose.debug.yaml --profile traces config --quiet
 
-      # Builds the derived collector image (stack/otel-collector/Dockerfile) for the next
-      # step; the integration tests' `up --build` then reuses it from the build cache.
+      # Builds the local images, the derived collector (stack/otel-collector/Dockerfile)
+      # and the app (stack/app/Dockerfile, ADR 0030), for the next step; the integration
+      # tests' `up --build` then reuses them from the build cache.
       - name: Build the local images
         run: docker compose build
 

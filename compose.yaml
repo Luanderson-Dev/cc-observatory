@@ -3,7 +3,8 @@
 #   docker compose up -d
 #   docker compose --profile traces up -d    # also Tempo, for Claude Code's beta traces
 #
-# Grafana is at http://localhost:4330 (CCOBS_GRAFANA_PORT). Every published port binds
+# Grafana is at http://localhost:4330 (CCOBS_GRAFANA_PORT), the app at
+# http://localhost:4300 (CCOBS_APP_PORT). Every published port binds
 # to 127.0.0.1 (ADR 0001) and can be moved with the variable named next to it; copying
 # .env.example to .env is optional. Storage services stay on the internal `backend`
 # network; compose.debug.yaml publishes them on loopback for debugging.
@@ -309,8 +310,65 @@ services:
       - backend
       - edge
 
+  # The app: receives Claude Code's hooks, keeps sessions, agents and blocks in SQLite
+  # and serves them (ADRs 0024 to 0029). Built on this machine from the clone
+  # (stack/app/Dockerfile, with the repository root as context) under a local name that
+  # no registry has; it is never pulled (ADR 0030). Its port is on loopback only, behind
+  # the app's Host allowlist (ADR 0027); its metrics listener (9464) is not published,
+  # and Prometheus scrapes it on the backend network (ADR 0028). The ports inside the
+  # container (4300 and 9464), its address and its data directory are fixed by the image.
+  app:
+    <<: *service
+    build:
+      context: .
+      dockerfile: stack/app/Dockerfile
+    image: cc-observatory-app:local
+    pull_policy: build
+    volumes:
+      - app-data:/var/lib/ccobs
+    ports:
+      - "127.0.0.1:${CCOBS_APP_PORT:-4300}:4300"
+    mem_limit: 256m
+    environment:
+      # The host label on the app's series and rows, the collector's value (ADR 0022).
+      CCOBS_HOST_LABEL: ${CCOBS_HOST_LABEL:-local}
+      # How long the app keeps sessions, as a Prometheus duration (ADR 0026).
+      CCOBS_APP_RETENTION: ${CCOBS_APP_RETENTION:-90d}
+      # How long a silent session waits before it is marked stale, at least 1h (ADR 0024).
+      CCOBS_SESSION_STALE_AFTER: ${CCOBS_SESSION_STALE_AFTER:-12h}
+      # Read Claude Code's tool_decision events back from Loki to close permission blocks
+      # denied with Esc (ADR 0029).
+      CCOBS_TELEMETRY_RECONCILE: ${CCOBS_TELEMETRY_RECONCILE:-true}
+      CCOBS_LOKI_URL: ${CCOBS_LOKI_URL:-http://loki:3100}
+      CCOBS_LOG_LEVEL: ${CCOBS_LOG_LEVEL:-info}
+      # The hook queue and body limits (ADR 0027); advanced settings.
+      CCOBS_HOOK_QUEUE_MAX_ITEMS: ${CCOBS_HOOK_QUEUE_MAX_ITEMS:-10000}
+      CCOBS_HOOK_QUEUE_MAX_BYTES: ${CCOBS_HOOK_QUEUE_MAX_BYTES:-67108864}
+      CCOBS_HOOK_BODY_MAX_BYTES: ${CCOBS_HOOK_BODY_MAX_BYTES:-8388608}
+    healthcheck:
+      # The image has Python and no HTTP client. /healthz is behind the Host guard,
+      # which allows the Host: 127.0.0.1:4300 that urllib sends; no proxy from the
+      # environment, so a proxy that Docker injects into containers is never used.
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request as u; u.build_opener(u.ProxyHandler({})).open('http://127.0.0.1:4300/healthz', timeout=2)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+      start_interval: 2s
+    networks:
+      - backend
+      - edge
+    # No depends_on: the hook route must accept events from the first second, and Loki
+    # serves only the reconciler, which retries on its next poll while Loki is down or
+    # still starting (ADR 0029). The collector starts the same way.
+
 volumes:
   prometheus-data: {}
   loki-data: {}
   tempo-data: {}
   grafana-data: {}
+  app-data: {}

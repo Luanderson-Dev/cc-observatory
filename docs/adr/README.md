@@ -58,3 +58,4 @@ the ADR wins.
 | [0027](0027-the-app-http-surface-and-hook-queue.md)          | The app's HTTP surface: guarded routes, a neutral hook route and a bounded queue      | Accepted |
 | [0028](0028-app-metrics-and-their-listener.md)               | The app's metrics: fixed-cardinality series on a separate, unpublished listener       | Accepted |
 | [0029](0029-closing-esc-denials-from-loki.md)                | Permission blocks denied with Esc are closed from Loki's `tool_decision` rejects      | Accepted |
+| [0030](0030-the-app-container.md)                            | The app container: built locally from the clone, non-root, published on loopback      | Accepted |

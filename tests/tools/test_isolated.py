@@ -38,6 +38,8 @@ def test_default_ports_are_the_24xxx_block() -> None:
         "CCOBS_PROMETHEUS_PORT": 24390,
         "CCOBS_LOKI_PORT": 24310,
         "CCOBS_TEMPO_PORT": 24320,
+        "CCOBS_APP_PORT": 24300,
+        "CCOBS_APP_METRICS_PORT": 24301,
     }
 
 
