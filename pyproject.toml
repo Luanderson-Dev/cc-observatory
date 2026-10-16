@@ -46,6 +46,7 @@ server = [
   "alembic>=1.20.0",
   "fastapi>=0.143.2",
   "httpx>=0.28.1",
+  "jinja2>=3.1.6",
   "prometheus-client>=0.26.0",
   "pydantic-settings>=2.16.0",
   "sqlalchemy>=2.1.4",
@@ -95,11 +96,6 @@ markers = [
 pythonpath = ["."]
 testpaths = ["tests"]
 xfail_strict = true
-# Starlette 1.x deprecates its TestClient on httpx in favour of httpx2, warning on import
-# (a UserWarning subclass). Moving the app tests to httpx2 is a later follow-up.
-filterwarnings = [
-  "ignore:Using `httpx` with `starlette\\.testclient` is deprecated:UserWarning",
-]
 
 [tool.coverage.run]
 branch = true
@@ -125,6 +121,9 @@ dev = [
   # The app's dependencies, so that `uv sync`, mypy and pytest see them.
   "cc-observatory[server]",
   "commitizen>=4.19.2",
+  # Starlette's TestClient runs on httpx2 (on plain httpx it warns at import time). The
+  # app itself keeps httpx for its Loki client (ADR 0029).
+  "httpx2>=2.13.1",
   "mypy>=2.4.0",
   "pre-commit>=4.7.0",
   "pytest>=9.1.1",

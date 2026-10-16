@@ -23,7 +23,7 @@ from collections.abc import Iterator, Sequence
 from pathlib import Path
 from typing import Final
 
-import httpx
+import httpx2
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -142,7 +142,7 @@ def drain(queue: HookQueue) -> list[RawHook]:
     return items
 
 
-def assert_neutral(response: httpx.Response) -> None:
+def assert_neutral(response: httpx2.Response) -> None:
     assert response.status_code == 204
     assert response.content == b""
     assert "content-type" not in response.headers

@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
 
-import httpx
+import httpx2
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -139,13 +139,13 @@ def raw_request(
     return asyncio.run(_exchange(app, method=method, path=path, headers=headers, chunks=chunks))
 
 
-def assert_neutral(response: httpx.Response) -> None:
+def assert_neutral(response: httpx2.Response) -> None:
     assert response.status_code == 204
     assert response.content == b""
     assert "content-type" not in response.headers
 
 
-def assert_no_cors(headers: httpx.Headers) -> None:
+def assert_no_cors(headers: httpx2.Headers) -> None:
     assert [name for name in headers if name.lower().startswith("access-control-")] == []
 
 

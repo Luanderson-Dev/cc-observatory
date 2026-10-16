@@ -25,6 +25,7 @@ SERVER_PACKAGES = (
     "pydantic-settings",
     "prometheus-client",
     "httpx",
+    "jinja2",
 )
 
 SERVER_MODULES = (
@@ -37,6 +38,8 @@ SERVER_MODULES = (
     "pydantic_settings",
     "prometheus_client",
     "httpx",
+    "jinja2",
+    "markupsafe",
     "ccobs.server",
 )
 
