@@ -81,4 +81,17 @@ def test_the_app_entry_keeps_python_and_uv_on_the_project_lines() -> None:
     # required-version and the uv_build bound: a new minor is moved by hand with them.
     ignores = _ignores(_entry("docker", "/stack/app"))
     assert ignores.get("python") == MINOR_AND_MAJOR
-    assert ignores.get("ghcr.io/astral-sh/uv") == MINOR_AND_MAJOR
+    # Dependabot names a ghcr.io image without the registry ("astral-sh/uv", as in its
+    # PR #10), so an ignore on "ghcr.io/astral-sh/uv" never matched.
+    assert ignores.get("astral-sh/uv") == MINOR_AND_MAJOR
+
+
+def test_no_ignore_names_a_registry_host() -> None:
+    # Dependabot names an image without its registry host, so an ignore that keeps one
+    # (a first segment with "." or ":", or "localhost") never matches anything.
+    for entry in _updates():
+        for name in _ignores(entry):
+            first = name.split("/", 1)[0] if "/" in name else ""
+            assert "." not in first, name
+            assert ":" not in first, name
+            assert first != "localhost", name
