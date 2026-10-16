@@ -12,32 +12,34 @@ and cost, on your own machine.
 
 ## Status
 
-**Pre-alpha.** v0.2.0 closes milestone 1 of 8: the observability stack. The
-`cc-observatory` package on PyPI still only prints its version; the stack runs from a
-clone of this repository.
+**Pre-alpha.** v0.3.0 closes milestone 2 of 8: the app that receives Claude Code's
+hooks. The `cc-observatory` package on PyPI still only prints its version; the stack and
+the app run from a clone of this repository.
 
-What v0.2.0 adds:
+What v0.3.0 adds:
 
-- the observability stack in Docker Compose: the OpenTelemetry Collector, Prometheus,
-  Loki and Grafana, plus Tempo under the optional `traces` profile, with every port bound
-  to `127.0.0.1` (see "Run the observability stack" below and
-  [docs/stack.md](https://github.com/Luanderson-Dev/cc-observatory/blob/main/docs/stack.md));
-- Grafana without a login, with its Prometheus, Loki and Tempo datasources and a Claude
-  Code overview dashboard provisioned from the repository;
-- the collector's privacy filters, which always delete personal attributes and, for now,
-  always drop content (the opt-in to keep content arrives in v0.5.0), and a `host` label
-  on every signal;
-- configs that turn off every usage report and update check, checked by tests against
-  the running stack;
-- integration tests in CI that run against a real compose stack;
-- ADRs 0013 to 0022 for the stack's decisions.
+- the app, built and started by `docker compose up -d` and published on
+  `127.0.0.1:4300` (see "Try the app" below and
+  [docs/app.md](https://github.com/Luanderson-Dev/cc-observatory/blob/main/docs/app.md));
+- a hook endpoint that always answers with an empty 204 and does its work in the
+  background, so it never slows Claude Code down;
+- a state machine for sessions, agents and blocks (sessions waiting on you); a
+  permission prompt denied with Esc fires no hook, so the app closes it from Claude
+  Code's telemetry in Loki;
+- SQLite storage of metadata only, with retention, and a read-only JSON API at
+  `/api/v1/sessions`;
+- live state on `/metrics`, scraped by Prometheus;
+- the browser defences: a `Host` allowlist, no CORS, and non-JSON requests to the hook
+  endpoint ignored;
+- ADRs 0023 to 0030 for the app's decisions.
 
-v0.1.0 (milestone 0) laid the foundation: the package published to
-[PyPI](https://pypi.org/project/cc-observatory/), tooling, CI, ADRs 0001 to 0012, and
-sanitized fixtures recorded from real Claude Code sessions.
+Until `ccobs setup` arrives in v0.5.0, you point Claude Code at the app with a settings
+file passed to `claude --settings`. Earlier releases: v0.2.0 (milestone 1) added the
+observability stack in Docker Compose with a provisioned Grafana, and v0.1.0 (milestone
+0) laid the foundation.
 
-What comes next: milestone 2 (v0.3.0), the app that receives Claude Code's hooks and
-tracks sessions, agents and blocks in SQLite. The full plan is in the roadmap below.
+What comes next: milestone 3 (v0.4.0), the web UI with live sessions, agents, blocks and
+events. The full plan is in the roadmap below.
 
 Unless a section says otherwise, the rest of this README describes the planned design.
 
@@ -324,7 +326,7 @@ can still do, and how to report a vulnerability.
 | --------- | ------- | -------------------------------------------------------------------------------------- | ----------- |
 | 0         | v0.1.0  | Foundation, tooling, CI, ADRs, telemetry and hooks spike, fixtures, first PyPI release | Released    |
 | 1         | v0.2.0  | Observability stack in compose, provisioned Grafana                                    | Released    |
-| 2         | v0.3.0  | Hook ingestion, session state machine, SQLite, blocks, `/metrics`                      | Planned     |
+| 2         | v0.3.0  | Hook ingestion, session state machine, SQLite, blocks, `/metrics`                      | Released    |
 | 3         | v0.4.0  | Web UI (HTMX + SSE)                                                                    | Planned     |
 | 4         | v0.5.0  | `ccobs setup`, `uninstall`, `doctor`, `status`                                         | Planned     |
 | 5         | v0.6.0  | Alerts (browser and Discord)                                                           | Planned     |

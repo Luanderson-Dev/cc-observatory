@@ -1,6 +1,6 @@
 [project]
 name = "cc-observatory"
-version = "0.2.0"
+version = "0.3.0"
 description = "Local observability for Claude Code: sessions, subagents, blocks, logs, tokens and cost on OpenTelemetry, Prometheus, Loki and Grafana."
 readme = "README.md"
 license = "MIT"

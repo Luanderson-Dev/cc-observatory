@@ -1,3 +1,9 @@
+## v0.3.0 (2026-10-16)
+
+### Feat
+
+- receive Claude Code hooks and track sessions, agents and blocks in SQLite with live state on /metrics (#9)
+
 ## v0.2.0 (2026-10-15)
 
 ### Feat

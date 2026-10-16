@@ -12,33 +12,34 @@ tokens e custo na sua própria máquina.
 
 ## Status
 
-**Pré-alfa.** A v0.2.0 fecha o milestone 1 de 8: a stack de observabilidade. O pacote
-`cc-observatory` no PyPI ainda só mostra a própria versão; a stack roda a partir de um
-clone deste repositório.
+**Pré-alfa.** A v0.3.0 fecha o milestone 2 de 8: o app que recebe os hooks do Claude
+Code. O pacote `cc-observatory` no PyPI ainda só mostra a própria versão; a stack e o app
+rodam a partir de um clone deste repositório.
 
-O que a v0.2.0 traz:
+O que a v0.3.0 traz:
 
-- a stack de observabilidade no Docker Compose: o OpenTelemetry Collector, o Prometheus,
-  o Loki e o Grafana, mais o Tempo no profile opcional `traces`, com todas as portas
-  ligadas a `127.0.0.1` (veja "Como rodar a stack de observabilidade" mais abaixo e o
-  [docs/stack.md](docs/stack.md), em inglês);
-- o Grafana sem login, com as fontes de dados do Prometheus, do Loki e do Tempo e um
-  dashboard de visão geral do Claude Code provisionados a partir do repositório;
-- os filtros de privacidade do collector, que sempre apagam atributos pessoais e, por
-  enquanto, sempre descartam conteúdo (a opção de guardar conteúdo chega na v0.5.0), e um
-  rótulo `host` em todo sinal;
-- configurações que desligam todos os relatórios de uso e verificações de atualização,
-  conferidas por testes com a stack rodando;
-- testes de integração no CI que rodam contra uma stack real no compose;
-- os ADRs 0013 a 0022, com as decisões da stack.
+- o app, construído e iniciado pelo `docker compose up -d` e publicado em
+  `127.0.0.1:4300` (veja "Experimente o app" mais abaixo e o
+  [docs/app.md](docs/app.md), em inglês);
+- um endpoint de hooks que sempre responde com um 204 vazio e faz o trabalho em segundo
+  plano, para nunca deixar o Claude Code mais lento;
+- uma máquina de estados de sessões, agentes e bloqueios (sessões esperando por você);
+  um pedido de permissão negado com Esc não dispara hook, então o app o fecha a partir
+  da telemetria do Claude Code no Loki;
+- armazenamento só de metadados em SQLite, com retenção, e uma API JSON somente leitura
+  em `/api/v1/sessions`;
+- o estado ao vivo em `/metrics`, coletado pelo Prometheus;
+- as defesas do navegador: lista de `Host` permitidos, sem CORS, e requisições ao
+  endpoint de hooks que não são JSON ignoradas;
+- os ADRs 0023 a 0030, com as decisões do app.
 
-A v0.1.0 (milestone 0) montou a fundação: o pacote publicado no
-[PyPI](https://pypi.org/project/cc-observatory/), o ferramental, o CI, os ADRs 0001 a
-0012 e fixtures sanitizadas gravadas a partir de sessões reais do Claude Code.
+Até o `ccobs setup` chegar na v0.5.0, você aponta o Claude Code para o app com um arquivo
+de settings passado ao `claude --settings`. Releases anteriores: a v0.2.0 (milestone 1)
+trouxe a stack de observabilidade no Docker Compose com um Grafana provisionado, e a
+v0.1.0 (milestone 0) montou a fundação.
 
-O que vem a seguir: o milestone 2 (v0.3.0), o app que recebe os hooks do Claude Code e
-acompanha sessões, agentes e bloqueios no SQLite. O plano completo está no roteiro mais
-abaixo.
+O que vem a seguir: o milestone 3 (v0.4.0), a interface web com sessões, agentes,
+bloqueios e eventos ao vivo. O plano completo está no roteiro mais abaixo.
 
 Salvo indicação em contrário, o restante deste README descreve o projeto planejado.
 
@@ -334,7 +335,7 @@ uma página web ainda consegue fazer, e para saber como relatar uma vulnerabilid
 | --------- | ------- | ------------------------------------------------------------------------------------------------ | ------------ |
 | 0         | v0.1.0  | Fundação, ferramental, CI, ADRs, spike de telemetria e hooks, fixtures, primeira release no PyPI | Lançado      |
 | 1         | v0.2.0  | Stack de observabilidade no compose, Grafana provisionado                                        | Lançado      |
-| 2         | v0.3.0  | Ingestão de hooks, máquina de estados da sessão, SQLite, bloqueios, `/metrics`                   | Planejado    |
+| 2         | v0.3.0  | Ingestão de hooks, máquina de estados da sessão, SQLite, bloqueios, `/metrics`                   | Lançado      |
 | 3         | v0.4.0  | Interface web (HTMX + SSE)                                                                       | Planejado    |
 | 4         | v0.5.0  | `ccobs setup`, `uninstall`, `doctor`, `status`                                                   | Planejado    |
 | 5         | v0.6.0  | Alertas (navegador e Discord)                                                                    | Planejado    |
