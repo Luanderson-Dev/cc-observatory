@@ -106,15 +106,39 @@ goes through `ReadGate.run(read, *args)`:
 - one request takes one slot at a time: a route that needs two queries (the session
   check and the events) runs both in one call on the gate.
 
-**Bounded session detail and keyset paging** (the next stage of milestone 3 brings the
-routes and their exact page sizes): the session detail no longer returns every agent and
-block a session ever had, but a bounded number of the most recent, and the lists that
-grow with a session's history page by **keyset**, never by `OFFSET`. A page is asked for
-with `before` (rows older than a cursor) or `after` (rows newer than it), exclusive, on
-the list's monotonic key: `seq` for hook events, served from the `(session_id, seq)`
-index of ADR 0026. `before` and `after` are not combined in one request; a page holds at
-most `limit` rows, in the same order as today; and an invalid cursor is a 422 that does
-not echo the value, like every validation error of the API (ADR 0027).
+**Bounded session detail and keyset paging**: the session detail no longer returns every
+agent and block a session ever had. It holds every running agent and open block (what
+the session is doing or waiting on now), plus the latest `DETAIL_CLOSED_LIMIT` (50)
+stopped agents and closed blocks, and `agents_total` and `blocks_total`, the counts of
+all stored. The lists that grow with a session's history page by **keyset**, never by
+`OFFSET`, on routes of their own (`/agents`, `/blocks`, `/events` under a session), each
+with `limit` (default 50, from 1 to 500):
+
+- **blocks** page on `block_id`: the `seq` of the hook that opened the block, so it never
+  changes and grows with every new block, and a page is a range of the `blocks` primary
+  key `(session_id, block_id)`;
+- **agents** have no monotonic column, so they page on (when the agent was first seen,
+  `agent_id`): `started_at_ms`, or `stopped_at_ms` for an internal agent, which is stored
+  already stopped and never starts. That value is set when the row is created (with one
+  exception, under consequences). The cursor is the `agent_id` of a row, and the page starts below that row's
+  position; a cursor that names no agent of the session is a 422. The read is a range of
+  the `agents` primary key on `session_id`, sorted in memory: a session's agents are far
+  fewer than its hooks;
+- **events** page on `seq`, from the `(session_id, seq)` index of ADR 0026, with
+  `before_seq` or `after_seq`.
+
+A page is asked for with `before` (`before_seq`), the rows just older than a cursor, or,
+for events, `after_seq`, the rows just newer than it, which is how the UI tails a
+session; cursors are exclusive, and `before_seq` and `after_seq` are not combined in one
+request (422). Without a cursor a route returns the latest `limit` rows, as `/events` did
+in v0.3.0. Every page, and the detail's lists, are in the lists' order of v0.3.0, oldest
+first (agents now by when they were first seen instead of by their last event, which
+changes as an agent runs and would move it between pages). An invalid cursor (not an
+integer from 0 to 2^63 - 1, or an `agent_id` that the hook parser would refuse) is a 422
+that does not echo the value, like every validation error of the API (ADR 0027). Agents
+also carry `parent_agent_id`, worked out from stored rows with no new column: the
+`agent_id` of the `PreToolUse` row (ADR 0023) whose `tool_use_id` is the agent's
+launching call, `null` for the main thread or when that row is missing.
 
 ### Consequences
 
@@ -123,8 +147,23 @@ not echo the value, like every validation error of the API (ADR 0027).
 - Good, because a reader connection cannot write, even through a bug: SQLite refuses it.
 - Good, because reads never take a thread of the default threadpool nor block the event
   loop, and overload answers in at most 5 s with a neutral 503 instead of hanging.
-- Good, because a read's cost is bounded by its page size, whatever the session's
-  length, and keyset pages stay stable while new hooks arrive.
+- Good, because what a read returns is bounded by its page size, whatever the session's
+  length, blocks and events are read as index ranges, and keyset pages stay stable while
+  new hooks arrive.
+- Bad, because two parts of a read still grow with the session rather than the page: the
+  agents are sorted in memory over the session's agents, and `parent_agent_id` scans the
+  session's hook events for the launching `PreToolUse` rows, since no index covers
+  `tool_use_id`. On a synthetic session with 200,000 hooks and 2,000 agents, the detail
+  and an agents page took about 60 ms each. An index on
+  `hook_events (session_id, tool_use_id)` would make the lookup a seek, at the cost of a
+  migration.
+- Bad, because an agent's position can still move once: the reducer remembers only the
+  last 64 stopped agent IDs of a session, so a late event of a stopped agent it has
+  forgotten builds a fresh running `Agent`, and its upsert replaces the stored
+  `started_at_ms` and `tool_use_id`. That agent then jumps to the newest page (a client
+  paging back may see it twice or miss it) and may lose its `parent_agent_id`. It needs
+  more than 64 agents to stop and a hook to arrive late, so it is rare; the follow-up is
+  for the upsert to keep a stored `started_at_ms` and `tool_use_id`.
 - Bad, because at most 4 reads run at once and a fifth waits; for one person's browser
   tabs on one machine that is ample, and the 503 makes overload visible rather than slow.
 - Bad, because a read holds its slot until its query ends even when its client has gone;
@@ -153,8 +192,13 @@ not echo the value, like every validation error of the API (ADR 0027).
   a failed migration opens no reader engine, that the writer commits within 1 s while 40
   reads hold every reader connection, and that a read with no free slot gets the neutral
   503 on every route; blocked reads wait on an event, not a sleep, so the test does not
-  depend on the machine's speed. The paging routes bring their own tests in the next
-  stage of milestone 3.
+  depend on the machine's speed. It also checks that a session with 500 blocks gets its
+  open blocks and the latest 50 closed ones with the right totals, that paging agents,
+  blocks and events to the end returns every row once, in order, that `after_seq`
+  returns only newer events, that `before_seq` with `after_seq` and invalid cursors are
+  422s that do not echo the value, that each request takes exactly one read slot (with a
+  gate of one slot), and that an agent names the agent that launched it.
+  `tests/server/test_repository.py` checks the same reads below the API.
 - The `reviewer` subagent checks that no API route is a sync `def`, that every database
   read of the API goes through the read gate, and that no list query uses `OFFSET`.
 
@@ -169,4 +213,9 @@ not echo the value, like every validation error of the API (ADR 0027).
 - FastAPI: [concurrency and `async def`](https://fastapi.tiangolo.com/async/).
 - Keyset pagination: [use the index, Luke](https://use-the-index-luke.com/no-offset).
 - Revisit if reads routinely meet the 503, if the UI needs more than 4 reads at once, or
-  if the app ever needs more than one writer.
+  if the app ever needs more than one writer. If the detail or the agents pages show up
+  as 503s or as slow reads under the UI's live refetches (the server-sent events stage
+  coalesces them), add the partial index
+  `hook_events (session_id, tool_use_id) WHERE hook_event_name = 'PreToolUse'` with a
+  migration. If revived agents show up in practice, make the agents upsert keep the
+  stored `started_at_ms` and `tool_use_id`.

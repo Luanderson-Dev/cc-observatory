@@ -23,7 +23,9 @@ from sqlalchemy import (
     delete,
     func,
     insert,
+    or_,
     select,
+    tuple_,
 )
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
@@ -64,6 +66,8 @@ from ccobs.server.db.models import (
 )
 
 __all__ = [
+    "DETAIL_CLOSED_LIMIT",
+    "AgentPage",
     "Applied",
     "HookEventRow",
     "Repository",
@@ -87,6 +91,20 @@ _NO_BOOKKEEPING: Final[Mapping[str, list[Any]]] = {
     "async_launches": [],
 }
 _RUNNING: Final = "running"
+_PRE_TOOL_USE: Final = "PreToolUse"
+# How many stopped agents and closed blocks a session detail holds, the latest ones; the
+# running agents and the open blocks are always all there (ADR 0033).
+DETAIL_CLOSED_LIMIT: Final = 50
+# The agents' paging key: when the agent was first seen. Agents have no monotonic column,
+# and this value is set when the row is created: a running agent always has its start
+# time, and an internal one is stored already stopped, with no start time. The last event
+# time is only a non-null fallback. agent_id breaks ties. One exception: a late event of a
+# stopped agent the reducer no longer remembers (it keeps the last 64 stopped IDs) builds
+# a fresh Agent, whose upsert replaces started_at_ms and tool_use_id, so that agent moves
+# to the newest page and may lose its parent (ADR 0033).
+_AGENT_FIRST_SEEN: Final = func.coalesce(
+    AgentModel.started_at_ms, AgentModel.stopped_at_ms, AgentModel.last_event_at_ms
+)
 _SESSION_FIELDS: Final = tuple(f.name for f in fields(Session))
 _AGENT_FIELDS: Final = tuple(f.name for f in fields(Agent))
 # Block.scope is stored as scope_agent_id.
@@ -206,12 +224,29 @@ class SessionView:
 
 @dataclass(frozen=True, kw_only=True)
 class SessionDetail:
-    """A session with every agent and block it ever had, stopped and closed ones too."""
+    """A session, bounded (ADR 0033): all its running agents and open blocks, plus its
+    latest ``DETAIL_CLOSED_LIMIT`` stopped agents and closed blocks. Agents are in the
+    order they were first seen, blocks in ``block_id`` order, as in their pages.
+    ``agents_total`` and ``blocks_total`` count every one stored for the session;
+    ``parents`` maps each agent listed to the agent whose call launched it (``_parents``).
+    """
 
     host: str
     session: Session
     agents: list[Agent]
     blocks: list[Block]
+    agents_total: int
+    blocks_total: int
+    parents: Mapping[str, str | None]
+
+
+@dataclass(frozen=True, kw_only=True)
+class AgentPage:
+    """A page of agents, in the order they were first seen, with their ``parents`` as in
+    ``SessionDetail``."""
+
+    agents: list[Agent]
+    parents: Mapping[str, str | None]
 
 
 # Record <-> row.
@@ -397,6 +432,8 @@ class Repository:
             return connection.execute(statement).first() is not None
 
     def get_session(self, session_id: str) -> SessionDetail | None:
+        """The bounded detail of a session (``SessionDetail``); ``None`` if it is not
+        stored. One connection, so every part comes from the same read transaction."""
         with self.engine.connect() as connection:
             row = (
                 connection.execute(
@@ -407,35 +444,174 @@ class Repository:
             )
             if row is None:
                 return None
-            agents = connection.execute(
-                select(AgentModel.__table__)
-                .where(AgentModel.session_id == session_id)
-                .order_by(AgentModel.last_event_at_ms, AgentModel.agent_id)
-            ).mappings()
+            of_session = AgentModel.session_id == session_id
+            latest_stopped = (
+                select(AgentModel.agent_id)
+                .where(of_session, AgentModel.status != _RUNNING)
+                .order_by(_AGENT_FIRST_SEEN.desc(), AgentModel.agent_id.desc())
+                .limit(DETAIL_CLOSED_LIMIT)
+            )
+            agents = [
+                _agent(agent)
+                for agent in connection.execute(
+                    select(AgentModel.__table__)
+                    .where(
+                        of_session,
+                        or_(AgentModel.status == _RUNNING, AgentModel.agent_id.in_(latest_stopped)),
+                    )
+                    .order_by(_AGENT_FIRST_SEEN, AgentModel.agent_id)
+                ).mappings()
+            ]
+            in_session = BlockModel.session_id == session_id
+            latest_closed = (
+                select(BlockModel.block_id)
+                .where(in_session, BlockModel.closed_at_ms.is_not(None))
+                .order_by(BlockModel.block_id.desc())
+                .limit(DETAIL_CLOSED_LIMIT)
+            )
             blocks = connection.execute(
                 select(BlockModel.__table__)
-                .where(BlockModel.session_id == session_id)
+                .where(
+                    in_session,
+                    or_(BlockModel.closed_at_ms.is_(None), BlockModel.block_id.in_(latest_closed)),
+                )
                 .order_by(BlockModel.block_id)
             ).mappings()
+            agents_total = connection.execute(
+                select(func.count()).select_from(AgentModel).where(of_session)
+            ).scalar_one()
+            blocks_total = connection.execute(
+                select(func.count()).select_from(BlockModel).where(in_session)
+            ).scalar_one()
             return SessionDetail(
                 host=row["host"],
                 session=_session(row),
-                agents=[_agent(agent) for agent in agents],
+                agents=agents,
                 blocks=[_block(block) for block in blocks],
+                agents_total=agents_total,
+                blocks_total=blocks_total,
+                parents=_parents(connection, session_id, agents),
             )
 
-    def list_events(self, session_id: str, limit: int) -> list[HookEventRow]:
-        """The latest ``limit`` events of a session, in ``seq`` order."""
-        statement = (
-            select(HookEventModel.__table__)
-            .where(HookEventModel.session_id == session_id)
-            .order_by(HookEventModel.seq.desc())
-            .limit(limit)
-        )
+    def list_blocks(self, session_id: str, limit: int, before: int | None = None) -> list[Block]:
+        """The ``limit`` blocks of a session just below ``block_id`` ``before``
+        (exclusive), or its latest without it, open or closed, in ``block_id`` order.
+
+        ``block_id`` is the ``seq`` of the event that opened the block: it never changes
+        and grows with every new block, so a page read from the primary key stays the same
+        however many blocks open later.
+        """
+        statement = select(BlockModel.__table__).where(BlockModel.session_id == session_id)
+        if before is not None:
+            statement = statement.where(BlockModel.block_id < before)
+        with self.engine.connect() as connection:
+            rows = connection.execute(
+                statement.order_by(BlockModel.block_id.desc()).limit(limit)
+            ).mappings()
+            return [_block(row) for row in reversed(rows.all())]
+
+    def list_agents(
+        self, session_id: str, limit: int, before: str | None = None
+    ) -> AgentPage | None:
+        """The ``limit`` agents of a session first seen just before the agent ``before``
+        (exclusive), or its latest without it, running or stopped, in the order they were
+        first seen. ``None`` if ``before`` names no agent of the session.
+
+        Agents have no monotonic column, so the cursor is an ``agent_id`` and the page
+        starts below its position, (first seen, ``agent_id``), which is set when the row is
+        created (see ``_AGENT_FIRST_SEEN`` for the one exception): pages stay the same
+        however many agents start later.
+        """
+        of_session = AgentModel.session_id == session_id
+        statement = select(AgentModel.__table__).where(of_session)
+        with self.engine.connect() as connection:
+            if before is not None:
+                position = connection.execute(
+                    select(_AGENT_FIRST_SEEN).where(of_session, AgentModel.agent_id == before)
+                ).one_or_none()
+                if position is None:
+                    return None
+                statement = statement.where(
+                    tuple_(_AGENT_FIRST_SEEN, AgentModel.agent_id) < tuple_(position[0], before)
+                )
+            newest_first = statement.order_by(
+                _AGENT_FIRST_SEEN.desc(), AgentModel.agent_id.desc()
+            ).limit(limit)
+            rows = connection.execute(newest_first).mappings().all()
+            agents = [_agent(row) for row in reversed(rows)]
+            return AgentPage(agents=agents, parents=_parents(connection, session_id, agents))
+
+    def launch_scopes(self, session_id: str, tool_use_ids: Iterable[str]) -> dict[str, str | None]:
+        """For each of ``tool_use_ids`` with a stored ``PreToolUse`` in the session, the
+        scope that made the call: an ``agent_id``, or ``None`` for the main thread."""
+        with self.engine.connect() as connection:
+            return _launch_scopes(connection, session_id, tool_use_ids)
+
+    def list_events(
+        self,
+        session_id: str,
+        limit: int,
+        *,
+        before_seq: int | None = None,
+        after_seq: int | None = None,
+    ) -> list[HookEventRow]:
+        """``limit`` events of a session, always in ``seq`` order: its latest, the ones just
+        below ``before_seq`` or the ones just above ``after_seq`` (both exclusive, never
+        together). Every page is a range of the ``(session_id, seq)`` index."""
+        if before_seq is not None and after_seq is not None:
+            raise ValueError("page before a seq or after one, not both")
+        statement = select(HookEventModel.__table__).where(HookEventModel.session_id == session_id)
+        if after_seq is not None:
+            statement = statement.where(HookEventModel.seq > after_seq)
+            statement = statement.order_by(HookEventModel.seq)
+        else:
+            if before_seq is not None:
+                statement = statement.where(HookEventModel.seq < before_seq)
+            statement = statement.order_by(HookEventModel.seq.desc())
         names = tuple(f.name for f in fields(HookEventRow))
         with self.engine.connect() as connection:
-            rows = connection.execute(statement).mappings().all()
-        return [HookEventRow(**{name: row[name] for name in names}) for row in reversed(rows)]
+            rows = connection.execute(statement.limit(limit)).mappings().all()
+        ordered = rows if after_seq is not None else reversed(rows)
+        return [HookEventRow(**{name: row[name] for name in names}) for row in ordered]
+
+
+def _launch_scopes(
+    connection: Connection, session_id: str, tool_use_ids: Iterable[str]
+) -> dict[str, str | None]:
+    """``Repository.launch_scopes`` on an open connection. A ``PreToolUse`` row keeps the
+    call's ``tool_use_id`` and the ``agent_id`` of its scope (ADR 0023); if a call has
+    more than one row, the first one counts."""
+    wanted = set(tool_use_ids)
+    if not wanted:
+        return {}
+    rows = connection.execute(
+        select(HookEventModel.tool_use_id, HookEventModel.agent_id)
+        .where(
+            HookEventModel.session_id == session_id,
+            HookEventModel.hook_event_name == _PRE_TOOL_USE,
+            HookEventModel.tool_use_id.in_(wanted),
+        )
+        .order_by(HookEventModel.seq.desc())
+    ).all()
+    # Latest first, so the first row of a call is the one that stays. The filter on
+    # wanted already excludes a NULL tool_use_id; the check only narrows the type.
+    return {tool_use_id: agent_id for tool_use_id, agent_id in rows if tool_use_id is not None}
+
+
+def _parents(
+    connection: Connection, session_id: str, agents: Sequence[Agent]
+) -> dict[str, str | None]:
+    """Each agent's parent: the scope of the ``PreToolUse`` of the Agent call that
+    launched it (``Agent.tool_use_id``, which the reducer links). ``None`` for the main
+    thread, and also when the launch is unknown: no linked call, or no stored
+    ``PreToolUse`` for it."""
+    scopes = _launch_scopes(
+        connection, session_id, (a.tool_use_id for a in agents if a.tool_use_id is not None)
+    )
+    return {
+        agent.agent_id: None if agent.tool_use_id is None else scopes.get(agent.tool_use_id)
+        for agent in agents
+    }
 
 
 def _load_states(

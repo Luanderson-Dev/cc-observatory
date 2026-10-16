@@ -16,11 +16,20 @@ sits behind the ``Host`` guard and the app sends no CORS header (ADR 0027).
 
 Request values never come back: a validation error lists where and why, without the
 value FastAPI would echo, and an invalid or unknown session ID gets the same 404.
+
+Each read is bounded (ADR 0033): the session detail holds every running agent and open
+block but only the latest stopped and closed ones, with totals, and the lists that grow
+with a session page by keyset, never by offset. Agents page by ``before`` (an
+``agent_id``), blocks by ``before`` (a ``block_id``), and events by ``before_seq`` or
+``after_seq``, never both; every cursor is exclusive and every page is in the lists'
+usual order, oldest first.
 """
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import asdict
+from enum import Enum
 from typing import Annotated, Final, get_args
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -31,11 +40,18 @@ from starlette.responses import Response
 
 from ccobs.domain.hooks import is_valid_session_id
 from ccobs.domain.sessions import Agent, Block, SessionStatus
-from ccobs.server.db.repository import HookEventRow, Repository, SessionDetail, SessionView
+from ccobs.server.db.repository import (
+    AgentPage,
+    HookEventRow,
+    Repository,
+    SessionDetail,
+    SessionView,
+)
 from ccobs.server.reads import ReadGate
 
 __all__ = [
     "DEFAULT_LIMIT",
+    "MAX_CURSOR",
     "MAX_LIMIT",
     "SESSION_STATUSES",
     "AgentOut",
@@ -49,6 +65,9 @@ __all__ = [
 
 DEFAULT_LIMIT: Final = 50
 MAX_LIMIT: Final = 500
+# The largest seq or block_id cursor: a larger integer would overflow SQLite's.
+MAX_CURSOR: Final = 2**63 - 1
+_MAX_ID_LENGTH: Final = 256
 SESSION_STATUSES: Final[tuple[str, ...]] = get_args(SessionStatus.__value__)
 _NOT_FOUND: Final = "session not found"
 
@@ -89,7 +108,10 @@ class SessionOut(_Out):
 
 
 class AgentOut(_Out):
-    """An ``agents`` row, running or stopped."""
+    """An ``agents`` row, running or stopped, and ``parent_agent_id``: the scope of the
+    stored ``PreToolUse`` of the Agent call that launched it. ``None`` for the main
+    thread, and also when the launch is unknown (``tool_use_id`` is ``None``, or that
+    call's ``PreToolUse`` was not stored)."""
 
     agent_id: str
     status: str
@@ -101,10 +123,11 @@ class AgentOut(_Out):
     stopped_at_ms: int | None
     last_event_at_ms: int
     stop_reason: str | None
+    parent_agent_id: str | None
 
     @classmethod
-    def of(cls, agent: Agent) -> AgentOut:
-        return cls(**asdict(agent))
+    def of(cls, agent: Agent, parents: Mapping[str, str | None]) -> AgentOut:
+        return cls(**asdict(agent), parent_agent_id=parents.get(agent.agent_id))
 
 
 class BlockOut(_Out):
@@ -131,10 +154,14 @@ class BlockOut(_Out):
 
 
 class SessionDetailOut(SessionOut):
-    """A session with every agent and block it ever had."""
+    """A session, bounded: every running agent and open block, the latest
+    ``DETAIL_CLOSED_LIMIT`` stopped agents and closed blocks, and how many agents and
+    blocks the session has in all. The others are on the paged routes."""
 
     agents: list[AgentOut]
     blocks: list[BlockOut]
+    agents_total: int
+    blocks_total: int
 
 
 class EventOut(_Out):
@@ -180,17 +207,57 @@ async def _reads(request: Request) -> ReadGate:
     return reads
 
 
-def _events(repository: Repository, session_id: str, limit: int) -> list[HookEventRow] | None:
-    """The session's latest ``limit`` events; None if the session is unknown. One read on
-    the gate, so a request holds at most one slot at a time."""
+# The reads of the routes that need more than one query. Each runs as one call on the
+# gate, so a request holds one slot, once: anyio refuses a second acquire from the task
+# that holds a slot. None means the session is unknown.
+
+
+def _blocks(
+    repository: Repository, session_id: str, limit: int, before: int | None
+) -> list[Block] | None:
     if not repository.session_exists(session_id):
         return None
-    return repository.list_events(session_id, limit)
+    return repository.list_blocks(session_id, limit, before)
+
+
+class _Unknown(Enum):
+    SESSION = "session"
+    CURSOR = "cursor"
+
+
+def _agents(
+    repository: Repository, session_id: str, limit: int, before: str | None
+) -> AgentPage | _Unknown:
+    if not repository.session_exists(session_id):
+        return _Unknown.SESSION
+    page = repository.list_agents(session_id, limit, before)
+    return _Unknown.CURSOR if page is None else page
+
+
+def _events(
+    repository: Repository,
+    session_id: str,
+    limit: int,
+    before_seq: int | None,
+    after_seq: int | None,
+) -> list[HookEventRow] | None:
+    if not repository.session_exists(session_id):
+        return None
+    return repository.list_events(session_id, limit, before_seq=before_seq, after_seq=after_seq)
+
+
+def _invalid(loc: tuple[str, ...], msg: str) -> RequestValidationError:
+    """A 422 through ``validation_error``, like FastAPI's own: where and why, no value."""
+    return RequestValidationError([{"loc": loc, "msg": msg, "type": "value_error"}])
 
 
 _Repo = Annotated[Repository, Depends(_repository)]
 _Reads = Annotated[ReadGate, Depends(_reads)]
 _Limit = Annotated[int, Query(ge=1, le=MAX_LIMIT)]
+# seq and block_id cursors: anything SQLite's signed 64-bit integers hold.
+_Seq = Annotated[int | None, Query(ge=0, le=MAX_CURSOR)]
+# An agent_id cursor: what the hook parser accepts as an ID (ADR 0023).
+_AgentCursor = Annotated[str | None, Query(min_length=1, max_length=_MAX_ID_LENGTH)]
 
 router = APIRouter(prefix="/api/v1")
 
@@ -209,7 +276,8 @@ async def list_sessions(
 
 @router.get("/sessions/{session_id}")
 async def get_session(repository: _Repo, reads: _Reads, session_id: str) -> SessionDetailOut:
-    """One session with its agents and blocks."""
+    """One session, bounded: its running agents and open blocks, the latest stopped and
+    closed ones, and their totals."""
     detail = None
     if is_valid_session_id(session_id):
         detail = await reads.run(repository.get_session, session_id)
@@ -217,19 +285,69 @@ async def get_session(repository: _Repo, reads: _Reads, session_id: str) -> Sess
         raise HTTPException(status_code=404, detail=_NOT_FOUND)
     return SessionDetailOut(
         **SessionOut.of(detail).model_dump(),
-        agents=[AgentOut.of(agent) for agent in detail.agents],
+        agents=[AgentOut.of(agent, detail.parents) for agent in detail.agents],
         blocks=[BlockOut.of(block) for block in detail.blocks],
+        agents_total=detail.agents_total,
+        blocks_total=detail.blocks_total,
     )
+
+
+@router.get("/sessions/{session_id}/agents")
+async def list_agents(
+    repository: _Repo,
+    reads: _Reads,
+    session_id: str,
+    before: _AgentCursor = None,
+    limit: _Limit = DEFAULT_LIMIT,
+) -> list[AgentOut]:
+    """The session's ``limit`` agents first seen just before the agent ``before``, or its
+    latest, oldest first."""
+    if before is not None and not is_valid_session_id(before):
+        raise _invalid(("query", "before"), "not an agent ID")
+    page: AgentPage | _Unknown = _Unknown.SESSION
+    if is_valid_session_id(session_id):
+        page = await reads.run(_agents, repository, session_id, limit, before)
+    if page is _Unknown.SESSION:
+        raise HTTPException(status_code=404, detail=_NOT_FOUND)
+    if page is _Unknown.CURSOR:
+        raise _invalid(("query", "before"), "no agent of this session has this ID")
+    return [AgentOut.of(agent, page.parents) for agent in page.agents]
+
+
+@router.get("/sessions/{session_id}/blocks")
+async def list_blocks(
+    repository: _Repo,
+    reads: _Reads,
+    session_id: str,
+    before: _Seq = None,
+    limit: _Limit = DEFAULT_LIMIT,
+) -> list[BlockOut]:
+    """The session's ``limit`` blocks just below ``block_id`` ``before``, or its latest,
+    oldest first."""
+    blocks = None
+    if is_valid_session_id(session_id):
+        blocks = await reads.run(_blocks, repository, session_id, limit, before)
+    if blocks is None:
+        raise HTTPException(status_code=404, detail=_NOT_FOUND)
+    return [BlockOut.of(block) for block in blocks]
 
 
 @router.get("/sessions/{session_id}/events")
 async def list_events(
-    repository: _Repo, reads: _Reads, session_id: str, limit: _Limit = DEFAULT_LIMIT
+    repository: _Repo,
+    reads: _Reads,
+    session_id: str,
+    before_seq: _Seq = None,
+    after_seq: _Seq = None,
+    limit: _Limit = DEFAULT_LIMIT,
 ) -> list[EventOut]:
-    """The session's latest ``limit`` hook events, in ``seq`` order."""
+    """The session's ``limit`` hook events in ``seq`` order: its latest, the ones just
+    below ``before_seq`` or the ones just above ``after_seq``."""
+    if before_seq is not None and after_seq is not None:
+        raise _invalid(("query",), "before_seq and after_seq cannot be used together")
     rows = None
     if is_valid_session_id(session_id):
-        rows = await reads.run(_events, repository, session_id, limit)
+        rows = await reads.run(_events, repository, session_id, limit, before_seq, after_seq)
     if rows is None:
         raise HTTPException(status_code=404, detail=_NOT_FOUND)
     return [EventOut.of(row) for row in rows]

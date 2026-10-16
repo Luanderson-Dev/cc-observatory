@@ -245,11 +245,40 @@ it sends no query.
 The app serves a read-only JSON API under `/api/v1`. `GET /api/v1/sessions` lists
 sessions with the latest activity first, filtered by `status` (`working`,
 `waiting_user`, `idle`, `ended`, `stale`) and limited by `limit` (default 50, from 1 to
-500). `GET /api/v1/sessions/{session_id}` returns one session with every agent and block
-it ever had, and `GET /api/v1/sessions/{session_id}/events` returns its latest hook
-events in `seq` order, with the same `limit`. Every field is a stored column of metadata
-kept under [ADR 0023](adr/0023-per-event-allowlist-of-hook-metadata.md), and nothing
-else: no prompt, tool input or output, message or error text is ever served. Times are
+500). `GET /api/v1/sessions/{session_id}` returns one session, bounded: every running
+agent and open block, the latest 50 stopped agents and the latest 50 closed blocks, and
+`agents_total` and `blocks_total`, how many agents and blocks the session has in all.
+When a total is larger than its list, the rest are on the paged routes:
+
+- `GET /api/v1/sessions/{session_id}/agents` returns the session's agents, running or
+  stopped, in the order they were first seen (their start time; an internal agent, which
+  never starts, by when it stopped), ties broken by `agent_id`. The detail lists them in
+  the same order.
+- `GET /api/v1/sessions/{session_id}/blocks` returns its blocks, open or closed, in
+  `block_id` order, which is the order they opened in (a block's ID is the `seq` of the
+  hook that opened it). The detail lists them in the same order.
+- `GET /api/v1/sessions/{session_id}/events` returns its hook events in `seq` order.
+
+Each takes `limit` (default 50, from 1 to 500) and pages by cursor, never by offset, so a
+page never shifts when new hooks arrive. With no cursor, a route returns the latest
+`limit` rows. `before` (agents: an `agent_id`; blocks: a `block_id`) and `before_seq`
+(events) return the `limit` rows just before the cursor; `after_seq` (events only)
+returns the `limit` events just after it, oldest first, which is how a client tails a
+session: pass the last `seq` it has, then the last one of each page, until a page comes
+back empty. Cursors are exclusive, so the row named by a cursor is never in its page, and
+every page is oldest first, whatever the cursor: to walk back through a history, pass
+the first row of each page as the next `before` until a page comes back empty.
+`before_seq` and `after_seq` cannot be combined (422), and neither can a cursor outside 0
+to 2^63 - 1 or an `agent_id` that is not one of the session's agents (422). Each agent
+also carries `parent_agent_id`, the agent whose Agent tool call launched it, found from
+that call's stored `PreToolUse`; it is `null` for an agent launched by the main thread,
+and also when the launch is unknown (its `tool_use_id` is `null`, or the `PreToolUse`
+was not stored).
+
+Every field is a stored column of metadata kept under
+[ADR 0023](adr/0023-per-event-allowlist-of-hook-metadata.md), or a count or a
+`parent_agent_id` worked out from those columns, and nothing else: no prompt, tool input
+or output, message or error text is ever served. Times are
 integers of UTC milliseconds since the epoch. Sessions carry the `host` label and `cwd`,
 which is personal data ([ADR 0006](adr/0006-privacy-metadata-only-by-default.md)): the
 API serves it to localhost only, because every route sits behind the `Host` allowlist
@@ -270,6 +299,9 @@ interactive docs are not served.
 curl -s 'http://127.0.0.1:4300/api/v1/sessions?status=waiting_user'
 curl -s 'http://127.0.0.1:4300/api/v1/sessions/<session_id>'
 curl -s 'http://127.0.0.1:4300/api/v1/sessions/<session_id>/events?limit=100'
+curl -s 'http://127.0.0.1:4300/api/v1/sessions/<session_id>/events?after_seq=<seq>'
+curl -s 'http://127.0.0.1:4300/api/v1/sessions/<session_id>/blocks?before=<block_id>'
+curl -s 'http://127.0.0.1:4300/api/v1/sessions/<session_id>/agents?before=<agent_id>'
 curl -s 'http://127.0.0.1:4300/healthz'      # {"status":"ok"}
 ~~~
 
