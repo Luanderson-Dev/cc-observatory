@@ -1,0 +1,6 @@
+{% extends "base.html" %}
+{% block title %}{% if board and board.waiting %}({{ board.waiting }}) {% endif %}cc-observatory{% endblock %}
+{% block content %}
+<h1 class="visually-hidden">Overview</h1>
+{% include "_board.html" %}
+{% endblock %}

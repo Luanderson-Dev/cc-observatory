@@ -1,0 +1,40 @@
+{% from "_strip.html" import strip %}
+<section id="board" class="board" aria-label="Sessions by state"{% if board %} data-waiting="{{ board.waiting }}"{% endif %}>
+{% if error %}
+{% include "_error.html" %}
+{% elif not board.any_session %}
+{% include "_empty.html" %}
+{% else %}
+{% for bay in board.bays %}
+{% if bay.collapsible %}
+<details class="bay bay--{{ bay.key }}">
+  <summary class="bay__summary"><h2 class="bay__title">{{ bay.heading }} <span class="bay__count">{{ bay.total }}</span></h2></summary>
+  <ol class="strips">
+  {% for s in bay.strips %}
+  {{ strip(s) }}
+  {% endfor %}
+  </ol>
+  {% if bay.more %}
+  <p class="bay__more"><a href="/sessions">{{ bay.more }} more in all sessions</a></p>
+  {% endif %}
+</details>
+{% else %}
+<section class="bay bay--{{ bay.key }}" aria-labelledby="bay-{{ bay.key }}">
+  <h2 class="bay__title" id="bay-{{ bay.key }}">{{ bay.heading }} <span class="bay__count">{{ bay.total }}</span></h2>
+  {% if bay.strips %}
+  <ol class="strips">
+  {% for s in bay.strips %}
+  {{ strip(s) }}
+  {% endfor %}
+  </ol>
+  {% else %}
+  <p class="bay__empty">Nothing is waiting on you.</p>
+  {% endif %}
+</section>
+{% endif %}
+{% endfor %}
+{% if not board.live %}
+<p class="board__quiet">No session is running right now. Older sessions are in <a href="/sessions">all sessions</a>.</p>
+{% endif %}
+{% endif %}
+</section>

@@ -22,10 +22,11 @@ import httpx2
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from starlette.routing import Mount
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from ccobs.domain.hook_config import HOOK_PATH
-from ccobs.server import api
+from ccobs.server import api, ui
 from ccobs.server import app as server_app
 from ccobs.server.config import Settings
 from ccobs.server.guards import (
@@ -877,7 +878,9 @@ def test_the_middlewares_wrap_in_order(app: FastAPI) -> None:
 
 # The routers that create_app includes: FastAPI lists an included router in app.routes
 # as one entry without a path, so their routes are read from the routers themselves.
-INCLUDED_ROUTERS: Final = (api.router,)
+INCLUDED_ROUTERS: Final = (api.router, ui.router)
+# A file under a mount: the mount's own path matches nothing.
+MOUNTED_FILE: Final = "/x"
 
 
 def _route_paths(app: FastAPI) -> list[str]:
@@ -887,6 +890,8 @@ def _route_paths(app: FastAPI) -> list[str]:
         path: str | None = getattr(route, "path", None)
         if path is None or path in HOOK_PATHS:
             continue
+        if isinstance(route, Mount):
+            path += MOUNTED_FILE
         paths.append(path.replace("{session_id}", SESSION_ID))
     return sorted(paths)
 
@@ -896,6 +901,9 @@ def test_the_read_only_check_sees_every_route(app: FastAPI) -> None:
 
     assert "/healthz" in paths
     assert f"/api/v1/sessions/{SESSION_ID}/events" in paths
+    assert "/" in paths
+    assert "/ui/board" in paths
+    assert "/static" + MOUNTED_FILE in paths
     assert not any("{" in path for path in paths)
     # A router included without being added to INCLUDED_ROUTERS fails here.
     without_path = [route for route in app.routes if getattr(route, "path", None) is None]
@@ -910,4 +918,10 @@ def test_every_route_but_the_hook_route_is_read_only(
         response = client.request(method, path)
 
         assert response.status_code == 405, path
-        assert_security_headers(response.headers)
+        if path.startswith("/static/"):
+            # Static files keep their own cache policy (ADR 0034).
+            for name, value in EXPECTED_HEADERS.items():
+                assert response.headers.get_list(name) == [value], name
+            assert "no-store" not in response.headers.get("cache-control", "")
+        else:
+            assert_security_headers(response.headers)

@@ -209,3 +209,458 @@ textarea {
     scroll-behavior: auto !important;
   }
 }
+
+/* Utilities. */
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
+.skip-link {
+  position: absolute;
+  top: var(--space-2);
+  left: var(--space-2);
+  z-index: 10;
+  padding: var(--space-2) var(--space-3);
+  background: var(--strip);
+  color: var(--ink);
+  border-radius: var(--radius-strip);
+  transform: translateY(-200%);
+}
+
+.skip-link:focus {
+  transform: none;
+}
+
+/* The page: left-aligned, at most --page-max-width wide. */
+
+.masthead__inner,
+.page {
+  max-width: var(--page-max-width);
+  padding-inline: var(--space-5);
+}
+
+.page {
+  padding-block: var(--space-4) var(--space-8);
+}
+
+.page:focus {
+  outline: none;
+}
+
+.masthead {
+  border-bottom: 1px solid color-mix(in srgb, var(--ink-muted) 30%, transparent);
+}
+
+.masthead__inner {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2) var(--space-5);
+  padding-block: var(--space-3);
+}
+
+.brand {
+  color: var(--ink);
+  font-size: var(--text-lg);
+  font-weight: var(--weight-semibold);
+  text-decoration: none;
+}
+
+.masthead__nav {
+  display: flex;
+  gap: var(--space-4);
+}
+
+.masthead__nav a {
+  color: var(--ink-muted);
+  text-decoration: none;
+}
+
+.masthead__nav a:hover,
+.masthead__nav a[aria-current="page"] {
+  color: var(--ink);
+  text-decoration: underline;
+  text-decoration-thickness: 2px;
+  text-underline-offset: 0.35em;
+}
+
+/* The theme toggle: three radios drawn as one segmented control. */
+
+.theme-toggle {
+  display: inline-flex;
+  margin: 0 0 0 auto;
+  padding: 2px;
+  border: 0;
+  border-radius: var(--radius-strip);
+  background: color-mix(in srgb, var(--ink) 8%, var(--board));
+}
+
+.theme-toggle[hidden] {
+  display: none;
+}
+
+.theme-toggle label {
+  position: relative;
+  cursor: pointer;
+}
+
+.theme-toggle input {
+  position: absolute;
+  inset: 0;
+  margin: 0;
+  opacity: 0;
+  cursor: pointer;
+}
+
+.theme-toggle span {
+  display: block;
+  padding: var(--space-1) var(--space-3);
+  border-radius: var(--radius-strip);
+  color: var(--ink-muted);
+  font-size: var(--text-sm);
+}
+
+.theme-toggle input:checked + span {
+  background: var(--strip);
+  color: var(--ink);
+  font-weight: var(--weight-semibold);
+}
+
+.theme-toggle input:focus-visible + span {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+.page-title {
+  margin-top: var(--space-3);
+}
+
+.page-lede {
+  color: var(--ink-muted);
+}
+
+/* The board: bays of strips, by state. */
+
+.bay {
+  margin-top: var(--space-6);
+}
+
+.bay:first-child {
+  margin-top: var(--space-3);
+}
+
+.bay__title {
+  margin-bottom: var(--space-3);
+  font-size: var(--text-lg);
+  font-weight: var(--weight-semibold);
+}
+
+.bay__count {
+  margin-left: var(--space-1);
+  color: var(--ink-muted);
+  font-weight: var(--weight-regular);
+  font-variant-numeric: tabular-nums;
+}
+
+.bay__summary {
+  display: block;
+  cursor: pointer;
+  list-style: none;
+}
+
+.bay__summary::-webkit-details-marker {
+  display: none;
+}
+
+.bay__summary .bay__title {
+  display: inline-flex;
+  align-items: baseline;
+  gap: var(--space-2);
+}
+
+/* A disclosure triangle drawn with borders, turned when the bay is open. */
+.bay__summary .bay__title::before {
+  content: "";
+  align-self: center;
+  width: 0;
+  height: 0;
+  border-block: 0.35em solid transparent;
+  border-left: 0.5em solid var(--ink-muted);
+  transition: transform 120ms ease-out;
+}
+
+details[open] > .bay__summary .bay__title::before {
+  transform: rotate(90deg);
+}
+
+.bay__empty,
+.board__quiet,
+.bay__more {
+  color: var(--ink-muted);
+}
+
+.bay__more {
+  margin-top: var(--space-2);
+}
+
+.board__quiet {
+  margin-top: var(--space-5);
+}
+
+/* A strip: a flat row with the state's holder band on its left edge. */
+
+.strips {
+  display: grid;
+  gap: var(--space-1);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.strip {
+  position: relative;
+  display: grid;
+  grid-template-columns: minmax(10rem, 18rem) minmax(0, 1fr) auto;
+  grid-template-areas: "head body elapsed";
+  align-items: center;
+  gap: var(--space-1) var(--space-5);
+  min-height: 3.25rem;
+  padding: var(--space-2) var(--space-4) var(--space-2) var(--space-3);
+  border-left: var(--band-width) solid var(--idle);
+  border-radius: var(--radius-strip);
+  background: var(--strip);
+}
+
+.strip:hover {
+  background: color-mix(in srgb, var(--ink) 4%, var(--strip));
+}
+
+.strip:focus-within {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+.strip--waiting_user {
+  border-left-color: var(--waiting);
+  background: color-mix(in srgb, var(--waiting) 9%, var(--strip));
+}
+
+.strip--waiting_user:hover {
+  background: color-mix(in srgb, var(--waiting) 15%, var(--strip));
+}
+
+.strip--working {
+  border-left-color: var(--working);
+}
+
+.strip--idle {
+  border-left-color: var(--idle);
+}
+
+.strip--ended {
+  border-left-color: var(--ended);
+}
+
+/* Stale: a dashed outline and no band fill. */
+.strip--stale {
+  border-left-color: transparent;
+  background: transparent;
+  outline: 1px dashed var(--ink-muted);
+  outline-offset: -1px;
+}
+
+/* After .strip:hover, which would fill it: a stale strip keeps only a faint tint. */
+.strip--stale:hover {
+  background: color-mix(in srgb, var(--ink) 3%, transparent);
+}
+
+.strip--stale:focus-within {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+.strip__head {
+  grid-area: head;
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.strip__project {
+  overflow: hidden;
+  color: var(--ink);
+  font-weight: var(--weight-semibold);
+  text-decoration: none;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* The whole strip is the link's target; the strip draws the focus ring. */
+.strip__project::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+}
+
+.strip__project:hover {
+  text-decoration: underline;
+}
+
+.strip__project:focus-visible {
+  outline: none;
+}
+
+.strip__unknown {
+  color: var(--ink-muted);
+  font-style: italic;
+  font-weight: var(--weight-regular);
+}
+
+.strip__id {
+  flex: none;
+  color: var(--ink-muted);
+  font-size: var(--text-sm);
+}
+
+.strip__body {
+  grid-area: body;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-1) var(--space-4);
+  min-width: 0;
+}
+
+.strip__state {
+  color: var(--ink-muted);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-semibold);
+}
+
+.strip--waiting_user .strip__state {
+  color: var(--waiting-text);
+}
+
+.strip__agents {
+  color: var(--ink-muted);
+}
+
+.strip__error {
+  color: var(--error);
+  font-size: var(--text-sm);
+}
+
+.strip__elapsed {
+  grid-area: elapsed;
+  color: var(--ink-muted);
+  font-size: var(--text-sm);
+  text-align: right;
+  white-space: nowrap;
+}
+
+/* The one bold element: how long a session has waited on you. */
+.strip__wait {
+  color: var(--waiting-text);
+  font-size: var(--text-xl);
+  font-weight: var(--weight-bold);
+  line-height: 1;
+}
+
+/* Empty and error states. */
+
+.empty-state,
+.error-state {
+  max-width: 52rem;
+  margin-top: var(--space-4);
+  padding: var(--space-4) var(--space-5);
+  border-left: var(--band-width) solid var(--idle);
+  border-radius: var(--radius-strip);
+  background: var(--strip);
+}
+
+.error-state {
+  border-left-color: var(--error);
+}
+
+.error-state h2 {
+  color: var(--error);
+}
+
+.hook-settings-box {
+  position: relative;
+}
+
+.hook-settings {
+  max-height: 24rem;
+  margin: 0;
+  padding: var(--space-3) var(--space-4);
+  overflow: auto;
+  border-radius: var(--radius-strip);
+  background: var(--board);
+  font-size: var(--text-sm);
+  line-height: var(--leading-tight);
+}
+
+.copy-button {
+  position: absolute;
+  top: var(--space-2);
+  right: var(--space-4);
+  padding: var(--space-1) var(--space-3);
+  border: 1px solid var(--ink-muted);
+  border-radius: var(--radius-strip);
+  background: var(--strip);
+  font-size: var(--text-sm);
+  cursor: pointer;
+}
+
+.copy-button[hidden] {
+  display: none;
+}
+
+/* Paging. */
+
+.pager {
+  display: flex;
+  gap: var(--space-5);
+  margin-top: var(--space-5);
+}
+
+/* Tablet. */
+
+@media (max-width: 48rem) {
+  .strip {
+    grid-template-columns: minmax(8rem, 12rem) minmax(0, 1fr) auto;
+    gap: var(--space-1) var(--space-4);
+  }
+}
+
+/* Phone: the fields wrap into two lines; the band stays, the time stays right. */
+
+@media (max-width: 30rem) {
+  .masthead__inner,
+  .page {
+    padding-inline: var(--space-3);
+  }
+
+  .theme-toggle {
+    margin-left: 0;
+  }
+
+  .strip {
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-areas:
+      "head elapsed"
+      "body body";
+    padding-right: var(--space-3);
+  }
+}

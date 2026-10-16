@@ -195,6 +195,56 @@ def test_own_files_use_no_forbidden_htmx_attributes() -> None:
             assert attribute not in text, (path.name, attribute)
 
 
+# The strict CSP (ADR 0034): no inline script or style, no event handler attributes, no
+# eval in our own scripts.
+INLINE_SCRIPT: Final = re.compile(r"<script\b(?![^>]*\bsrc\s*=)[^>]*>", re.IGNORECASE)
+STYLE_ELEMENT: Final = re.compile(r"<style\b", re.IGNORECASE)
+STYLE_ATTRIBUTE: Final = re.compile(r"\sstyle\s*=", re.IGNORECASE)
+HANDLER_ATTRIBUTE: Final = re.compile(r"\son[a-z]+\s*=", re.IGNORECASE)
+HTMX_HANDLER: Final = re.compile(r"\shx-on", re.IGNORECASE)
+EVAL: Final = re.compile(r"\beval\s*\(|\bnew\s+Function\b|\.innerHTML\b|document\.write")
+TEMPLATE_SUFFIXES: Final = {".html", ".jinja", ".j2"}
+
+
+def _templates() -> list[Path]:
+    return [path for path in _files(TEMPLATES) if path.suffix in TEMPLATE_SUFFIXES]
+
+
+def test_there_are_templates() -> None:
+    names = {path.name for path in _templates()}
+    assert {"base.html", "overview.html", "_board.html", "_strip.html"} <= names
+
+
+@pytest.mark.parametrize(
+    "scan", [INLINE_SCRIPT, STYLE_ELEMENT, STYLE_ATTRIBUTE, HANDLER_ATTRIBUTE, HTMX_HANDLER]
+)
+def test_templates_hold_nothing_the_csp_refuses(scan: re.Pattern[str]) -> None:
+    for path in _templates():
+        assert not scan.search(path.read_text(encoding="utf-8")), (path.name, scan.pattern)
+
+
+def test_own_scripts_never_evaluate_strings() -> None:
+    scripts = [path for path in _own_text_files() if path.suffix == ".js"]
+    assert {path.name for path in scripts} >= {"app.js", "theme.js"}
+    for path in scripts:
+        assert not EVAL.search(path.read_text(encoding="utf-8")), path.name
+
+
+def test_the_csp_scans_catch_what_they_must() -> None:
+    assert INLINE_SCRIPT.search("<script>alert(1)</script>")
+    assert INLINE_SCRIPT.search('<script type="module">')
+    assert not INLINE_SCRIPT.search('<script src="/static/js/app.js" defer>')
+    assert STYLE_ELEMENT.search("<STYLE>")
+    assert STYLE_ATTRIBUTE.search('<p style="color: red">')
+    assert not STYLE_ATTRIBUTE.search('<link rel="stylesheet">')
+    assert HANDLER_ATTRIBUTE.search('<img src="x" onerror="go()">')
+    assert not HANDLER_ATTRIBUTE.search('<p class="online">')
+    assert HTMX_HANDLER.search('<a hx-on:click="x">')
+    assert EVAL.search("eval (code)")
+    assert EVAL.search("el.innerHTML = x")
+    assert not EVAL.search("medieval(x)")
+
+
 def test_the_scans_catch_what_they_must() -> None:
     assert DIALOG.search("if (confirm ('x')) {}")
     assert DIALOG.search("window.alert(1)")
@@ -211,7 +261,9 @@ def test_the_scans_catch_what_they_must() -> None:
 
 
 def _blocks(css: str, selector: str) -> list[str]:
-    return re.findall(re.escape(selector) + r"\s*\{([^}]*)\}", css)
+    """The rules whose whole selector, on a line of its own, is ``selector``: ``body``
+    finds ``body { ... }`` and not ``.strip__body { ... }``."""
+    return re.findall(r"(?m)^[ \t]*" + re.escape(selector) + r"\s*\{([^}]*)\}", css)
 
 
 def _declared(block: str) -> set[str]:
@@ -261,6 +313,23 @@ def test_the_stylesheet_has_light_and_dark_colour_tokens() -> None:
     assert _values(media_dark) == _values(forced_dark)
     assert "color-scheme: light" in light
     assert "color-scheme: dark" in media_dark
+
+
+def test_blocks_match_whole_selectors() -> None:
+    css = "body { a: b; }\n.strip__body { c: d; }\n@media x {\n  body { e: f; }\n}\n"
+    assert _blocks(css, "body") == [" a: b; ", " e: f; "]
+
+
+def test_strips_are_flat_rows_with_a_band() -> None:
+    css = APP_CSS.read_text(encoding="utf-8")
+    # The base rule first; the media queries only change its grid.
+    strip = _blocks(css, ".strip")[0]
+    assert "border-left: var(--band-width) solid" in strip
+    assert "border-radius: var(--radius-strip)" in strip
+    # No shadows: only the focus ring stands out (the visual direction).
+    assert "box-shadow" not in css
+    for state in ("waiting_user", "working", "idle", "ended", "stale"):
+        assert _blocks(css, f".strip--{state}"), state
 
 
 def test_the_contrast_formula() -> None:

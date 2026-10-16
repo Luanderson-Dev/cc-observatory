@@ -33,8 +33,9 @@ The app is the `app` service of the compose stack, a FastAPI process
   as Prometheus metrics on a separate listener that Prometheus scrapes
   ([ADR 0028](adr/0028-app-metrics-and-their-listener.md)).
 
-The web UI comes in v0.4.0, and `ccobs setup`, which writes the hooks into Claude Code's
-settings for you, in v0.5.0.
+It also serves a web UI at <http://127.0.0.1:4300> (see [The web UI](#the-web-ui)),
+which is being built for v0.4.0; `ccobs setup`, which writes the hooks into Claude
+Code's settings for you, comes in v0.5.0.
 
 `docker compose up -d` builds the app's image on the first start and whenever the source
 changes, then starts it at <http://127.0.0.1:4300> (the port is `CCOBS_APP_PORT`).
@@ -239,6 +240,36 @@ it sends no query.
   the app works as before: the block closes on the next progress event of its scope, or
   at the stale sweep, and its duration includes the time until then.
 - A reject exported more than 15 minutes after its block opened is ignored.
+
+## The web UI
+
+The UI is server-rendered HTML with htmx and files that ship with the app; it loads
+nothing from another origin and works offline
+([ADR 0031](adr/0031-server-rendered-pages-with-htmx-and-vendored-assets.md)). It is
+still being built for v0.4.0; this section lists what is there so far.
+
+- **Overview** (`GET /`): a board of sessions in bays by state, each session a strip.
+  "Waiting on you" comes first, the longest wait first, with its time since the oldest
+  open block; then "Working" and "Idle", the latest activity first. "Ended in the last
+  24 hours" and "Stale" are collapsed and show at most 20 sessions each, with a link to
+  the rest. A strip shows the project name (the last part of the session's working
+  directory, never the whole path), what the session does or waits on, its running
+  subagents and its last error code. The page title counts the sessions waiting on you,
+  such as `(2) cc-observatory`. With no session stored yet, the board shows the hook
+  settings for the port you opened it on, ready to save for `claude --settings`.
+- **All sessions** (`GET /sessions`): every stored session as a strip, the latest
+  activity first, 50 per page; "Older sessions" pages on with a cursor.
+- `GET /ui/board` returns the overview's board alone; live updates, which refetch it
+  when a session changes, come in a later stage of v0.4.0. Until then, reload the page.
+- **Times** are elapsed times ticking in the browser; hover one for the moment in your
+  time zone.
+- **Theme**: system, light or dark, from the toggle in the header; the choice is kept in
+  the browser's local storage for the app's origin.
+- If the app cannot read its database, the page says so with a 503 and a short reason.
+
+Static files under `/static/` are cached by the browser: the versioned htmx file for a
+year, everything else revalidated with its `ETag` on each load, so an upgrade never
+leaves an old stylesheet behind. Pages are never cached (`Cache-Control: no-store`).
 
 ## The JSON API
 

@@ -67,12 +67,15 @@ from ccobs.server.db.models import (
 
 __all__ = [
     "DETAIL_CLOSED_LIMIT",
+    "LIVE_STATUSES",
     "AgentPage",
     "Applied",
+    "BoardRows",
     "HookEventRow",
     "Repository",
     "SessionDetail",
     "SessionView",
+    "StripRow",
     "hook_event_row",
 ]
 
@@ -105,6 +108,10 @@ DETAIL_CLOSED_LIMIT: Final = 50
 _AGENT_FIRST_SEEN: Final = func.coalesce(
     AgentModel.started_at_ms, AgentModel.stopped_at_ms, AgentModel.last_event_at_ms
 )
+# The statuses of the overview's live bays, which it always shows in full: the stale
+# sweep moves a session out of them after hours of silence (ADR 0024).
+LIVE_STATUSES: Final = ("waiting_user", "working", "idle")
+_STALE: Final = "stale"
 _SESSION_FIELDS: Final = tuple(f.name for f in fields(Session))
 _AGENT_FIELDS: Final = tuple(f.name for f in fields(Agent))
 # Block.scope is stored as scope_agent_id.
@@ -247,6 +254,30 @@ class AgentPage:
 
     agents: list[Agent]
     parents: Mapping[str, str | None]
+
+
+@dataclass(frozen=True, kw_only=True)
+class StripRow:
+    """What a strip of the web UI needs of a session: the session, how many of its agents
+    are running and not internal, and its oldest open block (by opening time), if any."""
+
+    session: Session
+    running_subagents: int
+    oldest_open_block: Block | None
+
+
+@dataclass(frozen=True, kw_only=True)
+class BoardRows:
+    """The overview's sessions: every live one (``LIVE_STATUSES``), and the latest ended
+    and stale ones, capped, with how many there are in all. ``any_session`` says whether
+    the database holds a session at all, old ones included."""
+
+    live: list[StripRow]
+    ended: list[StripRow]
+    ended_total: int
+    stale: list[StripRow]
+    stale_total: int
+    any_session: bool
 
 
 # Record <-> row.
@@ -573,6 +604,109 @@ class Repository:
             rows = connection.execute(statement.limit(limit)).mappings().all()
         ordered = rows if after_seq is not None else reversed(rows)
         return [HookEventRow(**{name: row[name] for name in names}) for row in ordered]
+
+    # Reads for the web UI.
+
+    def board(self, *, ended_since_ms: int, closed_limit: int) -> BoardRows:
+        """The overview's sessions (``BoardRows``): the live ones, the ``closed_limit``
+        latest that ended at or after ``ended_since_ms`` and the ``closed_limit`` stale
+        ones with the latest activity. One connection, so one read transaction."""
+        table = SessionModel.__table__
+        ended_filter = (
+            SessionModel.status == _ENDED,
+            SessionModel.ended_at_ms >= ended_since_ms,
+        )
+        stale_filter = SessionModel.status == _STALE
+        # Ties go by session ID, as on the board (presentation.board_sort_key).
+        latest = (SessionModel.last_event_at_ms.desc(), SessionModel.session_id)
+        with self.engine.connect() as connection:
+            live = connection.execute(
+                select(table).where(SessionModel.status.in_(LIVE_STATUSES))
+            ).mappings()
+            live_rows = list(live)
+            ended = connection.execute(
+                select(table)
+                .where(*ended_filter)
+                .order_by(SessionModel.ended_at_ms.desc(), SessionModel.session_id)
+                .limit(closed_limit)
+            ).mappings()
+            ended_rows = list(ended)
+            stale = connection.execute(
+                select(table).where(stale_filter).order_by(*latest).limit(closed_limit)
+            ).mappings()
+            stale_rows = list(stale)
+            ended_total = connection.execute(
+                select(func.count()).select_from(SessionModel).where(*ended_filter)
+            ).scalar_one()
+            stale_total = connection.execute(
+                select(func.count()).select_from(SessionModel).where(stale_filter)
+            ).scalar_one()
+            any_session = bool(live_rows or ended_rows or stale_rows) or (
+                connection.execute(select(SessionModel.session_id).limit(1)).first() is not None
+            )
+            strips = _strip_rows(connection, [*live_rows, *ended_rows, *stale_rows])
+        live_count, ended_count = len(live_rows), len(ended_rows)
+        return BoardRows(
+            live=strips[:live_count],
+            ended=strips[live_count : live_count + ended_count],
+            ended_total=ended_total,
+            stale=strips[live_count + ended_count :],
+            stale_total=stale_total,
+            any_session=any_session,
+        )
+
+    def session_page(self, limit: int, before: tuple[int, str] | None = None) -> list[StripRow]:
+        """``limit`` sessions with the latest activity first, then the highest
+        ``session_id``, starting just below ``before`` (``(last_event_at_ms,
+        session_id)``, exclusive) when given. The cursor is a position, not a row: a
+        session deleted since still pages, and one that moved up stays out of later pages.
+        """
+        statement = select(SessionModel.__table__)
+        if before is not None:
+            statement = statement.where(
+                tuple_(SessionModel.last_event_at_ms, SessionModel.session_id)
+                < tuple_(before[0], before[1])
+            )
+        statement = statement.order_by(
+            SessionModel.last_event_at_ms.desc(), SessionModel.session_id.desc()
+        ).limit(limit)
+        with self.engine.connect() as connection:
+            rows = connection.execute(statement).mappings().all()
+            return _strip_rows(connection, rows)
+
+
+def _strip_rows(connection: Connection, rows: Sequence[RowMapping]) -> list[StripRow]:
+    """The ``StripRow`` of each session row, in the same order: two more queries, one for
+    the running non-internal agents and one for the open blocks of these sessions."""
+    session_ids = [row["session_id"] for row in rows]
+    if not session_ids:
+        return []
+    running: dict[str, int] = {}
+    for session_id, count in connection.execute(
+        select(AgentModel.session_id, func.count())
+        .where(
+            AgentModel.session_id.in_(session_ids),
+            AgentModel.status == _RUNNING,
+            AgentModel.internal.is_(False),
+        )
+        .group_by(AgentModel.session_id)
+    ):
+        running[session_id] = count
+    oldest: dict[str, Block] = {}
+    for row in connection.execute(
+        select(BlockModel.__table__)
+        .where(BlockModel.session_id.in_(session_ids), BlockModel.closed_at_ms.is_(None))
+        .order_by(BlockModel.opened_at_ms, BlockModel.block_id)
+    ).mappings():
+        oldest.setdefault(row["session_id"], _block(row))
+    return [
+        StripRow(
+            session=_session(row),
+            running_subagents=running.get(row["session_id"], 0),
+            oldest_open_block=oldest.get(row["session_id"]),
+        )
+        for row in rows
+    ]
 
 
 def _launch_scopes(

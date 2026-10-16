@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<meta name="referrer" content="no-referrer">
+<meta name="htmx-config" content='{"includeIndicatorStyles":false,"allowEval":false,"allowScriptTags":false,"selfRequestsOnly":true,"historyCacheSize":0}'>
+<title>{% block title %}cc-observatory{% endblock %}</title>
+<link rel="icon" href="/static/img/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/static/css/app.css">
+<script src="/static/js/theme.js"></script>
+<script src="/static/vendor/htmx-2.0.11.min.js" defer></script>
+<script src="/static/js/app.js" defer></script>
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<header class="masthead">
+  <div class="masthead__inner">
+    <a class="brand" href="/">cc-observatory</a>
+    <nav class="masthead__nav" aria-label="Pages">
+      <a href="/"{% if nav == "overview" %} aria-current="page"{% endif %}>Overview</a>
+      <a href="/sessions"{% if nav == "sessions" %} aria-current="page"{% endif %}>All sessions</a>
+    </nav>
+    <fieldset class="theme-toggle" hidden>
+      <legend class="visually-hidden">Theme</legend>
+      <label><input type="radio" name="theme" value="system"><span>System</span></label>
+      <label><input type="radio" name="theme" value="light"><span>Light</span></label>
+      <label><input type="radio" name="theme" value="dark"><span>Dark</span></label>
+    </fieldset>
+  </div>
+</header>
+<main id="main" class="page" tabindex="-1">
+{% block content %}{% endblock %}
+</main>
+</body>
+</html>

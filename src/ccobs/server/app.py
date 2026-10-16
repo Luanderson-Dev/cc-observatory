@@ -30,7 +30,7 @@ from fastapi.exceptions import RequestValidationError
 from starlette.routing import Route
 from starlette.types import Receive, Scope, Send
 
-from ccobs.server import api
+from ccobs.server import api, ui
 from ccobs.server.config import Settings
 from ccobs.server.db.engine import create_engine_for, wal_enabled
 from ccobs.server.db.repository import Repository
@@ -328,6 +328,9 @@ def create_app(
         exception_handlers={RequestValidationError: api.validation_error},
     )
     app.state.queue = hook_queue
+    # The same clock as the hook route: the UI measures elapsed times and the window of
+    # recently ended sessions from it.
+    app.state.clock = endpoint.clock
     for path in sorted(HOOK_PATHS):
         app.router.routes.append(Route(path, endpoint, include_in_schema=False))
 
@@ -337,6 +340,9 @@ def create_app(
 
     # The read-only JSON API, behind the same guards.
     app.include_router(api.router)
+    # The web UI's pages and fragments, and its static files (ADR 0031).
+    app.include_router(ui.router)
+    app.mount("/static", ui.StaticAssets(), name="static")
     # The last one added is the outermost (ADR 0034): the Host guard, then the response
     # headers (so that a 403 carries them), then Fetch Metadata. The hook route passes
     # through the inner two untouched.
