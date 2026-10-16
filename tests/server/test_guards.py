@@ -37,8 +37,9 @@ from ccobs.server.guards import (
 )
 from ccobs.server.ingest import HookQueue
 
-# The app without its metrics listener: only tests/server/test_metrics.py opens sockets.
-create_app: Final = functools.partial(server_app.create_app, serve_metrics=False)
+# The app without its metrics listener (only tests/server/test_metrics.py opens sockets)
+# and without its sweeper (tests/server/test_sweeps.py covers it).
+create_app: Final = functools.partial(server_app.create_app, serve_metrics=False, sweeps=False)
 KIB: Final = 1024
 BODY_MAX: Final = 64 * KIB
 GOOD_HOST: Final = "127.0.0.1:4300"

@@ -47,8 +47,9 @@ from ccobs.server.ingest import (
 from ccobs.server.migrations import HEAD, upgrade_to_head
 from ccobs.server.writer import BlockClosedCallback, WriterCounts
 
-# The app without its metrics listener: only tests/server/test_metrics.py opens sockets.
-create_app: Final = functools.partial(server_app.create_app, serve_metrics=False)
+# The app without its metrics listener (only tests/server/test_metrics.py opens sockets)
+# and without its sweeper (tests/server/test_sweeps.py covers it).
+create_app: Final = functools.partial(server_app.create_app, serve_metrics=False, sweeps=False)
 KIB: Final = 1024
 MIB: Final = 1024 * KIB
 BODY_MAX: Final = 64 * KIB
@@ -79,6 +80,12 @@ class IdleWriter:
         pass
 
     def stop(self, timeout_s: float) -> None:
+        pass
+
+    def submit_tick(self, now_ms: int) -> None:
+        pass
+
+    def submit_retention(self, cutoff_ms: int) -> None:
         pass
 
     def counts(self) -> WriterCounts:

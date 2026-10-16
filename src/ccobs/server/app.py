@@ -6,8 +6,10 @@ background, so the route stays O(1) and far inside Claude Code's hook timeout. E
 request on the hook route, whatever happens to it, gets the same neutral 204 (CLAUDE.md,
 ADR 0011). The lifespan starts the writer once the database is migrated, then the
 metrics listener (``ccobs.server.metrics``, ADR 0028), which serves ``/metrics`` on a
-port of its own: this app has no ``/metrics`` route. At shutdown it stops the listener,
-then the writer, draining the queue, before it disposes the engine.
+port of its own (this app has no ``/metrics`` route), then the sweeper
+(``ccobs.server.sweeps``), which submits the stale sweep and retention to the writer. At
+shutdown it stops the listener, then the sweeper, then the writer, draining the queue,
+before it disposes the engine.
 """
 
 from __future__ import annotations
@@ -40,6 +42,7 @@ from ccobs.server.guards import (
 from ccobs.server.ingest import Clock, DropReason, HookQueue, RawHook, SeqAllocator, wall_clock_ms
 from ccobs.server.metrics import AppMetrics, MetricsListener
 from ccobs.server.migrations import upgrade_to_head
+from ccobs.server.sweeps import RETENTION_INTERVAL_S, TICK_INTERVAL_S, Sweeper, SweepTarget
 from ccobs.server.writer import BlockClosedCallback, Writer, WriterCounts
 
 __all__ = ["BackgroundWriter", "HookEndpoint", "WriterFactory", "create_app"]
@@ -51,10 +54,13 @@ _MS_PER_S: Final = 1000
 # How long shutdown waits for the writer to drain the queue before it counts the rest
 # as dropped; well inside the 30 s stop_grace_period that compose.yaml gives the app.
 WRITER_STOP_TIMEOUT_S: Final = 5.0
+# How long shutdown waits for the sweeper thread; its stop interrupts its wait at once.
+SWEEPER_STOP_TIMEOUT_S: Final = 5.0
 
 
-class BackgroundWriter(Protocol):
-    """What the app needs of the writer: ``Writer``, or a test double."""
+class BackgroundWriter(SweepTarget, Protocol):
+    """What the app needs of the writer: ``Writer``, or a test double. The sweeper
+    submits its ticks and retention through ``SweepTarget``'s methods."""
 
     def start(self) -> None: ...
 
@@ -137,6 +143,8 @@ def create_app(
     writer_factory: WriterFactory | None = None,
     serve_metrics: bool = True,
     metrics_port: int | None = None,
+    sweeps: bool = True,
+    sweep_intervals: tuple[float, float] | None = None,
 ) -> FastAPI:
     """The app, not started: its lifespan migrates the database, seeds ``seq``, runs the
     writer thread and the metrics listener.
@@ -147,7 +155,10 @@ def create_app(
     settings' host label and stale threshold. The metrics listener (ADR 0028) binds
     ``settings.listen_host`` on ``metrics_port``, ``settings.metrics_port`` by default
     (0 picks a free port, for tests); ``serve_metrics=False`` leaves it off, the registry
-    still in ``app.state.metrics``.
+    still in ``app.state.metrics``. The sweeper (``ccobs.server.sweeps``) submits the
+    stale sweep and retention to the writer on ``sweep_intervals``, ``(tick, retention)``
+    in seconds (60 s and 1 h by default), with the same clock as the hook route;
+    ``sweeps=False`` leaves it off.
     """
     hook_queue = queue or HookQueue(settings.hook_queue_max_items, settings.hook_queue_max_bytes)
     endpoint = HookEndpoint(
@@ -167,6 +178,10 @@ def create_app(
         )
 
     make_writer = writer_factory or default_writer
+    tick_interval_s, retention_interval_s = sweep_intervals or (
+        TICK_INTERVAL_S,
+        RETENTION_INTERVAL_S,
+    )
     listen_port = settings.metrics_port if metrics_port is None else metrics_port
 
     def start_listener(metrics: AppMetrics) -> MetricsListener | None:
@@ -209,13 +224,30 @@ def create_app(
             app.state.metrics = metrics
             listener = start_listener(metrics) if serve_metrics else None
             app.state.metrics_listener = listener
+            sweeper: Sweeper | None = None
+            app.state.sweeper = None
             try:
+                if sweeps:
+                    # After the writer starts, inside the try that stops it.
+                    sweeper = Sweeper(
+                        writer,
+                        retention=settings.retention,
+                        tick_interval_s=tick_interval_s,
+                        retention_interval_s=retention_interval_s,
+                        clock=endpoint.clock,
+                    )
+                    sweeper.start()
+                    app.state.sweeper = sweeper
                 yield
             finally:
                 # Before the writer stops, so no new scrape reads a writer going away.
                 if listener is not None:
                     await asyncio.to_thread(listener.stop)
                     app.state.metrics_listener = None
+                # Before the writer stops, so nothing is submitted to a stopping writer.
+                if sweeper is not None:
+                    await asyncio.to_thread(sweeper.stop, SWEEPER_STOP_TIMEOUT_S)
+                    app.state.sweeper = None
                 # No new hook enters the queue while the writer drains it.
                 endpoint.seq = None
                 # Off the event loop: the drain can take up to the timeout.

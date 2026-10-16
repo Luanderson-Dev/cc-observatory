@@ -165,7 +165,14 @@ def client(settings: Settings, clock: Clock) -> Iterator[TestClient]:
         return ManualWriter(queue, repository, HOST, stale_after_ms=12 * HOUR_MS, batch_wait_s=0)
 
     queue = HookQueue(settings.hook_queue_max_items, settings.hook_queue_max_bytes)
-    app = create_app(settings, queue=queue, clock=clock, writer_factory=manual, serve_metrics=False)
+    app = create_app(
+        settings,
+        queue=queue,
+        clock=clock,
+        writer_factory=manual,
+        serve_metrics=False,
+        sweeps=False,
+    )
     with TestClient(app, base_url=f"http://{GOOD_HOST}") as test_client:
         yield test_client
 

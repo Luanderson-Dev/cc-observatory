@@ -46,8 +46,9 @@ from ccobs.server.ingest import DROP_REASONS, HookQueue, RawHook
 from ccobs.server.migrations import upgrade_to_head
 from ccobs.server.writer import BlockClosedCallback, Writer, WriterCounts
 
-# The app without its metrics listener: only tests/server/test_metrics.py opens sockets.
-create_app: Final = functools.partial(server_app.create_app, serve_metrics=False)
+# The app without its metrics listener (only tests/server/test_metrics.py opens sockets)
+# and without its sweeper (tests/server/test_sweeps.py covers it).
+create_app: Final = functools.partial(server_app.create_app, serve_metrics=False, sweeps=False)
 HOOK_FIXTURES: Final = Path(__file__).parents[1] / "fixtures" / "hooks"
 FIXTURES: Final = sorted(HOOK_FIXTURES.glob("*.jsonl"))
 TOOLS: Final = HOOK_FIXTURES / "headless-tools-subagent.jsonl"
@@ -381,6 +382,12 @@ def test_the_lifespan_uses_an_injected_writer_factory(settings: Settings) -> Non
         def stop(self, timeout_s: float) -> None:
             calls.append(("stop", timeout_s))
             threads["stop"] = threading.current_thread()
+
+        def submit_tick(self, now_ms: int) -> None:
+            calls.append(("tick", now_ms))
+
+        def submit_retention(self, cutoff_ms: int) -> None:
+            calls.append(("retention", cutoff_ms))
 
         def counts(self) -> WriterCounts:
             return WriterCounts(

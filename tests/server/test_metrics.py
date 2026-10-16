@@ -9,6 +9,7 @@ its own on the metrics port, never by the public app.
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import os
@@ -54,7 +55,7 @@ from ccobs.domain.app_metrics import (
     AppMetric,
 )
 from ccobs.domain.hook_config import HOOK_PATH
-from ccobs.server.app import create_app
+from ccobs.server import app as server_app
 from ccobs.server.config import Settings
 from ccobs.server.db.models import AgentModel, BlockModel, HookEventModel, SessionModel
 from ccobs.server.db.repository import Repository
@@ -68,6 +69,8 @@ from ccobs.server.metrics import (
 )
 from ccobs.server.writer import BlockClosedCallback, Writer, WriterCounts
 
+# The app without its sweeper: tests/server/test_sweeps.py covers it.
+create_app: Final = functools.partial(server_app.create_app, sweeps=False)
 HOOK_FIXTURES: Final = Path(__file__).parents[1] / "fixtures" / "hooks"
 SERVER_SOURCES: Final = Path(__file__).parents[2] / "src" / "ccobs" / "server"
 # Agents and a permission block; an elicitation block and idle; compaction and a
@@ -519,6 +522,12 @@ def test_the_listener_stops_before_the_writer(settings: Settings, queue: HookQue
 
         def stop(self, timeout_s: float) -> None:
             seen.append(port_is_free(ports[0]))
+
+        def submit_tick(self, now_ms: int) -> None:
+            pass
+
+        def submit_retention(self, cutoff_ms: int) -> None:
+            pass
 
         def counts(self) -> WriterCounts:
             return WriterCounts(
