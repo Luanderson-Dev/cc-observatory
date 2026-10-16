@@ -16,7 +16,7 @@
 # There is no remote_write, remote_read or alerting: nothing leaves Prometheus.
 
 global:
-  # How often Prometheus scrapes the two jobs below; Claude Code's metrics are pushed.
+  # How often Prometheus scrapes the jobs below; Claude Code's metrics are pushed.
   scrape_interval: 15s
 
 storage:
@@ -50,3 +50,12 @@ scrape_configs:
   - job_name: otel-collector
     static_configs:
       - targets: ["otel-collector:8888"]
+  # The app's live state (ccobs_*: sessions by state, open blocks, hook counters),
+  # served by its metrics listener on port 9464 inside the stack's networks, never
+  # published (ADR 0028). Every series carries the app's own host label (ADR 0022). It is
+  # stored as sent, with no honor_labels: Prometheus renames a scraped label to
+  # exported_<name> only when a target label has the same name, and these targets have
+  # only job and instance (ADR 0030).
+  - job_name: ccobs-app
+    static_configs:
+      - targets: ["app:9464"]

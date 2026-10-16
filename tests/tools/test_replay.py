@@ -6,10 +6,12 @@ shapes, and a throwaway HTTP server on 127.0.0.1 for the sending side.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import re
 import socket
 import threading
+import time
 import uuid
 from collections import Counter, defaultdict
 from collections.abc import Iterable, Iterator, Mapping
@@ -17,10 +19,15 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from types import SimpleNamespace
 from typing import Final, Literal, override
 
 import pytest
 
+import tools.stack.replay as replay_module
+from ccobs.domain.hooks import parse_hook
+from ccobs.domain.sessions import Effect, SessionState, apply
 from tools.capture.jsontypes import JSON, JSONObject
 from tools.stack.replay import (
     CANARY_PREFIX,
@@ -29,6 +36,11 @@ from tools.stack.replay import (
     CONTENT_SPAN_EVENT_CANARY_KEYS,
     DATA_POINT_CANARY_KEYS,
     DEFAULT_FIXTURES,
+    DEFAULT_HOOKS_ENDPOINT,
+    HOOK_CONTENT_CANARY_KEYS,
+    HOOK_NESTED_CANARY_KEYS,
+    HOOK_NESTED_KEY,
+    HOOKS_PATH,
     IDENTITY_CANARY_KEYS,
     LOG_CONTENT_CANARY_KEYS,
     LOG_RECORD_CANARY_KEYS,
@@ -37,6 +49,7 @@ from tools.stack.replay import (
     SPAN_CANARY_KEYS,
     SPAN_CONTENT_CANARY_KEYS,
     SPAN_EVENT_CANARY_KEYS,
+    HookLine,
     Prepared,
     ReplayError,
     Scenario,
@@ -44,13 +57,17 @@ from tools.stack.replay import (
     Signal,
     contiguous_series,
     expected_totals,
+    fresh_session_id,
     is_identity_key,
     load_scenario,
     main,
+    post_hook,
     post_otlp,
     prepare,
+    prepare_hooks,
     scenario_names,
     send,
+    send_hooks,
     shift_iso_timestamp,
 )
 
@@ -58,6 +75,7 @@ from tools.stack.replay import (
 SECOND: Final = 1_000_000_000
 T0: Final = 1_700_000_000 * SECOND
 OLD_SESSION: Final = "11111111-2222-4333-8444-555555555555"
+OTHER_SESSION: Final = "66666666-7777-4888-9999-aaaaaaaaaaaa"
 TRACE_MAIN: Final = "0af7651916cd43dd8448eb211c80319c"
 TRACE_LINKED: Final = "4bf92f3577b34da6a3ce929d0e0e4736"
 SPAN_ROOT: Final = "b7ad6b7169203331"
@@ -1140,6 +1158,284 @@ def test_canaries_on_a_hooks_only_scenario_plant_nothing() -> None:
     assert all_requests(prepared) == []
 
 
+# Hooks.
+
+HOOK_NAMES: Final = scenario_names(with_hooks=True)
+
+
+def hook_line(event: str, offset_ms: int = 0, **fields: JSON) -> JSONObject:
+    payload: JSONObject = {
+        "session_id": OLD_SESSION,
+        "hook_event_name": event,
+        "transcript_path": f"/home/user/.claude/projects/p/{OLD_SESSION}.jsonl",
+        "cwd": "/home/user/project",
+        **fields,
+    }
+    return {"offset_ms": offset_ms, "transport": "http", "payload": payload}
+
+
+def hook_scenario(*lines: JSONObject) -> Scenario:
+    return Scenario("synthetic-hooks", OLD_SESSION, hooks=lines)
+
+
+def reduce(lines: Iterable[HookLine]) -> tuple[SessionState | None, list[Effect]]:
+    """The reducer's replay of ``lines``, as the app would fold them (ADR 0024)."""
+    state: SessionState | None = None
+    effects: list[Effect] = []
+    for seq, line in enumerate(lines, start=1):
+        state, changes = apply(state, parse_hook(line.payload), 1_000 + line.offset_ms, seq)
+        effects.extend(changes)
+    return state, effects
+
+
+def test_scenario_names_can_ask_for_hooks() -> None:
+    manifest = json.loads((DEFAULT_FIXTURES / "manifest.json").read_text(encoding="utf-8"))
+    with_hooks = [
+        entry["name"]
+        for entry in manifest["scenarios"]
+        if f"hooks/{entry['name']}.jsonl" in entry["files"]
+    ]
+
+    assert with_hooks == HOOK_NAMES
+    assert "headless-sessionstart-http-ignored" in HOOK_NAMES
+    assert "hooks-endpoint-down" not in HOOK_NAMES
+    # Either kind, in manifest order.
+    assert scenario_names(with_otlp=True, with_hooks=True) == [
+        name for name in NAMES if name in HOOK_NAMES or name in OTLP_NAMES
+    ]
+    assert set(scenario_names(with_otlp=True, with_hooks=True)) == set(NAMES)
+
+
+@pytest.mark.parametrize("name", NAMES)
+def test_load_scenario_reads_the_hook_lines_in_file_order(name: str) -> None:
+    scenario = load_scenario(name)
+    path = DEFAULT_FIXTURES / "hooks" / f"{name}.jsonl"
+
+    if name in HOOK_NAMES:
+        lines = path.read_text(encoding="utf-8").splitlines()
+        assert list(scenario.hooks) == [json.loads(line) for line in lines]
+    else:
+        assert scenario.hooks == ()
+
+
+def test_a_hook_line_that_is_not_an_object_is_an_error(tmp_path: Path) -> None:
+    (tmp_path / "hooks").mkdir()
+    (tmp_path / "hooks" / "bad.jsonl").write_text('{"offset_ms": 0}\n\n[1]\n', encoding="utf-8")
+    manifest = {
+        "scenarios": [{"name": "bad", "session_id": OLD_SESSION, "files": ["hooks/bad.jsonl"]}]
+    }
+    (tmp_path / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=r"bad\.jsonl:3: expected a hook line object"):
+        load_scenario("bad", tmp_path)
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        {"offset_ms": "0", "transport": "http", "payload": {}},
+        {"offset_ms": True, "transport": "http", "payload": {}},
+        {"offset_ms": 0, "transport": None, "payload": {}},
+        {"offset_ms": 0, "transport": "http", "payload": []},
+    ],
+)
+def test_prepare_hooks_refuses_a_malformed_line(line: JSONObject) -> None:
+    with pytest.raises(ValueError, match="synthetic-hooks hook line 2"):
+        prepare_hooks(hook_scenario(hook_line("Stop"), line))
+
+
+def test_fresh_session_ids_are_uuid4() -> None:
+    first, second = fresh_session_id(), fresh_session_id()
+
+    assert first != second
+    assert uuid.UUID(first).version == 4
+    assert fresh_session_id(CountingBits()) == fresh_session_id(CountingBits())
+
+
+def test_prepare_hooks_replaces_the_session_id_in_every_string() -> None:
+    scenario = hook_scenario(
+        hook_line("SessionStart", 0, source="startup"),
+        hook_line("Stop", 1_500, nested={"items": [OLD_SESSION, 7, None]}),
+    )
+    original = json.dumps(scenario.hooks)
+
+    prepared = prepare_hooks(scenario, session_id=OTHER_SESSION)
+
+    assert json.dumps(scenario.hooks) == original
+    assert prepared.session_id == OTHER_SESSION
+    assert OLD_SESSION not in json.dumps([line.payload for line in prepared.lines])
+    first, second = prepared.lines
+    assert (first.offset_ms, first.transport) == (0, "http")
+    assert second.offset_ms == 1_500
+    assert first.payload["session_id"] == OTHER_SESSION
+    path = first.payload["transcript_path"]
+    assert path == f"/home/user/.claude/projects/p/{OTHER_SESSION}.jsonl"
+    assert second.payload["nested"] == {"items": [OTHER_SESSION, 7, None]}
+    assert prepared.canary_marker is None
+    assert prepared.canary_values == frozenset()
+
+
+def test_prepare_hooks_defaults_to_a_fresh_session_id() -> None:
+    scenario = hook_scenario(hook_line("Stop"))
+
+    first, second = prepare_hooks(scenario), prepare_hooks(scenario)
+
+    assert first.session_id != second.session_id
+    assert uuid.UUID(first.session_id).version == 4
+    again = prepare_hooks(scenario, rng=CountingBits())
+    assert prepare_hooks(scenario, rng=CountingBits()) == again
+
+
+def test_prepare_hooks_without_an_original_session_id_only_sets_the_field() -> None:
+    original: JSONObject = {"hook_event_name": "Stop", "note": "kept as is"}
+    item: JSONObject = {"offset_ms": 0, "transport": "http", "payload": original}
+    scenario = Scenario("no-id", "", hooks=(item,))
+
+    (line,) = prepare_hooks(scenario, session_id=OTHER_SESSION).lines
+
+    assert line.payload == {**original, "session_id": OTHER_SESSION}
+    assert original == {"hook_event_name": "Stop", "note": "kept as is"}
+
+
+def test_prepare_hooks_refuses_a_payload_of_another_session() -> None:
+    stray = hook_line("Stop", 10)
+    payload = stray["payload"]
+    assert isinstance(payload, dict)
+    payload["session_id"] = OTHER_SESSION
+
+    with pytest.raises(ValueError, match="synthetic-hooks hook line 2: the payload's session_id"):
+        prepare_hooks(hook_scenario(hook_line("UserPromptSubmit"), stray))
+
+
+@pytest.mark.parametrize("name", HOOK_NAMES)
+def test_hooks_and_telemetry_of_a_scenario_share_one_session_id(name: str) -> None:
+    scenario = load_scenario(name)
+    session_id = fresh_session_id()
+
+    telemetry = prepare(scenario, now_ns=NOW, session_id=session_id)
+    hooks = prepare_hooks(scenario, session_id=session_id)
+
+    assert hooks.session_id == telemetry.session_id == session_id
+    assert {line.payload["session_id"] for line in hooks.lines} == {session_id}
+    assert scenario.session_id not in json.dumps([line.payload for line in hooks.lines])
+    assert len(hooks.lines) == len(scenario.hooks)
+
+
+def test_hook_canaries_go_in_every_content_field() -> None:
+    scenario = hook_scenario(
+        hook_line("PostToolUse", tool_name="Agent", tool_response={"status": "async_launched"}),
+        hook_line("StopFailure", 10, error="model_not_found"),
+        hook_line("PermissionDenied", 20, reason="denied by a rule", tool_response="plain text"),
+        hook_line(
+            "Stop",
+            30,
+            effort={"level": "high"},
+            background_tasks=[{"id": "t1", "type": "shell"}, "not a task"],
+        ),
+    )
+
+    prepared = prepare_hooks(scenario, canaries=True, rng=CountingBits())
+
+    marker = prepared.canary_marker
+    assert marker is not None
+    assert marker.startswith(CANARY_PREFIX)
+    post, failure, denied, stop = (line.payload for line in prepared.lines)
+    for number, payload in enumerate((post, failure, denied, stop)):
+        for key in HOOK_CONTENT_CANARY_KEYS:
+            assert payload[key] == f"{marker}:hooks.line{number}:{key}"
+        for key in ("tool_response", "effort", "mcp_server"):
+            nested = payload[key]
+            assert isinstance(nested, dict)
+            assert nested[HOOK_NESTED_KEY] == f"{marker}:hooks.line{number}:{key}"
+    # Metadata next to the canaries is kept.
+    assert post["tool_response"] == {
+        "status": "async_launched",
+        HOOK_NESTED_KEY: f"{marker}:hooks.line0:tool_response",
+    }
+    assert stop["effort"] == {"level": "high", HOOK_NESTED_KEY: f"{marker}:hooks.line3:effort"}
+    assert stop["background_tasks"] == [
+        {"id": "t1", "type": "shell", HOOK_NESTED_KEY: f"{marker}:hooks.line3:background_tasks.0"},
+        "not a task",
+    ]
+    assert "background_tasks" not in post
+    # error is a code on StopFailure only; reason is free text on PermissionDenied only.
+    assert failure["error"] == "model_not_found"
+    assert post["error"] == f"{marker}:hooks.line0:error"
+    assert denied["reason"] == f"{marker}:hooks.line2:reason"
+    assert "reason" not in post
+    values = {
+        str(value)
+        for payload in (post, failure, denied, stop)
+        for value in walk_strings(payload)
+        if str(value).startswith(marker)
+    }
+    assert values == prepared.canary_values
+    nested_keys = {"tool_response", "effort", "mcp_server", "background_tasks"}
+    assert set(HOOK_NESTED_CANARY_KEYS) == nested_keys
+
+
+def walk_strings(node: JSON) -> Iterator[str]:
+    if isinstance(node, str):
+        yield node
+    elif isinstance(node, list):
+        for value in node:
+            yield from walk_strings(value)
+    elif isinstance(node, dict):
+        for value in node.values():
+            yield from walk_strings(value)
+
+
+def test_hook_canaries_can_share_the_telemetry_marker() -> None:
+    telemetry = prepare(load_scenario("interactive-permission-compact"), now_ns=NOW, canaries=True)
+
+    hooks = prepare_hooks(
+        load_scenario("interactive-permission-compact"),
+        session_id=telemetry.session_id,
+        canaries=True,
+        canary_marker=telemetry.canary_marker,
+    )
+
+    assert hooks.canary_marker == telemetry.canary_marker
+    assert not hooks.canary_values & telemetry.canary_values
+
+
+def test_a_canary_marker_without_canaries_plants_nothing() -> None:
+    hooks = prepare_hooks(load_scenario("headless-api-error"), canary_marker="ccobs-canary-0")
+
+    assert hooks.canary_marker is None
+    assert hooks.canary_values == frozenset()
+    assert "ccobs-canary-0" not in json.dumps([line.payload for line in hooks.lines])
+
+
+@pytest.mark.parametrize("name", HOOK_NAMES)
+def test_hook_canaries_change_no_state_and_reach_no_parsed_event(name: str) -> None:
+    scenario = load_scenario(name)
+    session_id = fresh_session_id()
+    plain = prepare_hooks(scenario, session_id=session_id)
+    poisoned = prepare_hooks(scenario, session_id=session_id, canaries=True)
+    marker = poisoned.canary_marker
+    assert marker is not None
+
+    assert reduce(poisoned.lines) == reduce(plain.lines)
+    assert poisoned.canary_values
+    for line in poisoned.lines:
+        event = parse_hook(line.payload)
+        assert marker not in repr(event)
+        assert marker not in repr(dataclasses.asdict(event))
+
+
+def test_hook_summary_counts_the_lines() -> None:
+    prepared = prepare_hooks(load_scenario("headless-api-error"), canaries=True)
+
+    assert prepared.summary() == {
+        "scenario": "headless-api-error",
+        "session_id": prepared.session_id,
+        "hook_lines": len(load_scenario("headless-api-error").hooks),
+        "canary_marker": prepared.canary_marker,
+        "canary_value_count": len(prepared.canary_values),
+    }
+
+
 # Sending.
 
 
@@ -1340,6 +1636,109 @@ def test_send_stops_at_the_first_refusal() -> None:
     assert len(received) == 1
 
 
+@contextmanager
+def app(status: int = 204, reply: bytes = b"") -> Iterator[tuple[str, list[Received]]]:
+    """A local stand-in for the app's hook route, answering an empty 204 by default."""
+    with collector(status=status, reply=reply) as (endpoint, received):
+        yield endpoint, received
+
+
+def test_post_hook_sends_the_payload_as_json_to_the_hook_route() -> None:
+    payload = hook_line("Stop")["payload"]
+    assert isinstance(payload, dict)
+
+    with app() as (endpoint, received):
+        post_hook(endpoint + "/", payload, timeout=5)
+
+    (got,) = received
+    assert (got.method, got.path, got.content_type) == ("POST", HOOKS_PATH, "application/json")
+    assert json.loads(got.body) == payload
+
+
+@pytest.mark.parametrize(("status", "reply"), [(200, b""), (200, b"{}"), (500, b"boom")])
+def test_post_hook_accepts_only_an_empty_204(status: int, reply: bytes) -> None:
+    with app(status, reply) as (endpoint, _), pytest.raises(ReplayError) as error:
+        post_hook(endpoint, {"hook_event_name": "Stop"}, timeout=5)
+
+    message = str(error.value)
+    assert f"{HOOKS_PATH} answered {status} with a {len(reply)}-byte body" in message
+    assert "not an empty 204" in message
+
+
+def test_post_hook_reports_a_closed_port() -> None:
+    with pytest.raises(ReplayError, match="could not reach"):
+        post_hook(f"http://127.0.0.1:{closed_port()}", {}, timeout=0.5)
+
+
+def test_send_hooks_posts_every_line_in_file_order_back_to_back() -> None:
+    prepared = prepare_hooks(load_scenario("interactive-permission-compact"), canaries=True)
+    sleeps: list[float] = []
+
+    with app() as (endpoint, received):
+        durations = send_hooks(endpoint, prepared.lines, timeout=5, sleep=sleeps.append)
+
+    assert [json.loads(got.body) for got in received] == [line.payload for line in prepared.lines]
+    assert {got.path for got in received} == {HOOKS_PATH}
+    assert len(durations) == len(prepared.lines)
+    assert all(duration >= 0 for duration in durations)
+    assert sleeps == []
+
+
+class FakeClock:
+    """A monotonic clock that only moves when slept on."""
+
+    def __init__(self) -> None:
+        self.now = 100.0
+        self.sleeps: list[float] = []
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
+def test_send_hooks_can_keep_the_spacing_scaled_by_a_speed() -> None:
+    # A part of a scenario: offsets count from the first line sent.
+    scenario = hook_scenario(
+        hook_line("UserPromptSubmit", 5_000),
+        hook_line("PreToolUse", 6_000),
+        hook_line("PostToolUse", 6_000),
+        hook_line("Stop", 9_000),
+    )
+    clock = FakeClock()
+
+    with app() as (endpoint, received):
+        durations = send_hooks(
+            endpoint,
+            prepare_hooks(scenario).lines,
+            speed=2.0,
+            timeout=5,
+            sleep=clock.sleep,
+            monotonic=clock.monotonic,
+        )
+
+    assert clock.sleeps == [0.5, 1.5]
+    assert len(received) == 4
+    assert durations == [0.0] * 4
+
+
+@pytest.mark.parametrize("speed", [0.0, -1.0])
+def test_send_hooks_refuses_a_speed_that_is_not_positive(speed: float) -> None:
+    with pytest.raises(ValueError, match="speed must be positive"):
+        send_hooks("http://127.0.0.1:1", [], speed=speed)
+
+
+def test_send_hooks_stops_at_the_first_refusal() -> None:
+    prepared = prepare_hooks(load_scenario("headless-api-error"))
+
+    with app(status=500) as (endpoint, received), pytest.raises(ReplayError, match="500"):
+        send_hooks(endpoint, prepared.lines, timeout=5)
+
+    assert len(received) == 1
+
+
 # Command line.
 
 
@@ -1445,6 +1844,138 @@ def test_cli_reports_a_send_error_briefly(capsys: pytest.CaptureFixture[str]) ->
     assert err.startswith("replay failed: ")
     assert "Traceback" not in err
     assert len(err.splitlines()) == 1
+
+
+def test_cli_replays_hooks_and_telemetry_with_one_session_id(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    name = "headless-api-error"
+
+    with collector() as (endpoint, otlp), app() as (hooks_endpoint, hooks):
+        code, output, _ = run_cli(
+            capsys,
+            "--endpoint",
+            endpoint,
+            "--hooks-endpoint",
+            hooks_endpoint,
+            "--canaries",
+            "--scenario",
+            name,
+        )
+
+    assert code == 0
+    assert output is not None
+    assert output["hooks_endpoint"] == hooks_endpoint
+    (summary,) = objects(output["scenarios"])
+    session = summary["session_id"]
+    assert isinstance(session, str)
+    assert summary["hook_lines"] == len(load_scenario(name).hooks) == len(hooks)
+    assert summary["hook_canary_value_count"]
+    assert len(otlp) == sum(request_counts(name).values())
+    assert {json.loads(got.body)["session_id"] for got in hooks} == {session}
+    sent_logs = [json.loads(got.body) for got in otlp if got.path == "/v1/logs"]
+    assert session in json.dumps(sent_logs)
+    marker = summary["canary_marker"]
+    assert isinstance(marker, str)
+    assert all(marker in got.body.decode() for got in hooks)
+
+
+def test_cli_can_replay_only_the_hooks(capsys: pytest.CaptureFixture[str]) -> None:
+    with app() as (hooks_endpoint, hooks):
+        code, output, _ = run_cli(capsys, "--hooks-endpoint", hooks_endpoint, "--hooks-only")
+
+    assert code == 0
+    assert output is not None
+    assert output["endpoint"] is None
+    summaries = objects(output["scenarios"])
+    assert [summary["scenario"] for summary in summaries] == HOOK_NAMES
+    for summary in summaries:
+        assert summary["requests"] == dict.fromkeys(SIGNALS, 0)
+        assert summary["canary_marker"] is None
+    assert len(hooks) == sum(len(load_scenario(name).hooks) for name in HOOK_NAMES)
+
+
+def test_cli_with_hooks_defaults_to_every_scenario_with_either(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    code, output, _ = run_cli(capsys, "--dry-run", "--hooks-endpoint", DEFAULT_HOOKS_ENDPOINT)
+
+    assert code == 0
+    assert output is not None
+    summaries = objects(output["scenarios"])
+    assert [summary["scenario"] for summary in summaries] == NAMES
+    lines = {summary["scenario"]: summary["hook_lines"] for summary in summaries}
+    assert lines["hooks-endpoint-down"] == 0
+    assert lines["headless-sessionstart-http-ignored"] == 4
+
+
+def test_cli_paces_the_hooks_with_a_speed(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = FakeClock()
+    fake_time = SimpleNamespace(
+        time_ns=time.time_ns, sleep=clock.sleep, perf_counter=clock.monotonic
+    )
+    monkeypatch.setattr(replay_module, "time", fake_time)
+    name = "headless-api-error"
+    offsets = [int(str(line["offset_ms"])) for line in load_scenario(name).hooks]
+
+    with app() as (hooks_endpoint, _):
+        code, _, _ = run_cli(
+            capsys,
+            "--hooks-endpoint",
+            hooks_endpoint,
+            "--hooks-only",
+            "--speed",
+            "1000",
+            "--scenario",
+            name,
+        )
+
+    assert code == 0
+    assert sum(clock.sleeps) == pytest.approx((offsets[-1] - offsets[0]) / 1000 / 1000)
+
+
+def test_cli_reports_a_hook_refusal(capsys: pytest.CaptureFixture[str]) -> None:
+    with app(status=500) as (hooks_endpoint, _):
+        code, output, err = run_cli(
+            capsys,
+            "--hooks-endpoint",
+            hooks_endpoint,
+            "--hooks-only",
+            "--scenario",
+            "headless-api-error",
+        )
+
+    assert code == 1
+    assert output is not None
+    failed = output["failed"]
+    assert isinstance(failed, dict)
+    assert failed["scenario"] == "headless-api-error"
+    assert "not an empty 204" in str(failed["error"])
+    assert err.startswith("replay failed: headless-api-error: ")
+
+
+@pytest.mark.parametrize(
+    ("args", "message"),
+    [
+        (["--hooks-only"], "--hooks-only needs --hooks-endpoint"),
+        (["--speed", "1"], "--speed needs --hooks-endpoint"),
+        (["--hooks-endpoint", DEFAULT_HOOKS_ENDPOINT, "--speed", "0"], "--speed must be positive"),
+        (
+            ["--hooks-endpoint", DEFAULT_HOOKS_ENDPOINT, "--hooks-only", "--endpoint", "http://x"],
+            "--endpoint does not go with --hooks-only",
+        ),
+    ],
+)
+def test_cli_rejects_inconsistent_hook_options(
+    capsys: pytest.CaptureFixture[str], args: list[str], message: str
+) -> None:
+    with pytest.raises(SystemExit) as exit_info:
+        main(["--dry-run", *args])
+
+    assert exit_info.value.code == 2
+    assert message in capsys.readouterr().err
 
 
 def test_cli_rejects_an_unknown_scenario(capsys: pytest.CaptureFixture[str]) -> None:

@@ -25,7 +25,8 @@
 #   - secure.gravatar.com: avatars, fetched by Grafana when a page shows one;
 #   - snapshots.raintank.io: snapshots published outside;
 #   - secret-scanning.grafana.net: secret scanning (off by default).
-# Prometheus and the OpenTelemetry Collector have no usage reporting or update check.
+# Prometheus, the OpenTelemetry Collector and the app have no usage reporting or update
+# check; the app calls only Loki, on the backend network.
 # What the browser loads (feedback links, the news feed, the Geomap panel's tiles) never
 # passes through a container, so the sink cannot see it.
 #
@@ -43,6 +44,7 @@
 #
 #   egress() {
 #     CCOBS_OTLP_GRPC_PORT=44317 CCOBS_OTLP_HTTP_PORT=44318 CCOBS_GRAFANA_PORT=44330 \
+#     CCOBS_APP_PORT=44300 \
 #       docker compose -p ccobs-egress --env-file .env.example -f compose.yaml \
 #       -f tools/stack/compose.egress-sink.yaml --profile traces "$@"
 #   }
@@ -159,6 +161,10 @@ services:
       sink:
         condition: service_healthy
   grafana:
+    depends_on:
+      sink:
+        condition: service_healthy
+  app:
     depends_on:
       sink:
         condition: service_healthy

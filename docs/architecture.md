@@ -6,8 +6,11 @@ repository holds:
 - the observability stack of milestone 1: `compose.yaml` runs the OpenTelemetry
   Collector, Prometheus, Loki, Grafana and, in an optional profile, Tempo, with their
   configs in `stack/`; [stack.md](stack.md) is the reference for running it;
-- the Python package: a CLI that prints its version, and `ccobs.domain.telemetry`, the
-  stored telemetry names ([ADR 0014](adr/0014-stored-telemetry-names.md));
+- the Python package: a CLI that prints its version, `ccobs.domain` (the stored
+  telemetry names of [ADR 0014](adr/0014-stored-telemetry-names.md), the hook parser,
+  the session state machine and the hook settings, all free of I/O), and
+  `ccobs.server`, the app of milestone 2 (from v0.3.0), which the stack builds and runs
+  as its `app` service; [app.md](app.md) is the reference for operating it;
 - the tooling around them, unit tests, and integration tests that run the stack in an
   isolated compose project;
 - development-only tools, not packaged: fixture capture (`tools/capture/`) and the
@@ -15,9 +18,9 @@ repository holds:
   service, an egress check);
 - sanitized fixtures recorded from real Claude Code sessions (`tests/fixtures/`).
 
-The app, the hooks and the `ccobs` commands on this page are the planned design, and
-each part names the milestone that brings it (milestones and releases are listed in the
-roadmap in the [README](../README.md)).
+The app's web UI and alerts and the `ccobs` commands on this page are the planned
+design, and each part names the milestone that brings it (milestones and releases are
+listed in the roadmap in the [README](../README.md)).
 
 Decisions and their reasons are recorded as architecture decision records (ADRs, MADR
 format) in [`docs/adr/`](adr/README.md). When this page and an ADR disagree, the ADR
@@ -38,34 +41,37 @@ Grafana ◄── Prometheus, Loki, Tempo (provisioned datasources and dashboard
 Everything runs on one machine. The stack runs in Docker Compose and every published
 port binds to `127.0.0.1` ([ADR 0018](adr/0018-ports-networks-and-exposure.md)):
 
-- Only the collector's OTLP receivers (4317 gRPC, 4318 HTTP) and Grafana (4330) are
-  published; the app's port (4300) joins them in milestone 2. Every port can be moved
-  with a variable.
+- Only the collector's OTLP receivers (4317 gRPC, 4318 HTTP), Grafana (4330) and the
+  app (4300, from v0.3.0) are published. Every port can be moved with a variable.
 - Prometheus, Loki and Tempo, which have no authentication, publish no port and join
-  only `backend`, an internal network with no route out. The collector and Grafana join
-  `backend` and `edge`, a normal bridge network. `compose.debug.yaml` publishes the
-  three stores on loopback, for debugging and the integration tests.
+  only `backend`, an internal network with no route out. The collector, Grafana and the
+  app join `backend` and `edge`, a normal bridge network. `compose.debug.yaml` publishes
+  the three stores and the app's metrics listener on loopback, for debugging and the
+  integration tests.
 - Tempo runs only in the `traces` profile (`docker compose --profile traces up -d`).
 - Every service restarts unless stopped
   ([ADR 0019](adr/0019-restart-unless-stopped.md)) and has a memory limit; the limits
-  add up to 2 GiB, 2.5 GiB with Tempo.
+  add up to 2304 MiB, 2816 MiB with Tempo.
 - Retention is 90 days of metrics, 30 of events and 7 of traces by default, each set by
-  a variable ([ADR 0016](adr/0016-cardinality-and-retention.md)).
+  a variable ([ADR 0016](adr/0016-cardinality-and-retention.md)), and 90 days after a
+  session's last event in the app's database
+  ([ADR 0026](adr/0026-app-database-schema-migrations-and-retention.md)).
 
-[stack.md](stack.md) has the services, settings, measured memory and troubleshooting.
+[stack.md](stack.md) has the services, settings, measured memory and troubleshooting,
+and [app.md](app.md) the app's.
 
 ## Components
 
-| Component               | Responsibility                                                                                                                                                                                      | Milestone                                                |
-| ----------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------- |
-| Claude Code             | The program being observed. It exports telemetry over OTLP and calls the app's hook endpoint, both configured in the user settings: by hand until `ccobs setup` writes them (milestone 4).          | (external)                                               |
-| OpenTelemetry Collector | Receives OTLP on 4317 (gRPC) and 4318 (HTTP), deletes personal attributes and, by default, content, sets the `host` label and routes each signal to its backend.                                    | 1                                                        |
-| Prometheus              | Stores the metrics that the collector pushes to its OTLP receiver. Scrapes its own and the collector's metrics, and the app's `/metrics` from milestone 2.                                          | 1                                                        |
-| Loki                    | Stores Claude Code's events (OpenTelemetry log records).                                                                                                                                            | 1                                                        |
-| Tempo                   | Stores traces. Runs only in the optional `traces` compose profile, because tracing is a beta feature in Claude Code and is off by default.                                                          | 1                                                        |
-| Grafana                 | Deep analysis, with provisioned datasources (Prometheus, Loki, Tempo) and dashboards. No login: whoever opens it is an Editor.                                                                      | 1 (datasources, overview dashboard), 6 (more dashboards) |
-| App (FastAPI, SQLite)   | Receives hooks, runs the session state machine, stores sessions, agents, blocks and alerts, exposes `/metrics`, queries Prometheus and Loki over HTTP, serves the web UI and sends the alerts.      | 2 (ingestion, `/metrics`), 3 (UI), 5 (alerts)            |
-| `ccobs` CLI             | `setup`, `uninstall`, `doctor` and `status`: edits `~/.claude/settings.json` and checks the stack. Published on PyPI as `cc-observatory`; it never imports server-only dependencies at import time. | 4                                                        |
+| Component               | Responsibility                                                                                                                                                                                                                                                                                           | Milestone                                                |
+| ----------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------- |
+| Claude Code             | The program being observed. It exports telemetry over OTLP and calls the app's hook endpoint, both configured in the user settings: by hand until `ccobs setup` writes them (milestone 4).                                                                                                               | (external)                                               |
+| OpenTelemetry Collector | Receives OTLP on 4317 (gRPC) and 4318 (HTTP), deletes personal attributes and, by default, content, sets the `host` label and routes each signal to its backend.                                                                                                                                         | 1                                                        |
+| Prometheus              | Stores the metrics that the collector pushes to its OTLP receiver. Scrapes its own and the collector's metrics, and the app's metrics listener (from v0.3.0).                                                                                                                                            | 1                                                        |
+| Loki                    | Stores Claude Code's events (OpenTelemetry log records). The app reads its `tool_decision` rejects back (from v0.3.0).                                                                                                                                                                                   | 1                                                        |
+| Tempo                   | Stores traces. Runs only in the optional `traces` compose profile, because tracing is a beta feature in Claude Code and is off by default.                                                                                                                                                               | 1                                                        |
+| Grafana                 | Deep analysis, with provisioned datasources (Prometheus, Loki, Tempo) and dashboards. No login: whoever opens it is an Editor.                                                                                                                                                                           | 1 (datasources, overview dashboard), 6 (more dashboards) |
+| App (FastAPI, SQLite)   | From v0.3.0: receives hooks, runs the session state machine, stores sessions, agents and blocks, serves a read-only JSON API and its live state as metrics, and reads Claude Code's rejects from Loki. Later: serves the web UI, queries Prometheus and Loki for its views, stores and sends the alerts. | 2 (ingestion, API, metrics), 3 (UI), 5 (alerts)          |
+| `ccobs` CLI             | `setup`, `uninstall`, `doctor` and `status`: edits `~/.claude/settings.json` and checks the stack. Published on PyPI as `cc-observatory`; it never imports server-only dependencies at import time.                                                                                                      | 4                                                        |
 
 ## Two data paths
 
@@ -109,7 +115,13 @@ The names that reach Prometheus and Loki are recorded in
 
 ### Hooks: HTTP to the app
 
-Claude Code calls the app's hook endpoint on lifecycle events (milestone 2).
+Claude Code calls the app's hook endpoint, `POST /hooks` on port 4300, on lifecycle
+events (from v0.3.0). The endpoint only checks and enqueues each hook, then answers an
+empty 204; a background writer parses it into metadata, applies the state machine and
+stores the result in SQLite
+([ADRs 0023](adr/0023-per-event-allowlist-of-hook-metadata.md),
+[0026](adr/0026-app-database-schema-migrations-and-retention.md) and
+[0027](adr/0027-the-app-http-surface-and-hook-queue.md)).
 
 Good for: real-time session state (prompt submitted, tool use, turn finished),
 permission requests, notifications (permission prompts, idle prompts, MCP
@@ -123,42 +135,77 @@ stays with the telemetry backends.
 How hooks reach the app is decided in
 [ADR 0011](adr/0011-hook-delivery-http-plus-async-sessionstart.md): `http` hooks with a
 1-second timeout, plus an async command hook that posts `SessionStart` with `curl`,
-because `SessionStart` does not accept `http` hooks. The exact list of hook events that
-`ccobs setup` registers is decided with the session state machine in milestone 2, from
-the payloads that [ADR 0012](adr/0012-observed-telemetry-and-hook-contract.md) records.
+because `SessionStart` does not accept `http` hooks. The 15 `http` events and the
+async `SessionStart` that cc-observatory registers, the ones the state machine needs,
+are decided in [ADR 0025](adr/0025-registered-hook-events.md), from the payloads that
+[ADR 0012](adr/0012-observed-telemetry-and-hook-contract.md) records. Until
+`ccobs setup` writes them (milestone 4), [app.md](app.md#point-claude-code-at-the-app)
+shows how to pass them to Claude Code with `--settings`.
 
 ### Live state in `/metrics`
 
-The app exposes the live state it derives from hooks (for example, sessions by state and
-open blocks) on `/metrics` in the Prometheus format, and Prometheus scrapes it
-(milestone 2). That puts live state next to the telemetry in Grafana. Its series will
-carry the same `host` label as the telemetry, which the collector already sets on every
-metric, event and trace from `CCOBS_HOST_LABEL`, `local` by default
+The app exposes the live state it derives from hooks (sessions by state, open blocks,
+running agents, block durations, and what happened to each hook) on `/metrics` in the
+Prometheus format, from v0.3.0. It serves them on a listener of its own, port 9464
+inside the stack, which compose never publishes, so the app's port keeps its `Host`
+allowlist; Prometheus scrapes it over the compose network as the job `ccobs-app`
+([ADR 0028](adr/0028-app-metrics-and-their-listener.md)). That puts live state next to
+the telemetry in Grafana. Every label takes values from a closed list, so the number of
+series is fixed. The series carry the same `host` label as the telemetry, which the
+collector sets on every metric, event and trace from `CCOBS_HOST_LABEL`, `local` by
+default, and the app puts it on its database rows too
 ([ADR 0022](adr/0022-the-host-label.md)), so that a future central mode, in which
 several machines report to one stack, could tell machines apart. Central mode is not
 implemented and is not on the current roadmap.
 
-## Sessions and blocks (planned, milestone 2)
+### Esc denials read back from Loki
 
-Each session is in one of these states:
+One signal reaches only the telemetry: a permission dialog denied with Esc fires no
+hook, but Claude Code exports a `tool_decision` event with `decision=reject`. While a
+permission block is open, the app queries Loki every 2 seconds for the machine's
+rejects, with no session ID in the query, and closes the matching block at the
+reject's time (from v0.3.0,
+[ADR 0029](adr/0029-closing-esc-denials-from-loki.md)). With telemetry off or Loki
+down, blocks close on the next hook as before.
 
-| State          | Meaning                                                                                             |
-| -------------- | --------------------------------------------------------------------------------------------------- |
-| `working`      | Claude is handling a prompt: calling the API or running tools.                                      |
-| `waiting_user` | The session cannot continue until a person acts, for example on a permission prompt.                |
-| `idle`         | The turn finished and the session is waiting for the next prompt.                                   |
-| `ended`        | Claude Code reported that the session ended.                                                        |
-| `stale`        | No signal arrived for too long and no end was reported, for example because the process was killed. |
+## Sessions, agents and blocks (from v0.3.0)
 
-A **block** is a period in which a session waits on a person. It opens when the session
-starts waiting (candidate signals: a permission request, a permission or idle prompt
-notification, an MCP elicitation, an API failure that ends the turn) and closes on the
-next signal that the session is making progress again. Its duration is how long the
-session waited. Open blocks drive the alerts (milestone 5).
+A pure reducer in `ccobs.domain.sessions` derives every state from the hooks, in the
+order the app receives them and by the app's clock, since hook payloads carry no
+timestamp. [ADR 0024](adr/0024-session-agent-and-block-state-machine.md) holds the full
+rules and what confirms each one; when this summary and the ADR disagree, the ADR wins.
 
-The exact signals that open and close a block, the transitions between states and the
-timeout that marks a session as `stale` are defined in milestone 2 from real fixtures,
-not from the documentation alone.
+| State          | When                                                                                                                                            |
+| -------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| `waiting_user` | At least one block is open.                                                                                                                     |
+| `working`      | Otherwise, the main thread has a turn open, a compaction is running, or a subagent (not one of Claude Code's internal agents) runs.             |
+| `idle`         | Otherwise: the turn ended and no subagent runs.                                                                                                 |
+| `ended`        | After `SessionEnd`. Not final: any later event other than `SessionStart` reopens the session.                                                   |
+| `stale`        | Silent for `CCOBS_SESSION_STALE_AFTER`, 12 hours by default, without an end. Any later event other than `SessionStart` derives the state again. |
+
+- **Turns** open on `UserPromptSubmit` and close on `Stop` or `StopFailure`. A
+  `StopFailure` records its error code on the session; it is not a block. Background
+  subagents keep the session `working` after the main turn's `Stop`.
+- A **block** is a period in which a session waits on a person: a permission prompt
+  (`PermissionRequest`, or a `permission_prompt` notification when the request hook was
+  missed) or an MCP elicitation (`Elicitation`, or an `elicitation_dialog` notification
+  when the `Elicitation` hook was missed). The `idle_prompt` notification is not a
+  block: it only marks the session as notified.
+- A block **closes** as `tool_completed` or `tool_failed` when its tool call finishes;
+  as `superseded` on progress in its scope (another tool call, a new prompt, `Stop`,
+  `StopFailure`, `PreCompact`); with the action of its `ElicitationResult`; as
+  `agent_stopped` or `session_ended`; as `denied`, from Loki's reject (above), or from
+  a `PermissionDenied` hook, which the shipped settings do not register; or as `stale`.
+  Each closed block records whether a hook, the telemetry or the sweep closed it. Its
+  duration is how long the session waited.
+- The **stale sweep** runs every minute: a silent session becomes `stale`, its open
+  blocks close and its running agents stop, so the live metrics never count them; a
+  running agent silent that long stops too, in a session that is still active.
+- Known gaps: an Esc that interrupts a response fires no `Stop`, so the session shows
+  `working` until the next prompt or event that ends the turn; and a dialog denied with
+  Esc stays open until Loki's reject or the next progress event.
+
+Open blocks drive the alerts (milestone 5).
 
 ## Key constraints
 

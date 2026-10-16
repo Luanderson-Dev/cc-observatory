@@ -53,19 +53,20 @@ to each part from the release that ships it.
 - **Local-only ports.** Every port that the compose stack publishes binds to
   `127.0.0.1`, so nothing is published on your network interfaces
   ([ADR 0018](docs/adr/0018-ports-networks-and-exposure.md)). Only the collector's OTLP
-  receivers (4317 and 4318) and Grafana (4330) are published. Prometheus, Loki and
-  Tempo, which have no authentication of their own, publish no port and sit on an
-  internal Docker network; the debug override `compose.debug.yaml` publishes them on
-  `127.0.0.1` and gives them outbound access while you use it. On Linux, Docker Engine
-  releases older than 28.0 let hosts on the same local network segment (for example,
-  behind the same switch) reach ports published to `127.0.0.1`
+  receivers (4317 and 4318), Grafana (4330) and, from v0.3.0, the app (4300) are
+  published. Prometheus, Loki and Tempo, which have no authentication of their own,
+  publish no port and sit on an internal Docker network; the debug override
+  `compose.debug.yaml` publishes them on `127.0.0.1` and gives them outbound access
+  while you use it. It also publishes the app's metrics listener on `127.0.0.1:4301`.
+  On Linux, Docker Engine releases older than 28.0 let hosts on the same local network
+  segment (for example, behind the same switch) reach ports published to `127.0.0.1`
   ([Docker's port publishing docs](https://docs.docker.com/engine/network/port-publishing/)),
   so use Docker Engine 28.0 or later there.
 - **No authentication.** Anyone with access to your user account, and any process that
   can reach localhost on your machine (including other users of a shared machine), can
-  read the collected data and post events to the hook endpoint. Any local process can
-  inject fake hook events or telemetry, so what the app and Grafana show is only as
-  trustworthy as the software running on your machine.
+  read the collected data, including the app's JSON API, and post events to the hook
+  endpoint. Any local process can inject fake hook events or telemetry, so what the app
+  and Grafana show is only as trustworthy as the software running on your machine.
 - **Grafana has no login** (from v0.2.0,
   [ADR 0017](docs/adr/0017-grafana-access-and-dns-rebinding.md)). Whoever opens it is an
   Editor of its only organization: they can read all the data, run queries and save
@@ -102,17 +103,37 @@ to each part from the release that ships it.
       header, so a DNS rebinding page could post fake telemetry to it; it cannot read
       anything back through it, and a plain cross-site POST of JSON fails the CORS
       preflight.
-    - Planned defences in the app, from v0.3.0: a `Host` header allowlist (`localhost`,
-      `127.0.0.1`, `[::1]`); a hook endpoint that ignores any request whose
-      `Content-Type` is not `application/json` (still answering with an empty 2xx); and
-      no permissive CORS.
+    - The app (from v0.3.0,
+      [ADR 0027](docs/adr/0027-the-app-http-surface-and-hook-queue.md)) answers only a
+      `Host` header of `localhost`, `127.0.0.1` or `[::1]`, so a DNS rebinding page,
+      which sends its own host name, gets a 400 from the API and reads nothing. Its hook
+      endpoint ignores any request whose `Content-Type` is not `application/json`, and
+      a cross-site page can send that type only after a CORS preflight, which fails:
+      the app sends no CORS headers at all. The hook endpoint answers every request,
+      ignored ones included, with the same empty 204, so a page learns nothing from it.
+      The read-only JSON API serves the working directory (`cwd`), which contains your
+      OS username, and it reaches only clients on localhost that send an allowed
+      `Host`. The app serves no OpenAPI schema or interactive docs.
+    - The app's `/metrics` is on a separate listener that compose never publishes, so
+      a browser on your machine cannot reach it
+      ([ADR 0028](docs/adr/0028-app-metrics-and-their-listener.md)). Two exceptions,
+      accepted because the series hold only counts and labels from fixed lists, never
+      content, paths or IDs: the debug override publishes it on `127.0.0.1:4301` with
+      no `Host` check, so while you use the override a DNS rebinding page could read
+      the counts; and on Linux the host can reach a container's address on the Docker
+      bridge network, so a page that guessed that address could read them too.
 - **Do not expose it.** Do not publish the ports on other interfaces, and do not put the
   stack behind a reverse proxy, tunnel or port forward without adding authentication in
   front of it.
 - **What is stored, and where.** All data stays in the compose stack's Docker volumes on
   your machine:
-    - the app's SQLite database: sessions, agents and subagents, blocks and alerts,
-      built from hook payloads;
+    - the app's SQLite database (from v0.3.0): sessions, agents and subagents, blocks
+      and hook events, as metadata only: IDs, event, tool and MCP server names, agent
+      types (your own agents by name), enumerated values, durations, sizes, the model
+      and the working directory; never prompts, tool inputs or outputs, messages, error
+      text or other paths
+      ([ADR 0023](docs/adr/0023-per-event-allowlist-of-hook-metadata.md)). Alerts join
+      it in v0.6.0. [docs/app.md](docs/app.md#privacy) has the details;
     - Prometheus: metrics from Claude Code's telemetry (tokens, cost, counters) and the
       app's live state;
     - Loki: events from Claude Code's telemetry (API requests and errors, tool results
@@ -120,8 +141,11 @@ to each part from the release that ships it.
     - Tempo, only when the optional `traces` profile is enabled: traces;
     - Grafana: its own database of settings and dashboards.
 - **Local paths.** Hook payloads include local paths, such as the working directory and
-  the transcript path, that contain your OS username. They are stored as metadata, so
-  keep them in mind when you share screenshots, exports or bug reports.
+  the transcript path, that contain your OS username. The app stores only the working
+  directory (`cwd`) and drops the others; on Amazon Bedrock the stored model name can be
+  an ARN that contains your AWS account ID. Keep them in mind when you share
+  screenshots, API output, backups of the volumes or bug reports. The app's logs never
+  contain them.
 - **Content capture is opt-in.** By default, prompt text, tool inputs and outputs,
   assistant messages and error text are dropped before anything is stored.
   `ccobs setup --capture-content` (from v0.5.0) turns content capture on in Claude Code,

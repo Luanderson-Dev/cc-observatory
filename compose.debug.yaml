@@ -1,4 +1,5 @@
-# Debug override: publishes the storage services on 127.0.0.1, for debugging only.
+# Debug override: publishes the storage services and the app's metrics on 127.0.0.1,
+# for debugging only.
 #
 #   docker compose -f compose.yaml -f compose.debug.yaml up -d
 #
@@ -6,8 +7,9 @@
 # with no published port. This override publishes each one on loopback (ports set by
 # CCOBS_PROMETHEUS_PORT, CCOBS_LOKI_PORT and CCOBS_TEMPO_PORT) and attaches it to the
 # `edge` network, because a service only on an internal network cannot publish ports
-# (ADR 0018). While the override is in use, those services have egress. Tempo runs only
-# with the traces profile:
+# (ADR 0018). While the override is in use, those services have egress. It also
+# publishes the app's metrics listener (CCOBS_APP_METRICS_PORT). Tempo runs only with
+# the traces profile:
 #
 #   docker compose -f compose.yaml -f compose.debug.yaml --profile traces up -d
 
@@ -27,6 +29,14 @@ services:
     networks:
       - backend
       - edge
+
+  # The app's metrics listener (/metrics, ADR 0028), which compose.yaml never publishes.
+  # The app is already on edge, for its own port. While the override is in use, a web
+  # page that uses DNS rebinding could read these counts (no Host check on this
+  # listener); they hold no content, paths or IDs.
+  app:
+    ports:
+      - "127.0.0.1:${CCOBS_APP_METRICS_PORT:-4301}:9464"
 
   # Tempo's HTTP API: traces by ID, TraceQL search, /status/config and /ready. Only with
   # the traces profile, like Tempo itself; its OTLP receiver is not published.

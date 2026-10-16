@@ -23,6 +23,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Final
 
+from ccobs.domain.durations import parse_duration
+
 # Claude Code's service.name: the value of Prometheus's job label and of Loki's
 # service_name index label.
 SERVICE_NAME: Final = "claude-code"
@@ -33,6 +35,11 @@ SERVICE_NAME: Final = "claude-code"
 # 0021). Prometheus promotes it to a label and Loki indexes it.
 HOST_LABEL: Final = "host"
 DEFAULT_HOST: Final = "local"
+# The values the label supports (ADR 0022), matched in full: letters, digits, ".", "_"
+# and "-". The value goes into an OTTL string literal in the collector's config, where
+# a double quote or a backslash would break or change it. The app refuses anything else
+# at start-up; the collector does not validate it.
+HOST_VALUE_PATTERN: Final = re.compile(r"[A-Za-z0-9._-]+")
 
 # Prometheus (ADR 0013).
 
@@ -223,11 +230,6 @@ def is_identity_key(key: str) -> bool:
 # A classic label name, which PromQL takes unquoted; names starting with __ are
 # Prometheus's own.
 _LABEL_NAME: Final = re.compile(r"[a-zA-Z_][a-zA-Z0-9_]*")
-# A Prometheus duration, units from the largest down, such as 1h30m or 90d.
-_DURATION: Final = re.compile(
-    r"(?:([0-9]+)y)?(?:([0-9]+)w)?(?:([0-9]+)d)?(?:([0-9]+)h)?"
-    r"(?:([0-9]+)m)?(?:([0-9]+)s)?(?:([0-9]+)ms)?"
-)
 # Escapes inside a double-quoted PromQL string: the backslash and the quote; the newline
 # and U+FFFD, which Prometheus's lexer refuses raw ("unterminated quoted string",
 # "invalid UTF-8 rune"); and every other control character, for readability.
@@ -246,7 +248,11 @@ def _label(metric: Metric, label: str) -> str:
     return label
 
 
-def _quote(value: str) -> str:
+def quote(value: str) -> str:
+    """``value`` as a double-quoted PromQL or LogQL string literal (both use Go's
+    quoting): the characters ``_ESCAPES`` lists escaped, so any value that is valid UTF-8
+    reads back as itself and cannot change the query. Raises ``ValueError`` for a value
+    that is not valid UTF-8 (a lone surrogate)."""
     try:
         value.encode("utf-8")
     except UnicodeEncodeError:
@@ -255,11 +261,13 @@ def _quote(value: str) -> str:
 
 
 def _window(window: str) -> str:
-    match = _DURATION.fullmatch(window)
-    if match is None or not any(int(amount) for amount in match.groups() if amount):
+    # A Prometheus duration, units from the largest down, such as 1h30m or 90d.
+    try:
+        parse_duration(window)
+    except ValueError:
         raise ValueError(
             f"window {window!r} is not a Prometheus duration above zero, such as 1h or 90d"
-        )
+        ) from None
     return window
 
 
@@ -275,7 +283,7 @@ def selector(metric: Metric, matchers: Mapping[str, str] | None = None) -> str:
     valid UTF-8."""
     if not matchers:
         return metric.name
-    parts = ",".join(f"{_label(metric, key)}={_quote(value)}" for key, value in matchers.items())
+    parts = ",".join(f"{_label(metric, key)}={quote(value)}" for key, value in matchers.items())
     return f"{metric.name}{{{parts}}}"
 
 

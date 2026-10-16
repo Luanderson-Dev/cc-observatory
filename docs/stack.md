@@ -4,7 +4,8 @@ A reference for running the observability stack: what runs, how to start, stop a
 update it, its settings, where its data lives and for how long, how much memory and disk
 it uses, and what to check when something goes wrong. The decisions behind it are
 recorded as ADRs in [`adr/`](adr/README.md); this page links to them instead of
-repeating their reasons.
+repeating their reasons. [app.md](app.md) is the reference for the app itself: pointing
+Claude Code at it, its API, metrics, data and troubleshooting.
 
 Commands run from the repository root, where `compose.yaml` is, in bash (Git Bash on
 Windows).
@@ -18,6 +19,7 @@ Windows).
 | `loki`           | `grafana/loki:3.7.8`                                               | Events (OpenTelemetry log records)               | `backend`         | none (4310 with the debug override) |
 | `tempo`          | `grafana/tempo:3.1.0`, only with `--profile traces`                | Traces                                           | `backend`         | none (4320 with the debug override) |
 | `grafana`        | `grafana/grafana:13.2.4`                                           | Its own database                                 | `backend`, `edge` | 4330                                |
+| `app`            | `cc-observatory-app:local`, built locally (see below)              | Sessions, agents, blocks and hook events         | `backend`, `edge` | 4300 (4301 with the debug override) |
 
 - **Images.** Every upstream image is pinned to an exact tag and its multi-arch index
   digest (`name:tag@sha256:...`), in `compose.yaml` and in the collector's Dockerfile
@@ -27,6 +29,13 @@ Windows).
   ([`stack/otel-collector/Dockerfile`](../stack/otel-collector/Dockerfile)). Compose
   builds it on your machine (`pull_policy: build`, from the build cache after the first
   time) under a local tag with no digest, and never pushes it.
+- **The app's image** is built the same way from the clone, with the repository root as
+  context ([`stack/app/Dockerfile`](../stack/app/Dockerfile),
+  [ADR 0030](adr/0030-the-app-container.md)): `python:3.12.15-slim-trixie` with the
+  locked dependencies in a virtual environment, about 250 MB. Its name has no version,
+  because it is the code of your clone, whatever its branch; no registry has it, so
+  `docker compose pull` never updates it, and `docker compose up -d` rebuilds it when
+  the source changes (`docker compose build app` rebuilds it alone).
 - **Path of the data.** Claude Code sends OTLP to the collector, which deletes identity
   attributes and content ([ADR 0021](adr/0021-collector-privacy-filters.md); an opt-in
   to keep content comes with `ccobs setup` in v0.5.0,
@@ -36,16 +45,22 @@ Windows).
   events to Loki's OTLP endpoint ([ADR 0015](adr/0015-loki-through-its-otlp-endpoint.md))
   and traces to Tempo ([ADR 0003](adr/0003-observability-backends.md)). Prometheus also
   scrapes its own metrics and the collector's (`otelcol_*`, on port 8888 inside the
-  stack's networks). Grafana queries the three stores.
+  stack's networks). Grafana queries the three stores. Claude Code's hooks go to the
+  app, which keeps sessions, agents and blocks in SQLite, reads Claude Code's
+  `tool_decision` events back from Loki, and serves its live state on a metrics listener
+  (port 9464 inside the stack, never published) that Prometheus scrapes as the job
+  `ccobs-app` ([app.md](app.md)).
 - **Networks** ([ADR 0018](adr/0018-ports-networks-and-exposure.md)). `backend` is an
   internal network with no route out, so Prometheus, Loki and Tempo, which join only
-  `backend`, cannot reach the internet. `edge` is a normal bridge network for the two
-  services that publish ports. Every published port binds to `127.0.0.1` only.
+  `backend`, cannot reach the internet. `edge` is a normal bridge network for the
+  three services that publish ports: the collector, Grafana and the app. Every published
+  port binds to `127.0.0.1` only.
 - **Debug override.** `compose.debug.yaml` publishes Prometheus, Loki and Tempo on
-  loopback, for debugging. It also attaches them to `edge`, which gives them egress
-  while it is in use. To unpublish them, run `docker compose up -d` again without it
-  (`docker compose --profile traces up -d` if Tempo runs): without the profile, a
-  running Tempo keeps its published port and stays on `edge`.
+  loopback, for debugging, and the app's metrics listener on `127.0.0.1:4301`
+  (`CCOBS_APP_METRICS_PORT`). It also attaches the three stores to `edge`, which gives
+  them egress while it is in use. To unpublish them, run `docker compose up -d` again
+  without it (`docker compose --profile traces up -d` if Tempo runs): without the
+  profile, a running Tempo keeps its published port and stays on `edge`.
 
   ~~~bash
   docker compose -f compose.yaml -f compose.debug.yaml up -d
@@ -59,6 +74,12 @@ Windows).
   `no-new-privileges`, no Linux capabilities (`cap_drop: [ALL]`), container logs capped
   at three files of 10 MB, and 30 seconds to stop cleanly after SIGTERM (15 for Tempo).
   Every container runs as a non-root user.
+- **The app stops well inside its 30 seconds.** After SIGTERM, uvicorn waits at most 5
+  seconds for open requests; then the app stops its metrics listener, then its Loki
+  reconciler and its sweeper (up to 5 seconds each), and gives its writer up to 5
+  seconds to store the hooks still queued, counting any left as dropped. The worst case
+  is about 20 seconds; measured, `docker compose stop app` took 1.2 seconds and the
+  container exited with code 0 ([ADR 0030](adr/0030-the-app-container.md)).
 
 ## Start, stop and update
 
@@ -77,11 +98,16 @@ changes, API errors and recent events, for the last 24 hours by default, refresh
 minute, with Host and Model filters. Traces are in Explore, with the Tempo datasource;
 without Tempo, that datasource shows an error and nothing else is affected.
 
+The app answers at <http://127.0.0.1:4300> (the port is `CCOBS_APP_PORT`): its hook
+endpoint, `/healthz` and its JSON API, such as `/api/v1/sessions`; its web UI comes in
+v0.4.0. Claude Code sends it hooks only once you point Claude Code at it
+([app.md](app.md#point-claude-code-at-the-app)).
+
 | Command                            | Effect                                                                                                                                |
 | ---------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
 | `docker compose stop`              | Stops the containers and keeps them. They stay stopped across Docker restarts and reboots; `docker compose start` or `up -d` resumes. |
 | `docker compose down`              | Removes the containers and networks. The volumes, and so all stored data, stay.                                                       |
-| `docker compose down -v`           | Also deletes the volumes: every stored metric, event and trace, and Grafana's database. It cannot be undone.                          |
+| `docker compose down -v`           | Also deletes the volumes: every stored metric, event and trace, Grafana's database and the app's. It cannot be undone.                |
 | `docker compose restart <service>` | Restarts one service, for example after editing its files under `stack/`.                                                             |
 | `docker compose logs <service>`    | Shows a service's logs.                                                                                                               |
 
@@ -105,9 +131,10 @@ without Tempo, that datasource shows an error and nothing else is affected.
   docker compose up -d --force-recreate    # add --profile traces if you run Tempo
   ~~~
 
-  Compose pulls any newly pinned image and rebuilds the collector image. It recreates a
-  container only when its definition in the compose files changes, not when a mounted
-  file under `stack/` changes, hence `--force-recreate`; the data stays in the volumes.
+  Compose pulls any newly pinned image and rebuilds the collector's and the app's images
+  when their sources change. It recreates a container only when its definition in the
+  compose files or its image changes, not when a mounted file under `stack/` changes,
+  hence `--force-recreate`; the data stays in the volumes.
   The images of earlier versions stay on disk: `docker image ls` lists them and
   `docker image rm <image>` removes one.
 
@@ -118,19 +145,41 @@ is optional. To change one, copy [`.env.example`](../.env.example) to `.env`, ed
 value and run `docker compose up -d` (with `--profile traces` if you run Tempo): Compose
 recreates the services whose settings changed. Git ignores `.env`.
 
-| Variable                     | Default | Effect                                                                                                                |
-| ---------------------------- | ------- | --------------------------------------------------------------------------------------------------------------------- |
-| `CCOBS_OTLP_GRPC_PORT`       | `4317`  | Host port of the collector's OTLP/gRPC receiver, for Claude Code's `grpc` protocol.                                   |
-| `CCOBS_OTLP_HTTP_PORT`       | `4318`  | Host port of the collector's OTLP/HTTP receiver, for Claude Code's `http/protobuf` and `http/json` protocols.         |
-| `CCOBS_GRAFANA_PORT`         | `4330`  | Host port of Grafana, and the port of its root URL, which Grafana redirects to.                                       |
-| `CCOBS_HOST_LABEL`           | `local` | The `host` label on every metric, event and trace ([ADR 0022](adr/0022-the-host-label.md)); see below.                |
-| `CCOBS_PROMETHEUS_RETENTION` | `90d`   | How long Prometheus keeps metrics, in Prometheus's units: `y`, `w`, `d`, `h`, `m`, `s` or `ms`.                       |
-| `CCOBS_LOKI_RETENTION`       | `720h`  | How long Loki keeps events, as a multiple of `24h`. It is also how far back a Loki query reaches.                     |
-| `CCOBS_TEMPO_RETENTION`      | `168h`  | How long Tempo keeps traces, as a Go duration in hours at most. Tempo refuses days, such as `7d`, and does not start. |
-| `CCOBS_PROMETHEUS_PORT`      | `4390`  | Host port of Prometheus's HTTP API; debug override only.                                                              |
-| `CCOBS_LOKI_PORT`            | `4310`  | Host port of Loki's HTTP API; debug override only.                                                                    |
-| `CCOBS_TEMPO_PORT`           | `4320`  | Host port of Tempo's HTTP API; debug override only, with the `traces` profile.                                        |
-| `CCOBS_APP_PORT`             | `4300`  | Reserved for the app (milestone 2); nothing reads it yet.                                                             |
+| Variable                     | Default            | Effect                                                                                                                                   |
+| ---------------------------- | ------------------ | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| `CCOBS_OTLP_GRPC_PORT`       | `4317`             | Host port of the collector's OTLP/gRPC receiver, for Claude Code's `grpc` protocol.                                                      |
+| `CCOBS_OTLP_HTTP_PORT`       | `4318`             | Host port of the collector's OTLP/HTTP receiver, for Claude Code's `http/protobuf` and `http/json` protocols.                            |
+| `CCOBS_GRAFANA_PORT`         | `4330`             | Host port of Grafana, and the port of its root URL, which Grafana redirects to.                                                          |
+| `CCOBS_HOST_LABEL`           | `local`            | The `host` label on every metric, event and trace, and on the app's rows and series ([ADR 0022](adr/0022-the-host-label.md)); see below. |
+| `CCOBS_PROMETHEUS_RETENTION` | `90d`              | How long Prometheus keeps metrics, in Prometheus's units: `y`, `w`, `d`, `h`, `m`, `s` or `ms`.                                          |
+| `CCOBS_LOKI_RETENTION`       | `720h`             | How long Loki keeps events, as a multiple of `24h`. It is also how far back a Loki query reaches.                                        |
+| `CCOBS_TEMPO_RETENTION`      | `168h`             | How long Tempo keeps traces, as a Go duration in hours at most. Tempo refuses days, such as `7d`, and does not start.                    |
+| `CCOBS_PROMETHEUS_PORT`      | `4390`             | Host port of Prometheus's HTTP API; debug override only.                                                                                 |
+| `CCOBS_LOKI_PORT`            | `4310`             | Host port of Loki's HTTP API; debug override only.                                                                                       |
+| `CCOBS_TEMPO_PORT`           | `4320`             | Host port of Tempo's HTTP API; debug override only, with the `traces` profile.                                                           |
+| `CCOBS_APP_PORT`             | `4300`             | Host port of the app: the hook URL that Claude Code posts to, the API and `/healthz`.                                                    |
+| `CCOBS_APP_METRICS_PORT`     | `4301`             | Host port of the app's metrics listener; debug override only.                                                                            |
+| `CCOBS_APP_RETENTION`        | `90d`              | How long the app keeps a session after its last event, in Prometheus's units; at least `1d` and never below `CCOBS_SESSION_STALE_AFTER`. |
+| `CCOBS_SESSION_STALE_AFTER`  | `12h`              | How long a session or agent can stay silent before the app marks it stale, in the same units; at least `1h`.                             |
+| `CCOBS_TELEMETRY_RECONCILE`  | `true`             | Whether the app reads Claude Code's `tool_decision` events from Loki to close permission prompts denied with Esc.                        |
+| `CCOBS_LOKI_URL`             | `http://loki:3100` | Loki's HTTP API as the app reaches it inside the stack.                                                                                  |
+| `CCOBS_LOG_LEVEL`            | `info`             | The app's log level: `debug`, `info`, `warning` or `error`.                                                                              |
+
+Advanced: the app's hook queue and body limits
+([ADR 0027](adr/0027-the-app-http-surface-and-hook-queue.md)). A hook that does not fit
+is dropped, still answered with an empty 2xx, and counted in
+`ccobs_hook_events_dropped_total`.
+
+| Variable                     | Default    | Effect                                                                                     |
+| ---------------------------- | ---------- | ------------------------------------------------------------------------------------------ |
+| `CCOBS_HOOK_QUEUE_MAX_ITEMS` | `10000`    | Most hooks the queue holds at once, 1 to 1000000.                                          |
+| `CCOBS_HOOK_QUEUE_MAX_BYTES` | `67108864` | Most body bytes the queue holds at once (64 MiB), 1 MiB to 1 GiB.                          |
+| `CCOBS_HOOK_BODY_MAX_BYTES`  | `8388608`  | Largest hook body read (8 MiB), 64 KiB to 64 MiB and at most `CCOBS_HOOK_QUEUE_MAX_BYTES`. |
+
+The app checks its own settings at start-up and stops with a message that names each
+invalid variable; [app.md](app.md#configuration) has the details, including
+`CCOBS_LISTEN_HOST`, which the image sets, and the three other settings that compose
+never passes.
 
 `CCOBS_HOST_LABEL` takes letters, digits, `.`, `_` and `-`. The stack does not check the
 value: a double quote or a backslash can stop the collector at start-up or change the
@@ -146,17 +195,19 @@ only if you want the hostname stored.
 | `loki-data`       | `/loki`            | Loki's chunks, index, write-ahead log and compactor state.                                                                                       |
 | `tempo-data`      | `/var/tempo`       | Tempo's write-ahead log and trace blocks (`traces` profile).                                                                                     |
 | `grafana-data`    | `/var/lib/grafana` | Grafana's database: dashboards saved in the UI, stars and preferences. The datasources and the provisioned dashboard come from `stack/grafana/`. |
+| `app-data`        | `/var/lib/ccobs`   | The app's SQLite database, `ccobs.db`, and its WAL files: sessions, agents, blocks and hook events, metadata only.                               |
 
 Docker names them `cc-observatory_<volume>`, because `compose.yaml` fixes the project
 name; `docker system df -v` shows their sizes. The collector has no volume: at a stop
 it lets the export attempts in progress finish (5 s at most per store) and drops the
 requests waiting to be retried, so what it has not delivered by then is lost.
 
-| Data    | Default          | Variable                     | Applied by                  |
-| ------- | ---------------- | ---------------------------- | --------------------------- |
-| Metrics | 90 days (`90d`)  | `CCOBS_PROMETHEUS_RETENTION` | Prometheus's TSDB retention |
-| Events  | 30 days (`720h`) | `CCOBS_LOKI_RETENTION`       | Loki's compactor            |
-| Traces  | 7 days (`168h`)  | `CCOBS_TEMPO_RETENTION`      | Tempo's backend worker      |
+| Data         | Default                                      | Variable                     | Applied by                     |
+| ------------ | -------------------------------------------- | ---------------------------- | ------------------------------ |
+| Metrics      | 90 days (`90d`)                              | `CCOBS_PROMETHEUS_RETENTION` | Prometheus's TSDB retention    |
+| Events       | 30 days (`720h`)                             | `CCOBS_LOKI_RETENTION`       | Loki's compactor               |
+| Traces       | 7 days (`168h`)                              | `CCOBS_TEMPO_RETENTION`      | Tempo's backend worker         |
+| App sessions | 90 days (`90d`) after a session's last event | `CCOBS_APP_RETENTION`        | The app's hourly retention job |
 
 - The defaults and the format of each variable come from
   [ADR 0016](adr/0016-cardinality-and-retention.md). To change one, set its variable in
@@ -171,6 +222,10 @@ requests waiting to be retried, so what it has not delivered by then is lost.
   query length limit is off. A longer range, such as "Last 90 days" in the dashboard
   (Prometheus keeps 90 days), shows events from the start of Loki's retention instead of
   failing.
+- The app deletes only ended and stale sessions, with their agents, blocks and hook
+  events; a session still open is never deleted. Its retention job runs about a minute
+  after the app starts, then every hour, and a sweep every minute marks sessions silent
+  for `CCOBS_SESSION_STALE_AFTER` stale ([app.md](app.md#data-and-retention)).
 - Disk use over 30 to 90 days of real use has not been measured. ADR 0016 estimates
   roughly 1 MB of metrics a day at 50 sessions a day.
 
@@ -185,11 +240,15 @@ requests waiting to be retried, so what it has not delivered by then is lost.
 | `loki`           | 512m        | 409MiB       |
 | `tempo`          | 512m        | 409MiB       |
 | `grafana`        | 768m        | 614MiB       |
+| `app`            | 256m        | none         |
 
-- The limits add up to 2048 MiB without Tempo and 2560 MiB with it.
-- Every service is a Go program, and `GOMEMLIMIT` is about 80% of its limit, so the Go
-  runtime collects garbage before the container reaches the limit
-  ([ADR 0020](adr/0020-compose-conventions.md)). The collector's `memory_limiter`
+- The limits add up to 2304 MiB without Tempo and 2816 MiB with it.
+- Every service but the app is a Go program, and `GOMEMLIMIT` is about 80% of its limit,
+  so the Go runtime collects garbage before the container reaches the limit
+  ([ADR 0020](adr/0020-compose-conventions.md)). The app is a Python process, which
+  `GOMEMLIMIT` does not tune; its limit leaves room for the hook queue, which may hold
+  up to 64 MiB of bodies (`CCOBS_HOOK_QUEUE_MAX_BYTES`) on top of its steady state
+  ([ADR 0030](adr/0030-the-app-container.md)). The collector's `memory_limiter`
   processor, first in every pipeline, is set in percentages of the container's limit
   (`limit_percentage: 80`, `spike_limit_percentage: 25`): it refuses new data, with an
   error the sender may retry, once the collector's heap passes its soft limit, 55% of
@@ -248,8 +307,9 @@ With Tempo (`docker compose --profile traces up -d`):
 | `grafana`        | 165.7 / 165.9 | 140.1 / 166.1 | 140.0 / 144.2 | 204.2 / 208.2 | 213.8         |
 | Total            | 290.1 / 294.1 | 286.8 / 300.9 | 347.5 / 347.5 | 424.6 / 446.3 |               |
 
-- The stack used about 260 to 290 MiB idle and 420 to 450 MiB at the dashboard peak,
-  against limits that add up to 2048 MiB (2560 MiB with Tempo).
+- The stack used about 260 to 290 MiB idle and 420 to 450 MiB at the dashboard peak.
+  These runs came before the app joined the stack; its own figures are below. The limits
+  now add up to 2304 MiB (2816 MiB with Tempo).
 - A total's sampled peak is the highest sum of one sample, not the sum of each service's
   peak.
 - Loki's high-water mark (137.4 and 140.7 MiB) is well above its highest sample (111.3
@@ -266,10 +326,25 @@ With Tempo (`docker compose --profile traces up -d`):
 - The runs held a few replayed sessions. Memory with 30 to 90 days of real history,
   where Prometheus and Loki hold and query much more data, has not been measured.
 
+The app was measured on its own, with the same Docker Desktop 29.8 (Windows 11, WSL 2)
+and `tools/stack/memory.py`, when it joined the stack, in MiB:
+
+| Phase                                   | Usage | `memory.peak` |
+| --------------------------------------- | ----- | ------------- |
+| Idle, after a fresh start               | 63.8  | 79.1          |
+| After replaying the fixtures' 131 hooks | 66.5  | 83.0          |
+| After 2,620 more hooks                  | 70.1  | 89.3          |
+| After a restart with that data          | 63.3  |               |
+
+- The peak includes the healthcheck's short-lived Python process. The app stays far
+  below its 256m limit.
+- In the same measurement the other services, idle, used about 167 MiB (Grafana), 49
+  MiB (the collector), 44 MiB (Prometheus) and 39 MiB (Loki).
+
 ### Docker Desktop's memory
 
 Docker Desktop runs the containers in a VM with a fixed amount of memory. Leave at least
-about 2 GB of it for the stack (2.5 GB with Tempo), the sum of the limits above, on top
+2304 MiB of it for the stack (2816 MiB with Tempo), the sum of the limits above, on top
 of what your other containers use: with less, the VM can run out of memory before a
 service reaches its own limit.
 
@@ -298,6 +373,12 @@ Compressed download sizes, from the registry manifests:
 Unpacked, the default stack's images take about 3.0 GB of disk (amd64, containerd image
 store): Grafana 1938 MB, the collector about 520 MB, Prometheus 362 MB and Loki 211 MB.
 Tempo adds 178 MB. The data volumes come on top.
+
+The app's image is built on your machine from the `python:3.12.15-slim-trixie` and
+`ghcr.io/astral-sh/uv:0.12.24` images, which the first build downloads (their download
+size is not measured here); the built image is about 250 MB as Docker Desktop 29.8
+reports it, 54 MB of which is the app's virtual environment
+([ADR 0030](adr/0030-the-app-container.md)).
 
 ## Measuring memory
 
@@ -367,7 +448,10 @@ container paths are not turned into Windows paths.
   28.0 also let hosts on the same local network segment reach ports published to
   `127.0.0.1` ([port publishing](https://docs.docker.com/engine/network/port-publishing/)).
 - About 750 MB to download (790 MB with Tempo) and about 3 GB of disk for the images,
-  on amd64, plus the data. Memory: see [Memory and disk](#memory-and-disk).
+  on amd64, plus the app's base images and its 250 MB image, and the data. Memory: see
+  [Memory and disk](#memory-and-disk).
+- The app's image builds on linux/amd64 and linux/arm64, the platforms the uv image
+  offers; 32-bit ARM hosts cannot build it.
 - Tested on Linux (GitHub Actions' Ubuntu runners) and on Windows 11 with Docker
   Desktop, both on amd64. macOS and arm64 have not been tested.
 
@@ -457,6 +541,15 @@ for lack of memory, either the VM ran out (give Docker Desktop more memory: see
 [Docker Desktop's memory](#docker-desktops-memory)) or the service reached its own
 limit, which `uv run python -m tools.stack.memory --samples 12` shows as a peak close to
 100%.
+
+### The app is unhealthy, or Claude Code shows hook errors
+
+`docker compose ps app` shows the app's health and `docker compose logs app` why it
+failed: most often an invalid setting, which it names, or port 4300 taken by another
+program. A hook-error notice in Claude Code's transcript means a hook could not reach
+the app: the stack is down or starting, or the hook URL is wrong (it must use
+`127.0.0.1`). [app.md](app.md#troubleshooting) covers these, a session stuck in
+`working` or `waiting_user`, WAL being off and dropped hooks.
 
 ### An edited dashboard does not show on the home page
 
@@ -570,7 +663,8 @@ total still comes out low.
 checks the settings of the running stack: Loki's and Tempo's usage reports are off;
 Grafana applied every outbound setting and ran none of the jobs that call grafana.com;
 Prometheus has no remote write or read, no Alertmanager and no service discovery; the
-collector exports only to the three stores; and `backend` is internal.
+collector exports only to the three stores; and `backend` is internal. The app calls
+nothing but Loki, over `backend`, although it is on `edge` too to publish its port.
 
 That no connection leaves, whatever the settings say, is a manual check with
 [`tools/stack/compose.egress-sink.yaml`](../tools/stack/compose.egress-sink.yaml), a
@@ -584,6 +678,7 @@ integration tests'. About 25 minutes, with Docker running:
 ~~~bash
 egress() {
   CCOBS_OTLP_GRPC_PORT=44317 CCOBS_OTLP_HTTP_PORT=44318 CCOBS_GRAFANA_PORT=44330 \
+  CCOBS_APP_PORT=44300 \
     docker compose -p ccobs-egress --env-file .env.example -f compose.yaml \
     -f tools/stack/compose.egress-sink.yaml --profile traces "$@"
 }
@@ -617,7 +712,8 @@ uv run pytest -m integration --no-cov
 With Docker running, the tests start their own compose project, `ccobs-it`, with
 `compose.yaml`, `compose.debug.yaml` and the `traces` profile, on ports of their own
 ([ADR 0018](adr/0018-ports-networks-and-exposure.md)): OTLP gRPC 24317, OTLP HTTP 24318,
-Grafana 24330, Prometheus 24390, Loki 24310 and Tempo 24320.
+Grafana 24330, Prometheus 24390, Loki 24310, Tempo 24320, the app 24300 and the app's
+metrics 24301.
 They read `.env.example`, never your `.env`, and drop inherited `CCOBS_*` and
 `COMPOSE_*` variables ([`tools/stack/isolated.py`](../tools/stack/isolated.py)), so they
 can run next to your stack.
