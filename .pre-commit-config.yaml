@@ -5,9 +5,12 @@ repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v6.0.0
     hooks:
+      # Vendored files and licence texts keep their published bytes (VENDOR.json checksums).
       - id: trailing-whitespace
         args: [--markdown-linebreak-ext=md]
+        exclude: '^src/ccobs/server/static/(vendor|licenses)/'
       - id: end-of-file-fixer
+        exclude: '^src/ccobs/server/static/(vendor|licenses)/'
       - id: check-yaml
       - id: check-toml
       - id: check-json
@@ -16,7 +19,7 @@ repos:
       - id: detect-private-key
       - id: mixed-line-ending
         args: [--fix=lf]
-        exclude: '\.(bat|cmd)$'
+        exclude: '\.(bat|cmd)$|^src/ccobs/server/static/(vendor|licenses)/'
 
   # Tools run through uv so their versions come from uv.lock, the same as in CI.
   - repo: local

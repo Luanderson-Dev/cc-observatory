@@ -1,0 +1,211 @@
+/*
+ * cc-observatory web UI: tokens and base element styles (ADR 0031).
+ *
+ * Every file this stylesheet loads ships with the app; nothing comes from another origin.
+ * Component styles (strips, bays, panels) build on these tokens.
+ */
+
+/* Fonts: Atkinson Hyperlegible Next and Mono, variable (wght 200-800), SIL OFL 1.1,
+   unmodified upstream files listed in ../VENDOR.json. */
+
+@font-face {
+  font-family: "Atkinson Hyperlegible Next";
+  font-style: normal;
+  font-weight: 200 800;
+  font-display: swap;
+  src: url("../fonts/atkinson-hyperlegible-next-wght.woff2") format("woff2");
+}
+
+@font-face {
+  font-family: "Atkinson Hyperlegible Next";
+  font-style: italic;
+  font-weight: 200 800;
+  font-display: swap;
+  src: url("../fonts/atkinson-hyperlegible-next-italic-wght.woff2") format("woff2");
+}
+
+@font-face {
+  font-family: "Atkinson Hyperlegible Mono";
+  font-style: normal;
+  font-weight: 200 800;
+  font-display: swap;
+  src: url("../fonts/atkinson-hyperlegible-mono-wght.woff2") format("woff2");
+}
+
+/* Tokens. Light is the default; dark follows the system unless the page carries
+   data-theme="light", and data-theme="dark" forces it (the manual choice wins). */
+
+:root {
+  color-scheme: light;
+
+  /* Colour: the strip board. Amber is the only saturated colour in the common case.
+     Text tokens reach WCAG AA (4.5:1) on --board and --strip, --on-waiting on --waiting;
+     tests/server/test_static.py computes the ratios. */
+  --board: #dce3e0;
+  --strip: #f6f8f7;
+  --ink: #1c2623;
+  --ink-muted: #56645f;
+  --waiting: #e39b12;
+  --waiting-text: #8a5a00;
+  --on-waiting: #1c2623;
+  --working: #285fbf;
+  --idle: #7a8a85;
+  --ended: #b4beba;
+  --error: #b33a28;
+  --focus: var(--working);
+
+  /* Type: one superfamily; Mono only for identifiers. Scale 1.25: 13/16/20/25/31 px. */
+  --font-sans: "Atkinson Hyperlegible Next", system-ui, sans-serif;
+  --font-mono: "Atkinson Hyperlegible Mono", ui-monospace, monospace;
+  --text-sm: 0.8125rem;
+  --text-base: 1rem;
+  --text-lg: 1.25rem;
+  --text-xl: 1.5625rem;
+  --text-2xl: 1.9375rem;
+  --leading-tight: 1.25;
+  --leading-normal: 1.5;
+  --weight-regular: 400;
+  --weight-semibold: 600;
+  --weight-bold: 700;
+
+  /* Space: a 4 px base. */
+  --space-1: 0.25rem;
+  --space-2: 0.5rem;
+  --space-3: 0.75rem;
+  --space-4: 1rem;
+  --space-5: 1.5rem;
+  --space-6: 2rem;
+  --space-7: 3rem;
+  --space-8: 4rem;
+
+  /* Shape: strips are flat rows with a solid holder band on the left; no shadows. */
+  --radius-strip: 2px;
+  --band-width: 6px;
+  --page-max-width: 75rem;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --board: #18211f;
+    --strip: #222d2a;
+    --ink: #e8eeeb;
+    --ink-muted: #93a39d;
+    --waiting: #f0b33a;
+    --waiting-text: #f0b33a;
+    --on-waiting: #18211f;
+    --working: #6c9cf0;
+    --idle: #7f918b;
+    --ended: #4a5753;
+    --error: #f07a62;
+  }
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --board: #18211f;
+  --strip: #222d2a;
+  --ink: #e8eeeb;
+  --ink-muted: #93a39d;
+  --waiting: #f0b33a;
+  --waiting-text: #f0b33a;
+  --on-waiting: #18211f;
+  --working: #6c9cf0;
+  --idle: #7f918b;
+  --ended: #4a5753;
+  --error: #f07a62;
+}
+
+/* Base elements. */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background: var(--board);
+  color: var(--ink);
+  font-family: var(--font-sans);
+  font-size: var(--text-base);
+  font-weight: var(--weight-regular);
+  line-height: var(--leading-normal);
+}
+
+h1,
+h2,
+h3 {
+  margin: 0 0 var(--space-3);
+  line-height: var(--leading-tight);
+  font-weight: var(--weight-semibold);
+}
+
+h1 {
+  font-size: var(--text-xl);
+}
+
+h2 {
+  font-size: var(--text-lg);
+}
+
+h3 {
+  font-size: var(--text-base);
+}
+
+p {
+  margin: 0 0 var(--space-3);
+}
+
+small {
+  font-size: var(--text-sm);
+}
+
+a {
+  color: var(--working);
+  text-underline-offset: 0.15em;
+}
+
+code,
+kbd,
+samp {
+  font-family: var(--font-mono);
+  font-size: 0.95em;
+}
+
+/* Durations and counts stay in the UI face, with tabular figures. */
+time,
+data {
+  font-variant-numeric: tabular-nums;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+  color: inherit;
+}
+
+:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
