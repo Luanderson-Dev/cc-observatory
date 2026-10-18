@@ -149,6 +149,8 @@ até lá, você aponta o Claude Code para a stack manualmente.
    tem, ou exporte-as no shell que inicia o Claude Code. As configurações de projeto
    (`.claude/settings.json` e `.claude/settings.local.json`) não conseguem defini-las.
 
+   <!-- telemetry-env: telemetry_env(), kept equal by tests/test_docs_snippet.py -->
+
    ~~~json
    {
      "env": {

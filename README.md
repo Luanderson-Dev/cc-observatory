@@ -141,6 +141,8 @@ Claude Code's metrics and events in Grafana. From v0.3.0 the stack also runs the
    them in the shell that starts Claude Code. Project settings
    (`.claude/settings.json` and `.claude/settings.local.json`) cannot set them.
 
+   <!-- telemetry-env: telemetry_env(), kept equal by tests/test_docs_snippet.py -->
+
    ~~~json
    {
      "env": {
