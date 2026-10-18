@@ -770,6 +770,20 @@ details[open] > .bay__summary .bay__title::before {
   user-select: all;
 }
 
+/* The links to Grafana: one quiet line under the header, a label and three links. */
+.grafana-links {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-1) var(--space-4);
+  margin-top: var(--space-3);
+  font-size: var(--text-sm);
+}
+
+.grafana-links__label {
+  color: var(--ink-muted);
+}
+
 .session-columns {
   display: grid;
   gap: var(--space-6) var(--space-7);

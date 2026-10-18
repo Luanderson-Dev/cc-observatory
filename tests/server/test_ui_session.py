@@ -19,7 +19,7 @@ import subprocess
 from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
 from typing import Any, Final
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 
 import pytest
 from fastapi import FastAPI, HTTPException
@@ -27,6 +27,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import Engine, insert, select, update
 from sqlalchemy.exc import OperationalError
 
+from ccobs.domain.grafana_links import dashboard_url, session_links, session_range
 from ccobs.domain.hook_config import HOOK_PATH
 from ccobs.domain.presentation import format_duration
 from ccobs.server import ui
@@ -59,6 +60,8 @@ XSS: Final = "<script>\"'&"
 RAW_XSS: Final = ("<script>", "\"'&")
 ESCAPED_XSS: Final = "&lt;script&gt;&#34;&#39;&amp;"
 CONTENT_CANARY: Final = "content-canary-7f3a"
+GRAFANA: Final = "http://localhost:4330"
+MOVED_GRAFANA: Final = "http://localhost:24330"
 type RowValues = dict[str, object]
 SESSION_OPTIONAL: Final = (
     "last_prompt_id",
@@ -107,10 +110,20 @@ class Clock:
 
 @pytest.fixture
 def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[TestClient]:
+    yield from _client(tmp_path, monkeypatch)
+
+
+@pytest.fixture
+def moved_grafana_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[TestClient]:
+    """The app with Grafana on another port, as compose gives it from CCOBS_GRAFANA_PORT."""
+    yield from _client(tmp_path, monkeypatch, grafana_url=MOVED_GRAFANA + "/")
+
+
+def _client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, **values: Any) -> Iterator[TestClient]:
     for name in list(os.environ):
         if name.upper().startswith("CCOBS_"):
             monkeypatch.delenv(name)
-    settings = Settings(data_dir=tmp_path / "data", host_label=HOST)
+    settings = Settings(data_dir=tmp_path / "data", host_label=HOST, **values)
 
     def manual(
         queue: HookQueue, repository: Repository, observers: WriterObservers
@@ -441,6 +454,122 @@ def test_the_overview_links_to_the_session_page(client: TestClient) -> None:
 
     assert f'href="/sessions/{SID}"' in page(client, "/")
     page(client, f"/sessions/{SID}")
+
+
+# Links to Grafana.
+
+
+def anchors(body: str, element_id: str) -> dict[str, str]:
+    """The links in ``element_id``, by their text, with their href unescaped."""
+    links = {}
+    for attributes, text in re.findall(r"<a\b([^>]*)>([^<]*)</a>", section(body, element_id)):
+        href = re.search(r'\bhref="([^"]*)"', attributes)
+        assert href is not None, attributes
+        assert 'target="_blank"' in attributes, attributes
+        assert 'rel="noopener noreferrer"' in attributes, attributes
+        assert "hx-" not in attributes, attributes
+        links[text.strip()] = html.unescape(href.group(1))
+    return links
+
+
+def header_grafana(body: str) -> str:
+    found = re.search(r'<a\b[^>]*\bclass="masthead__grafana"[^>]*>', body)
+    assert found is not None
+    assert 'target="_blank"' in found.group(0)
+    assert 'rel="noopener noreferrer"' in found.group(0)
+    href = re.search(r'\bhref="([^"]*)"', found.group(0))
+    assert href is not None
+    return html.unescape(href.group(1))
+
+
+def test_an_ended_session_links_grafana_over_its_lifetime(client: TestClient) -> None:
+    ended = NOW - HOUR_MS
+    seed(client, [session_row(status="ended", last_event_at_ms=ended, ended_at_ms=ended)])
+
+    body = page(client, f"/sessions/{SID}")
+
+    expected = session_links(
+        GRAFANA, host=HOST, session_id=SID, time_range=session_range(ended - HOUR_MS, ended)
+    )
+    links = anchors(body, "grafana-links")
+    assert links == {
+        "Logs": expected.logs,
+        "Tokens and cost": expected.usage,
+        "Dashboard": expected.dashboard,
+    }
+    assert "Open in Grafana" in section(body, "grafana-links")
+
+
+def test_a_live_session_links_grafana_up_to_now(client: TestClient) -> None:
+    seed(client, [session_row(status="waiting_user")])
+
+    links = anchors(page(client, f"/sessions/{SID}"), "grafana-links")
+
+    expected = session_links(
+        GRAFANA, host=HOST, session_id=SID, time_range=session_range(NOW - HOUR_MS, None)
+    )
+    assert links["Logs"] == expected.logs
+    assert "to=now" in links["Dashboard"]
+
+
+def test_a_stale_session_links_grafana_up_to_its_last_event(client: TestClient) -> None:
+    last = NOW - 13 * HOUR_MS
+    seed(client, [session_row(status="stale", last_event_at_ms=last)])
+
+    links = anchors(page(client, f"/sessions/{SID}"), "grafana-links")
+
+    window = session_range(last - HOUR_MS, last)
+    assert links["Dashboard"] == dashboard_url(GRAFANA, host=HOST, time_range=window)
+
+
+def test_the_grafana_links_escape_a_hostile_session_id(client: TestClient) -> None:
+    hostile = f"{XSS}-{SID}"
+    seed(client, [session_row(session_id=hostile)])
+
+    body = page(client, "/sessions/" + quote(hostile, safe=""))
+
+    links = anchors(body, "grafana-links")
+    expected = session_links(
+        GRAFANA, host=HOST, session_id=hostile, time_range=session_range(NOW - HOUR_MS, None)
+    )
+    assert links["Logs"] == expected.logs
+    assert links["Tokens and cost"] == expected.usage
+    # Percent-encoded in the URL, and escaped again in the attribute.
+    for raw in RAW_XSS:
+        assert raw not in section(body, "grafana-links")
+
+
+def test_the_grafana_links_stay_out_of_the_live_refresh(client: TestClient) -> None:
+    seed(client, [session_row()])
+
+    live = page(client, url("live?blocks_since=1&agents_since=1"))
+
+    assert "grafana-links" not in live
+    assert "localhost:4330" not in live
+
+
+def test_every_page_header_links_the_grafana_dashboard(client: TestClient) -> None:
+    seed(client, [session_row()])
+    expected = dashboard_url(GRAFANA, host=HOST)
+
+    for path, status in (
+        ("/", 200),
+        ("/sessions", 200),
+        (f"/sessions/{SID}", 200),
+        ("/sessions/unknown-session", 404),
+    ):
+        assert header_grafana(page(client, path, status=status)) == expected, path
+
+
+def test_the_links_follow_the_grafana_url_setting(moved_grafana_client: TestClient) -> None:
+    seed(moved_grafana_client, [session_row()])
+
+    body = page(moved_grafana_client, f"/sessions/{SID}")
+
+    assert header_grafana(body) == dashboard_url(MOVED_GRAFANA, host=HOST)
+    for href in anchors(body, "grafana-links").values():
+        assert href.startswith(MOVED_GRAFANA + "/")
+        assert not href.startswith(MOVED_GRAFANA + "//")
 
 
 # Blocks.

@@ -272,6 +272,18 @@ still being built for v0.4.0; this section lists what is there so far.
     (tool, MCP server, agent, notification type, error code, duration, sizes), never
     prompts, tool inputs or outputs.
 
+  Under the header, **Open in Grafana** has three links, each opening a new tab:
+  - **Logs**: Explore on Loki with the session's Claude Code events,
+    `{service_name="claude-code", host="<host>"} | session_id="<id>"`;
+  - **Tokens and cost**: Explore on Prometheus, split in two: the session's tokens by
+    type and its cost by model, per interval, as the dashboard draws them;
+  - **Dashboard**: the Claude Code overview for the app's host label.
+
+  Each covers the session from a minute before it started to two minutes after it
+  ended (or after its last event, once stale); for a live session it runs up to now.
+  Loki logs every query it runs, so the session ID of a Logs link you open ends up in
+  Loki's log, like any query you type in Grafana.
+
   The page shows every open block and running agent, the latest 50 closed blocks and
   stopped agents, and the latest 50 hook events; "Show older ..." appends the next 50
   in place (from `/ui/sessions/{session_id}/blocks`, `.../agents` and `.../events`). An
@@ -283,6 +295,10 @@ still being built for v0.4.0; this section lists what is there so far.
   time zone.
 - **Theme**: system, light or dark, from the toggle in the header; the choice is kept in
   the browser's local storage for the app's origin.
+- **Grafana**: the header's link opens the Claude Code overview dashboard for the app's
+  host label in a new tab. Grafana answers only at `http://localhost:<port>`
+  ([ADR 0017](adr/0017-grafana-access-and-dns-rebinding.md)), and every link the app
+  draws starts there (see `CCOBS_GRAFANA_URL` under [Configuration](#configuration)).
 - If the app cannot read its database, the page says so with a 503 and a short reason.
 
 ### Live updates
@@ -525,6 +541,14 @@ in `.env` and run `docker compose up -d`.
 | `CCOBS_HOOK_QUEUE_MAX_ITEMS` | `10000`            | Advanced: most hooks the queue holds at once, 1 to 1000000.                                                        |
 | `CCOBS_HOOK_QUEUE_MAX_BYTES` | `67108864`         | Advanced: most body bytes the queue holds at once (64 MiB), 1 MiB to 1 GiB.                                        |
 | `CCOBS_HOOK_BODY_MAX_BYTES`  | `8388608`          | Advanced: largest hook body read (8 MiB), 64 KiB to 64 MiB and at most the queue's bytes.                          |
+
+Compose also passes `CCOBS_GRAFANA_URL`, Grafana as the browser opens it, for the UI's
+links. It is not offered in `.env`: compose sets it to Grafana's root URL,
+`http://localhost:<CCOBS_GRAFANA_PORT>`, the only URL Grafana does not redirect, so it
+follows `CCOBS_GRAFANA_PORT`. Outside compose it defaults to `http://localhost:4330`,
+and the app accepts only `http` or `https` on the host name `localhost` (not
+`127.0.0.1`, which Grafana redirects), with an optional port and path and no user,
+query or fragment.
 
 The image sets `CCOBS_LISTEN_HOST` and relies on the code's defaults for three more,
 which compose never passes, so that the port mappings, the healthcheck, the scrape

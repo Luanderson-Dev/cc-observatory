@@ -22,6 +22,9 @@
     <nav class="masthead__nav" aria-label="Pages">
       <a href="/"{% if nav == "overview" %} aria-current="page"{% endif %}>Overview</a>
       <a href="/sessions"{% if nav == "sessions" %} aria-current="page"{% endif %}>All sessions</a>
+      {#- Grafana opens in its own tab: a plain navigation, which the CSP and the Fetch
+          Metadata checks leave alone (ADR 0034). -#}
+      <a class="masthead__grafana" href="{{ grafana_home }}" target="_blank" rel="noopener noreferrer">Grafana</a>
     </nav>
     <fieldset class="theme-toggle" hidden>
       <legend class="visually-hidden">Theme</legend>

@@ -350,6 +350,10 @@ def create_app(
     # recently ended sessions from it.
     app.state.clock = endpoint.clock
     app.state.live = hub
+    # The UI's links to Grafana: its URL as the browser opens it, and the host label
+    # its dashboard and queries filter on.
+    app.state.grafana_url = settings.grafana_url
+    app.state.host_label = settings.host_label
     app.state.stream_timing = stream_timing or StreamTiming()
     for path in sorted(HOOK_PATHS):
         app.router.routes.append(Route(path, endpoint, include_in_schema=False))

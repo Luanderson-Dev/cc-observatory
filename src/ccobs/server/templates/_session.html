@@ -99,6 +99,18 @@
 </header>
 {%- endmacro %}
 
+{#- The session's links to Grafana, each in a new tab: its events in Explore on Loki, its
+    tokens and cost in Explore on Prometheus, and the overview dashboard, over the
+    session's range. Outside the header, so the live refresh leaves them alone. -#}
+{% macro grafana_links(links) -%}
+<nav id="grafana-links" class="grafana-links" aria-labelledby="grafana-links-label">
+  <span class="grafana-links__label" id="grafana-links-label">Open in Grafana</span>
+  <a href="{{ links.logs }}" target="_blank" rel="noopener noreferrer">Logs</a>
+  <a href="{{ links.usage }}" target="_blank" rel="noopener noreferrer">Tokens and cost</a>
+  <a href="{{ links.dashboard }}" target="_blank" rel="noopener noreferrer">Dashboard</a>
+</nav>
+{%- endmacro %}
+
 {#- The blocks the live refresh replaces: the heading, every open block, and the closed
     ones from the page's boundary up. Older pages go to #closed-blocks-older, outside. -#}
 {% macro blocks_region(blocks, oob=False) -%}

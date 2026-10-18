@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% from "_session.html" import event_row, more_control, tail_element, live_element, session_head, blocks_region, agents_region, older_list %}
+{% from "_session.html" import event_row, more_control, tail_element, live_element, session_head, grafana_links, blocks_region, agents_region, older_list %}
 {% block title %}{% if not error and head.project %}{{ head.project }}{% else %}Session{% endif %} - cc-observatory{% endblock %}
 {% block content %}
 <p class="back-link"><a href="/">Overview</a></p>
@@ -9,6 +9,7 @@
 {% else %}
 {{ live_element(live) }}
 {{ session_head(head) }}
+{{ grafana_links(grafana) }}
 <div class="session-columns">
   <div class="session-columns__side">
     <section class="session-section" aria-labelledby="blocks-heading">

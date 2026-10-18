@@ -14,6 +14,11 @@
   refresh").
 - ``/static``: the package's ``static/`` directory.
 
+Every page's header links the Grafana overview dashboard for the app's host label, and
+the session page links the session's events, tokens and cost in Grafana's Explore and
+the dashboard over its range (``ccobs.domain.grafana_links``). They are plain links that
+open a new tab, from ``CCOBS_GRAFANA_URL``; Jinja2 escapes them in the ``href``.
+
 Each request reads the database once, through the read gate (``ccobs.server.reads``,
 ADR 0033). A busy gate or a failed read renders a page or fragment that says what failed,
 with status 503; nothing from the error reaches it. The templates get view objects built
@@ -95,6 +100,7 @@ from starlette.staticfiles import StaticFiles
 from starlette.types import Scope
 
 from ccobs.domain.agent_tree import AgentRef, build_agent_tree
+from ccobs.domain.grafana_links import SessionLinks, dashboard_url, session_links, session_range
 from ccobs.domain.hook_config import HOOK_PATH, hook_settings
 from ccobs.domain.hooks import is_valid_session_id
 from ccobs.domain.presentation import (
@@ -110,7 +116,7 @@ from ccobs.domain.presentation import (
     format_duration,
     project_name,
 )
-from ccobs.domain.sessions import Agent, Block
+from ccobs.domain.sessions import Agent, Block, Session
 from ccobs.server.db.repository import (
     AgentPage,
     BoardRows,
@@ -444,6 +450,26 @@ def _now_ms(request: Request) -> int:
     return clock()
 
 
+def _grafana_home(request: Request) -> str:
+    """The header's link: the overview dashboard for the app's host label, over the
+    dashboard's own default range."""
+    return dashboard_url(request.app.state.grafana_url, host=request.app.state.host_label)
+
+
+def _grafana_session(request: Request, session: Session) -> SessionLinks:
+    """The session page's links to Grafana, over the session's range: up to its end, its
+    last event once stale (it gets no more), else up to now."""
+    last_ms = session.ended_at_ms
+    if last_ms is None and session.status == "stale":
+        last_ms = session.last_event_at_ms
+    return session_links(
+        request.app.state.grafana_url,
+        host=request.app.state.host_label,
+        session_id=session.session_id,
+        time_range=session_range(session.started_at_ms, last_ms),
+    )
+
+
 _Repo = Annotated[Repository, Depends(_repository)]
 _Reads = Annotated[ReadGate, Depends(_reads)]
 
@@ -474,6 +500,7 @@ async def overview(request: Request, repository: _Repo, reads: _Reads) -> Respon
         "overview.html",
         status_code=_status(context),
         nav="overview",
+        grafana_home=_grafana_home(request),
         live_stream=STREAM_PATH,
         **context,
     )
@@ -513,16 +540,17 @@ async def all_sessions(
         cursor = _parse_cursor(before)
         if cursor is None:
             # The value is not echoed.
-            return _sessions_page(status_code=_BAD_REQUEST, paged=True, error=_BAD_CURSOR)
+            return _sessions_page(request, status_code=_BAD_REQUEST, paged=True, error=_BAD_CURSOR)
     now_ms = _now_ms(request)
     # One more than a page: whether an older page exists.
     rows = await _read(reads, _page_read, repository, SESSIONS_PAGE_SIZE + 1, cursor)
     if isinstance(rows, ErrorView):
         return _sessions_page(
-            status_code=_SERVICE_UNAVAILABLE, paged=cursor is not None, error=rows
+            request, status_code=_SERVICE_UNAVAILABLE, paged=cursor is not None, error=rows
         )
     shown = rows[:SESSIONS_PAGE_SIZE]
     return _sessions_page(
+        request,
         paged=cursor is not None,
         strips=[_strip(row, now_ms) for row in shown],
         next_href=_next_href(shown) if len(rows) > SESSIONS_PAGE_SIZE else None,
@@ -531,6 +559,7 @@ async def all_sessions(
 
 
 def _sessions_page(
+    request: Request,
     *,
     status_code: int = 200,
     paged: bool,
@@ -544,6 +573,7 @@ def _sessions_page(
         "sessions.html",
         status_code=status_code,
         nav="sessions",
+        grafana_home=_grafana_home(request),
         before=paged,
         error=error,
         strips=strips,
@@ -935,8 +965,14 @@ def _session_read(repository: Repository, session_id: str, limit: int) -> Sessio
     return SessionRead(detail=detail, events=events[::-1])
 
 
-def _not_found_page() -> HTMLResponse:
-    return _render("not_found.html", status_code=_NOT_FOUND, nav=None, error=_NO_SESSION)
+def _not_found_page(request: Request) -> HTMLResponse:
+    return _render(
+        "not_found.html",
+        status_code=_NOT_FOUND,
+        nav=None,
+        grafana_home=_grafana_home(request),
+        error=_NO_SESSION,
+    )
 
 
 @router.get("/sessions/{session_id}", response_class=HTMLResponse)
@@ -945,13 +981,19 @@ async def session_page(
 ) -> Response:
     """One session: its header, blocks, agents and hook timeline."""
     if not is_valid_session_id(session_id):
-        return _not_found_page()
+        return _not_found_page(request)
     now_ms = _now_ms(request)
     found = await _read(reads, _session_read, repository, session_id, EVENTS_PAGE_SIZE + 1)
     if isinstance(found, ErrorView):
-        return _render("session.html", status_code=_SERVICE_UNAVAILABLE, nav=None, error=found)
+        return _render(
+            "session.html",
+            status_code=_SERVICE_UNAVAILABLE,
+            nav=None,
+            grafana_home=_grafana_home(request),
+            error=found,
+        )
     if found is None:
-        return _not_found_page()
+        return _not_found_page(request)
     detail = found.detail
     blocks = _blocks_region(detail, now_ms)
     # The oldest closed block and stopped agent shown: the "Show older" cursors, and the
@@ -973,7 +1015,9 @@ async def session_page(
     return _render(
         "session.html",
         nav=None,
+        grafana_home=_grafana_home(request),
         error=None,
+        grafana=_grafana_session(request, detail.session),
         live_stream=_live_stream(session_id),
         live=_live_link(
             session_id,

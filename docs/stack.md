@@ -149,7 +149,7 @@ recreates the services whose settings changed. Git ignores `.env`.
 | ---------------------------- | ------------------ | ---------------------------------------------------------------------------------------------------------------------------------------- |
 | `CCOBS_OTLP_GRPC_PORT`       | `4317`             | Host port of the collector's OTLP/gRPC receiver, for Claude Code's `grpc` protocol.                                                      |
 | `CCOBS_OTLP_HTTP_PORT`       | `4318`             | Host port of the collector's OTLP/HTTP receiver, for Claude Code's `http/protobuf` and `http/json` protocols.                            |
-| `CCOBS_GRAFANA_PORT`         | `4330`             | Host port of Grafana, and the port of its root URL, which Grafana redirects to.                                                          |
+| `CCOBS_GRAFANA_PORT`         | `4330`             | Host port of Grafana, and the port of its root URL, which Grafana redirects to; the app's links to Grafana follow it.                    |
 | `CCOBS_HOST_LABEL`           | `local`            | The `host` label on every metric, event and trace, and on the app's rows and series ([ADR 0022](adr/0022-the-host-label.md)); see below. |
 | `CCOBS_PROMETHEUS_RETENTION` | `90d`              | How long Prometheus keeps metrics, in Prometheus's units: `y`, `w`, `d`, `h`, `m`, `s` or `ms`.                                          |
 | `CCOBS_LOKI_RETENTION`       | `720h`             | How long Loki keeps events, as a multiple of `24h`. It is also how far back a Loki query reaches.                                        |
@@ -631,8 +631,10 @@ details.
   ([ADR 0017](adr/0017-grafana-access-and-dns-rebinding.md)).
 - Grafana logs some of the requests its access control refuses (on organizations and
   dashboards) at error level.
-- Grafana shows a *Sign in* link, but there are no accounts and the login form is off:
-  there is nothing to sign in to.
+- Grafana shows a *Sign in* button to anonymous visitors, but there are no accounts and
+  the login form is off: there is nothing to sign in to, and clicking it only leads back
+  to Grafana. It is known and harmless, and stays as it is for now
+  ([ADR 0017](adr/0017-grafana-access-and-dns-rebinding.md)).
 
 ## Known limit: delta temporality
 

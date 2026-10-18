@@ -340,6 +340,10 @@ services:
       # denied with Esc (ADR 0029).
       CCOBS_TELEMETRY_RECONCILE: ${CCOBS_TELEMETRY_RECONCILE:-true}
       CCOBS_LOKI_URL: ${CCOBS_LOKI_URL:-http://loki:3100}
+      # Grafana as the browser opens it, for the UI's links: Grafana's root URL (above),
+      # the one it never redirects (ADR 0017), so it follows CCOBS_GRAFANA_PORT and is
+      # not a setting of its own.
+      CCOBS_GRAFANA_URL: http://localhost:${CCOBS_GRAFANA_PORT:-4330}
       CCOBS_LOG_LEVEL: ${CCOBS_LOG_LEVEL:-info}
       # The hook queue and body limits (ADR 0027); advanced settings.
       CCOBS_HOOK_QUEUE_MAX_ITEMS: ${CCOBS_HOOK_QUEUE_MAX_ITEMS:-10000}

@@ -38,6 +38,8 @@ def test_defaults() -> None:
     assert settings.retention == timedelta(days=90)
     assert settings.session_stale_after == timedelta(hours=12)
     assert settings.loki_url == "http://loki:3100"
+    # Grafana's root URL with the default port (ADR 0017).
+    assert settings.grafana_url == "http://localhost:4330"
     assert settings.telemetry_reconcile is True
     assert settings.log_level == "info"
     assert settings.hook_queue_max_items == 10_000
@@ -77,6 +79,7 @@ def test_every_field_is_read_from_the_environment(
         "CCOBS_APP_RETENTION": "30d",
         "CCOBS_SESSION_STALE_AFTER": "2h30m",
         "CCOBS_LOKI_URL": "http://127.0.0.1:4310",
+        "CCOBS_GRAFANA_URL": "http://localhost:24330",
         "CCOBS_TELEMETRY_RECONCILE": "false",
         "CCOBS_LOG_LEVEL": "debug",
         "CCOBS_HOOK_QUEUE_MAX_ITEMS": "500",
@@ -96,6 +99,7 @@ def test_every_field_is_read_from_the_environment(
     assert settings.retention == timedelta(days=30)
     assert settings.session_stale_after == timedelta(hours=2, minutes=30)
     assert settings.loki_url == "http://127.0.0.1:4310"
+    assert settings.grafana_url == "http://localhost:24330"
     assert settings.telemetry_reconcile is False
     assert settings.log_level == "debug"
     assert settings.hook_queue_max_items == 500
@@ -355,6 +359,69 @@ def test_loki_url_error_does_not_echo_credentials(monkeypatch: pytest.MonkeyPatc
     with pytest.raises(SettingsError, match="CCOBS_LOKI_URL") as caught:
         load_settings()
     assert "hunter2" not in str(caught.value)
+
+
+# Grafana's URL, for the UI's links: the browser opens it, and Grafana answers only on
+# localhost (ADR 0017).
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("http://localhost:4330", "http://localhost:4330"),
+        ("http://localhost:24330/", "http://localhost:24330"),
+        ("https://localhost", "https://localhost"),
+        ("HTTP://LOCALHOST:4330", "HTTP://LOCALHOST:4330"),
+        ("http://localhost:4330/grafana//", "http://localhost:4330/grafana"),
+    ],
+)
+def test_grafana_url_accepts_http_and_https_on_localhost(
+    monkeypatch: pytest.MonkeyPatch, value: str, expected: str
+) -> None:
+    monkeypatch.setenv("CCOBS_GRAFANA_URL", value)
+
+    assert load_settings().grafana_url == expected
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "",
+        "localhost:4330",
+        "//localhost:4330",
+        "ftp://localhost:4330",
+        "javascript:alert(1)",
+        "file:///etc/passwd",
+        "http://",
+        "http://:4330",
+        # Grafana redirects every other host name to localhost (enforce_domain).
+        "http://127.0.0.1:4330",
+        "http://[::1]:4330",
+        "http://grafana:3000",
+        "http://localhost.example.com:4330",
+        "http://example.com/localhost",
+        "http://user@localhost:4330",
+        "http://localhost@example.com",
+        "http://localhost:4330?orgId=2",
+        "http://localhost:4330#top",
+        "http://localhost:99999",
+        "http://localhost:65536",
+        "http://localhost:0",
+        "http://localhost:",
+        "http://localhost:/grafana",
+        "http://localhost:port",
+        " http://localhost:4330",
+        "http://localhost:4330\n",
+        'http://localhost:4330/"onmouseover=x',
+        "http://localhost:4330/<script>",
+    ],
+)
+def test_grafana_url_rejects_anything_else(monkeypatch: pytest.MonkeyPatch, value: str) -> None:
+    monkeypatch.setenv("CCOBS_GRAFANA_URL", value)
+
+    with pytest.raises(SettingsError, match="CCOBS_GRAFANA_URL") as caught:
+        load_settings()
+    assert "localhost" in str(caught.value)
 
 
 # Ports and sizes: positive and bounded.
