@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any, Final
 
 import pytest
-from sqlalchemy import Engine, func, select, text
+from sqlalchemy import Engine, func, insert, select, text, update
 from sqlalchemy.exc import IntegrityError
 
 from ccobs.domain.hooks import HookEvent, parse_hook
@@ -41,7 +41,13 @@ from ccobs.server.db.models import (
     SessionModel,
     SessionStateModel,
 )
-from ccobs.server.db.repository import Applied, HookEventRow, Repository, hook_event_row
+from ccobs.server.db.repository import (
+    DETAIL_CLOSED_LIMIT,
+    Applied,
+    HookEventRow,
+    Repository,
+    hook_event_row,
+)
 from ccobs.server.migrations import upgrade_to_head
 
 HOOK_FIXTURES: Final = Path(__file__).parents[1] / "fixtures" / "hooks"
@@ -54,7 +60,7 @@ TABLES: Final = (SessionModel, AgentModel, BlockModel, HookEventModel, SessionSt
 
 
 def make_repository(path: Path) -> Repository:
-    engine = create_engine_for(path)
+    engine = create_engine_for(path, role="writer")
     upgrade_to_head(engine)
     return Repository(engine)
 
@@ -165,7 +171,7 @@ def test_a_restart_before_any_event_rebuilds_the_exact_state(tmp_path: Path, pat
         straight(hook_event, at, seq)
         # A restart: a new engine, and the state read back from the database only.
         restarted.repo.engine.dispose()
-        restarted.repo = Repository(create_engine_for(restarted_path))
+        restarted.repo = Repository(create_engine_for(restarted_path, role="writer"))
         restarted.states = restarted.repo.load_open_states()
         if sid not in restarted.states and (loaded := restarted.repo.load_state(sid)):
             restarted.states[sid] = loaded  # an ended session, which can reopen
@@ -570,6 +576,17 @@ def test_session_exists(repo: Repository) -> None:
     assert not repo.session_exists(OTHER)
 
 
+def test_find_session_returns_the_session_alone(repo: Repository) -> None:
+    Writer(repo)(event("UserPromptSubmit"), BASE)
+
+    found = repo.find_session(SESSION)
+    detail = repo.get_session(SESSION)
+
+    assert detail is not None
+    assert found == detail.session
+    assert repo.find_session(OTHER) is None
+
+
 def test_unknown_sessions(repo: Repository) -> None:
     assert repo.get_session(SESSION) is None
     assert repo.load_state(SESSION) is None
@@ -612,3 +629,384 @@ def test_no_content_reaches_the_database(repo: Repository, tmp_path: Path) -> No
         connection.execute(text("PRAGMA wal_checkpoint(TRUNCATE)"))
     for path in tmp_path.glob("ccobs.db*"):
         assert canary.encode() not in path.read_bytes(), path.name
+
+
+# Bounded detail and keyset paging (ADR 0033).
+
+BLOCKS: Final = 500
+AGENTS: Final = 300
+
+
+def seeded(repo: Repository) -> None:
+    """``SESSION`` with ``BLOCKS`` blocks and ``AGENTS`` agents written straight to their
+    tables (an ``OTHER`` session gets a few of each, which no read of ``SESSION`` may
+    return). Every seventh block is open and every fifth agent is running. Agent start
+    times are a permutation of the order of their IDs, with ties, and every eleventh
+    stopped agent is internal (no start time), so the agents' key differs from their IDs.
+    """
+    write = Writer(repo)
+    write(event("UserPromptSubmit"), BASE)
+    write(event("UserPromptSubmit", session_id=OTHER), BASE)
+    blocks: list[dict[str, Any]] = []
+    agents: list[dict[str, Any]] = []
+    for sid, total_blocks, total_agents in ((SESSION, BLOCKS, AGENTS), (OTHER, 5, 5)):
+        for index in range(total_blocks):
+            closed = None if index % 7 == 0 else BASE + 10 * index + 5
+            blocks.append(
+                {
+                    "session_id": sid,
+                    "host": HOST,
+                    "block_id": 1_000 + 2 * index + (sid == OTHER),
+                    "kind": "permission",
+                    "scope_agent_id": None,
+                    "opened_at_ms": BASE + 10 * index,
+                    "closed_at_ms": closed,
+                    "close_reason": None if closed is None else "tool_completed",
+                    "close_source": None if closed is None else "hook",
+                }
+            )
+        for index in range(total_agents):
+            running = index % 5 == 0
+            internal = not running and index % 11 == 0
+            started = BASE + ((index * 37) % total_agents) // 2
+            agents.append(
+                {
+                    "session_id": sid,
+                    "host": HOST,
+                    "agent_id": f"a{index:04d}",
+                    "status": "running" if running else "stopped",
+                    "internal": internal,
+                    "background": False,
+                    "started_at_ms": None if internal else started,
+                    "stopped_at_ms": None if running else started + 7,
+                    "last_event_at_ms": started + 9,
+                    "stop_reason": None if running else "stopped",
+                }
+            )
+    with repo.engine.begin() as connection:
+        connection.execute(insert(BlockModel), blocks)
+        connection.execute(insert(AgentModel), agents)
+
+
+def first_seen(agent: Agent) -> int:
+    for value in (agent.started_at_ms, agent.stopped_at_ms):
+        if value is not None:
+            return value
+    return agent.last_event_at_ms
+
+
+def agent_key(agent: Agent) -> tuple[int, str]:
+    return first_seen(agent), agent.agent_id
+
+
+def all_rows(repo: Repository) -> tuple[list[Agent], list[Block]]:
+    """Every agent and block of ``SESSION``, in the orders of the reads."""
+    stored = ("session_id", "host", "scope_agent_id")
+    with repo.engine.connect() as connection:
+        agent_rows = connection.execute(
+            select(AgentModel.__table__).where(AgentModel.session_id == SESSION)
+        ).mappings()
+        agents = [Agent(**{k: v for k, v in row.items() if k not in stored}) for row in agent_rows]
+        block_rows = connection.execute(
+            select(BlockModel.__table__).where(BlockModel.session_id == SESSION)
+        ).mappings()
+        blocks = [
+            Block(scope=row["scope_agent_id"], **{k: v for k, v in row.items() if k not in stored})
+            for row in block_rows
+        ]
+    return sorted(agents, key=agent_key), sorted(blocks, key=lambda b: b.block_id)
+
+
+def test_the_detail_holds_what_is_open_and_the_latest_closed(repo: Repository) -> None:
+    seeded(repo)
+    agents, blocks = all_rows(repo)
+    stopped = [a for a in agents if a.status == "stopped"]
+    closed = [b for b in blocks if b.closed_at_ms is not None]
+    latest_stopped = {a.agent_id for a in stopped[-DETAIL_CLOSED_LIMIT:]}
+    latest_closed = {b.block_id for b in closed[-DETAIL_CLOSED_LIMIT:]}
+
+    detail = repo.get_session(SESSION)
+
+    assert detail is not None
+    assert DETAIL_CLOSED_LIMIT == 50
+    assert (detail.agents_total, detail.blocks_total) == (AGENTS, BLOCKS)
+    # In the order of the full lists: the open ones whatever their age, then the latest.
+    assert detail.blocks == [
+        b for b in blocks if b.closed_at_ms is None or b.block_id in latest_closed
+    ]
+    assert detail.agents == [
+        a for a in agents if a.status == "running" or a.agent_id in latest_stopped
+    ]
+    assert len([b for b in detail.blocks if b.closed_at_ms is None]) == len(range(0, BLOCKS, 7))
+    assert len([a for a in detail.agents if a.status == "running"]) == AGENTS // 5
+    assert detail.parents == {a.agent_id: None for a in detail.agents}
+
+
+def test_a_short_session_detail_holds_everything(repo: Repository) -> None:
+    write = Writer(repo)
+    write(event("SubagentStart", agent_id="a1"), BASE)
+    write(event("PermissionRequest", tool_name="Bash"), BASE + 1)
+    detail = repo.get_session(SESSION)
+    assert detail is not None
+    assert (detail.agents_total, detail.blocks_total) == (1, 1)
+    assert [a.agent_id for a in detail.agents] == ["a1"]
+    assert len(detail.blocks) == 1
+
+
+LATE: Final = BASE + 10**7
+
+
+def _close_late(repo: Repository, block: Block, agent: Agent) -> None:
+    """Mark ``block`` and ``agent`` as closed and stopped at ``LATE``, long after the
+    others, as if they were open and running when a page loaded."""
+    with repo.engine.begin() as connection:
+        connection.execute(
+            update(BlockModel)
+            .where(BlockModel.session_id == SESSION, BlockModel.block_id == block.block_id)
+            .values(closed_at_ms=LATE)
+        )
+        connection.execute(
+            update(AgentModel)
+            .where(AgentModel.session_id == SESSION, AgentModel.agent_id == agent.agent_id)
+            .values(stopped_at_ms=LATE)
+        )
+
+
+def test_a_windowed_detail_holds_everything_from_the_boundaries_or_closed_since(
+    repo: Repository,
+) -> None:
+    # The live refresh of a session page (ADR 0032): every open block and running agent,
+    # the closed and stopped ones from the page's boundaries up, and the ones that
+    # closed or stopped after the page loaded, whatever their position.
+    seeded(repo)
+    agents, blocks = all_rows(repo)
+    closed = [b for b in blocks if b.closed_at_ms is not None]
+    stopped = [a for a in agents if a.status == "stopped"]
+    old_block = closed[0]
+    old_agent = next(a for a in stopped if a.started_at_ms is not None)
+    _close_late(repo, old_block, old_agent)
+    block_from, agent_from = closed[-30], stopped[-30]
+
+    detail = repo.get_session(
+        SESSION,
+        closed_limit=500,
+        blocks_from=block_from.block_id,
+        agents_from=agent_from.agent_id,
+        blocks_since_ms=LATE,
+        agents_since_ms=LATE,
+    )
+
+    assert detail is not None
+    assert [b.block_id for b in detail.blocks] == [
+        b.block_id
+        for b in blocks
+        if b.closed_at_ms is None or b.block_id >= block_from.block_id or b == old_block
+    ]
+    assert [a.agent_id for a in detail.agents] == [
+        a.agent_id
+        for a in agents
+        if a.status == "running" or agent_key(a) >= agent_key(agent_from) or a == old_agent
+    ]
+    assert (detail.agents_total, detail.blocks_total) == (AGENTS, BLOCKS)
+
+
+def test_a_windowed_detail_holds_the_kept_rows_whatever_their_close_time(
+    repo: Repository,
+) -> None:
+    # A block open and an agent running when the page loaded, below its boundaries, may
+    # close with a time before the page's (a sweep, a late hook): the page names them.
+    seeded(repo)
+    agents, blocks = all_rows(repo)
+    closed = [b for b in blocks if b.closed_at_ms is not None]
+    stopped = [a for a in agents if a.status == "stopped"]
+    block_from, agent_from = closed[-30], stopped[-30]
+    old_block, old_agent = closed[0], stopped[0]
+
+    detail = repo.get_session(
+        SESSION,
+        closed_limit=500,
+        blocks_from=block_from.block_id,
+        agents_from=agent_from.agent_id,
+        blocks_since_ms=LATE,
+        agents_since_ms=LATE,
+        keep_blocks=[old_block.block_id],
+        keep_agents=[old_agent.agent_id],
+    )
+
+    assert detail is not None
+    assert old_block in detail.blocks
+    assert old_agent in detail.agents
+    assert closed[1] not in detail.blocks
+    assert stopped[1] not in detail.agents
+
+
+def test_a_windowed_detail_keeps_the_latest_up_to_its_limit(repo: Repository) -> None:
+    seeded(repo)
+    agents, blocks = all_rows(repo)
+    closed = [b for b in blocks if b.closed_at_ms is not None]
+    stopped = [a for a in agents if a.status == "stopped"]
+
+    detail = repo.get_session(
+        SESSION,
+        closed_limit=10,
+        blocks_from=closed[-30].block_id,
+        agents_from=stopped[-30].agent_id,
+        blocks_since_ms=LATE,
+        agents_since_ms=LATE,
+    )
+
+    assert detail is not None
+    assert [b for b in detail.blocks if b.closed_at_ms is not None] == closed[-10:]
+    assert [a for a in detail.agents if a.status == "stopped"] == stopped[-10:]
+
+
+def test_a_window_without_a_start_time_holds_only_rows_from_its_boundary(
+    repo: Repository,
+) -> None:
+    seeded(repo)
+    _, blocks = all_rows(repo)
+    closed = [b for b in blocks if b.closed_at_ms is not None]
+
+    detail = repo.get_session(SESSION, closed_limit=500, blocks_from=closed[-30].block_id)
+
+    assert detail is not None
+    assert [b for b in detail.blocks if b.closed_at_ms is not None] == closed[-30:]
+
+
+def test_an_unknown_agent_boundary_holds_the_latest_stopped_agents(repo: Repository) -> None:
+    seeded(repo)
+    agents, _ = all_rows(repo)
+    stopped = [a for a in agents if a.status == "stopped"]
+
+    detail = repo.get_session(SESSION, agents_from="no-such-agent", agents_since_ms=LATE)
+
+    assert detail is not None
+    assert [a for a in detail.agents if a.status == "stopped"] == stopped[-DETAIL_CLOSED_LIMIT:]
+
+
+@pytest.mark.parametrize("limit", [1, 7, 50, 500])
+def test_block_pages_cover_every_block_once(repo: Repository, limit: int) -> None:
+    seeded(repo)
+    _, blocks = all_rows(repo)
+    pages: list[list[Block]] = []
+    page = repo.list_blocks(SESSION, limit)
+    while page:
+        assert len(page) <= limit
+        pages.append(page)
+        page = repo.list_blocks(SESSION, limit, before=page[0].block_id)
+
+    # The first page is the latest; each page is in block_id order and older than the last.
+    assert pages[0] == blocks[-limit:]
+    assert [b for p in reversed(pages) for b in p] == blocks
+    assert len(pages) == -(-BLOCKS // limit)
+
+
+def test_a_block_cursor_is_exclusive(repo: Repository) -> None:
+    seeded(repo)
+    _, blocks = all_rows(repo)
+    assert repo.list_blocks(SESSION, 3, before=blocks[100].block_id) == blocks[97:100]
+    assert repo.list_blocks(SESSION, 3, before=blocks[0].block_id) == []
+    assert repo.list_blocks(SESSION, 3, before=0) == []
+    assert repo.list_blocks("missing", 3) == []
+
+
+@pytest.mark.parametrize("limit", [1, 7, 50, 500])
+def test_agent_pages_cover_every_agent_once(repo: Repository, limit: int) -> None:
+    seeded(repo)
+    agents, _ = all_rows(repo)
+    pages: list[list[Agent]] = []
+    page = repo.list_agents(SESSION, limit)
+    while page is not None and page.agents:
+        assert len(page.agents) <= limit
+        assert page.parents == {a.agent_id: None for a in page.agents}
+        pages.append(page.agents)
+        page = repo.list_agents(SESSION, limit, before=page.agents[0].agent_id)
+
+    assert page is not None
+    assert pages[0] == agents[-limit:]
+    assert [a for p in reversed(pages) for a in p] == agents
+    assert len(pages) == -(-AGENTS // limit)
+
+
+def test_an_agent_cursor_is_exclusive_and_must_name_an_agent_of_the_session(
+    repo: Repository,
+) -> None:
+    seeded(repo)
+    agents, _ = all_rows(repo)
+    page = repo.list_agents(SESSION, 3, before=agents[100].agent_id)
+    assert page is not None
+    assert page.agents == agents[97:100]
+    first = repo.list_agents(SESSION, 3, before=agents[0].agent_id)
+    assert first is not None
+    assert first.agents == []
+    # Unknown, or an agent of another session: no position to page from.
+    assert repo.list_agents(SESSION, 3, before="a9999") is None
+    with repo.engine.begin() as connection:
+        connection.execute(
+            update(AgentModel)
+            .where(AgentModel.session_id == OTHER, AgentModel.agent_id == "a0001")
+            .values(agent_id="only-other")
+        )
+    assert repo.list_agents(SESSION, 3, before="only-other") is None
+
+
+def test_event_pages_before_and_after_a_seq(repo: Repository) -> None:
+    write = Writer(repo)
+    for index in range(30):
+        write(event("UserPromptSubmit", session_id=OTHER if index % 3 == 0 else SESSION), BASE)
+    mine = [row.seq for row in repo.list_events(SESSION, 500)]
+    assert len(mine) == 20
+
+    # Before: the limit events just below the cursor, in seq order.
+    assert [r.seq for r in repo.list_events(SESSION, 3, before_seq=mine[10])] == mine[7:10]
+    assert [r.seq for r in repo.list_events(SESSION, 3, before_seq=mine[0])] == []
+    # After: the limit events just above the cursor, in seq order.
+    assert [r.seq for r in repo.list_events(SESSION, 3, after_seq=mine[10])] == mine[11:14]
+    assert [r.seq for r in repo.list_events(SESSION, 3, after_seq=0)] == mine[:3]
+    assert [r.seq for r in repo.list_events(SESSION, 3, after_seq=mine[-1])] == []
+    # Paging back from the latest page, and tailing forward from nothing, cover each once.
+    back: list[int] = []
+    page = [r.seq for r in repo.list_events(SESSION, 7)]
+    while page:
+        back = page + back
+        page = [r.seq for r in repo.list_events(SESSION, 7, before_seq=page[0])]
+    forward: list[int] = []
+    cursor = 0
+    while page := [r.seq for r in repo.list_events(SESSION, 7, after_seq=cursor)]:
+        forward += page
+        cursor = page[-1]
+    assert back == forward == mine
+    with pytest.raises(ValueError, match="not both"):
+        repo.list_events(SESSION, 3, before_seq=5, after_seq=1)
+
+
+def test_launch_scopes_name_the_scope_of_each_launching_call(repo: Repository) -> None:
+    write = Writer(repo)
+    write(event("PreToolUse", tool_name="Agent", tool_use_id="t1"), BASE)
+    write(event("SubagentStart", agent_id="a1", agent_type="general-purpose"), BASE + 1)
+    write(event("PreToolUse", agent_id="a1", tool_name="Agent", tool_use_id="t2"), BASE + 2)
+    write(event("SubagentStart", agent_id="a2", agent_type="Explore"), BASE + 3)
+    # Its PostToolUse names the same call: only the PreToolUse counts as the launch.
+    write(event("PostToolUse", agent_id="a1", tool_name="Agent", tool_use_id="t2"), BASE + 4)
+    # A second PreToolUse row for t1, from another scope: the first row (lower seq) wins.
+    write(event("PreToolUse", agent_id="a1", tool_name="Agent", tool_use_id="t1"), BASE + 4)
+    # Never linked to a call.
+    write(event("SubagentStop", agent_id="internal"), BASE + 5)
+    write(event("PreToolUse", tool_name="Agent", tool_use_id="t9", session_id=OTHER), BASE + 6)
+    assert {a.agent_id: a.tool_use_id for a in write.agents.values()} == {
+        "a1": "t1",
+        "a2": "t2",
+        "internal": None,
+    }
+
+    assert repo.launch_scopes(SESSION, ["t1", "t2", "t9", "unknown"]) == {
+        "t1": None,
+        "t2": "a1",
+    }
+    assert repo.launch_scopes(SESSION, []) == {}
+    detail = repo.get_session(SESSION)
+    assert detail is not None
+    assert detail.parents == {"a1": None, "a2": "a1", "internal": None}
+    page = repo.list_agents(SESSION, 50)
+    assert page is not None
+    assert page.parents == detail.parents

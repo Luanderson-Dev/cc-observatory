@@ -1,0 +1,169 @@
+{#- The session page's rows and controls, shared by the page and its fragments. -#}
+
+{#- A past moment, ticking (app.js) from data-since-ms; its title is the local time. -#}
+{% macro moment(m, cls="") -%}
+<time{% if cls %} class="{{ cls }}"{% endif %} datetime="{{ m.iso }}" data-since-ms="{{ m.since_ms }}">{{ m.text }}</time>
+{%- endmacro %}
+
+{#- A block: what it waits on, then how long it has waited (open) or how it closed. -#}
+{% macro block_row(b) -%}
+<li class="block block--{{ 'open' if b.is_open else 'closed' }}" data-block-id="{{ b.block_id }}">
+  <span class="block__what">{{ b.what }}</span>
+  {% if b.scope %}<span class="block__scope">In subagent <code>{{ b.scope }}</code></span>{% endif %}
+  {% if b.is_open %}
+  <span class="block__elapsed"><span class="visually-hidden">Waiting for</span>{{ moment(b.opened, "block__wait") }}</span>
+  {% else %}
+  <span class="block__close">{{ b.close }}</span>
+  <span class="block__waited">Waited {{ b.waited }}</span>
+  <span class="block__when">Closed {{ moment(b.closed) }} ago</span>
+  {% endif %}
+</li>
+{%- endmacro %}
+
+{#- An agent of the tree, indented by its depth (a class per depth, no inline style). -#}
+{% macro agent_row(a) -%}
+<li class="agent agent--depth-{{ a.depth }}{% if a.running %} agent--running{% endif %}" data-agent-id="{{ a.agent_id }}">
+  <div class="agent__head">
+    <span class="agent__type">{% if a.agent_type %}{{ a.agent_type }}{% else %}<span class="agent__unknown">Unknown type</span>{% endif %}</span>
+    <code>{{ a.short_id }}</code>
+    {% if a.background %}<span class="agent__flag">Background</span>{% endif %}
+    {% if a.internal %}<span class="agent__flag">Internal</span>{% endif %}
+  </div>
+  <div class="agent__body">
+    <span class="agent__status">{{ a.status_text }}</span>
+    {% if a.running and a.started %}
+    <span class="agent__when">Started {{ moment(a.started) }} ago</span>
+    {% else %}
+    {% if a.ran %}<span class="agent__ran">Ran {{ a.ran }}</span>{% endif %}
+    {% if a.stopped %}<span class="agent__when">Stopped {{ moment(a.stopped) }} ago</span>{% endif %}
+    {% endif %}
+    {% if a.launched_by %}<span class="agent__parent">Launched by <code>{{ a.launched_by }}</code></span>{% endif %}
+  </div>
+</li>
+{%- endmacro %}
+
+{#- A hook event: its number, when it came, its name and its stored metadata. -#}
+{% macro event_row(e) -%}
+<li class="event" data-seq="{{ e.seq }}">
+  <span class="event__seq"><span class="visually-hidden">Event </span>{{ e.seq }}</span>
+  <code class="event__name">{{ e.name }}</code>
+  <span class="event__when">{{ moment(e.at) }} ago</span>
+  {% if e.details %}
+  <dl class="event__details">
+    {% for d in e.details %}
+    <div><dt>{{ d.label }}</dt><dd>{% if d.mono %}<code>{{ d.value }}</code>{% else %}{{ d.value }}{% endif %}</dd></div>
+    {% endfor %}
+  </dl>
+  {% endif %}
+</li>
+{%- endmacro %}
+
+{#- A "Show older" control: appends the next page to target; a fragment replaces it out
+    of band with the control for the page after, or with an empty one at the end. -#}
+{% macro more_control(id, more, target, label, oob=False) -%}
+<div id="{{ id }}" class="more"{% if oob %} hx-swap-oob="true"{% endif %}>
+{% if more.href %}
+  <button type="button" class="more__button" hx-get="{{ more.href }}" hx-target="{{ target }}" hx-swap="beforeend" hx-disabled-elt="this">{{ label }}</button>
+{% endif %}
+</div>
+{%- endmacro %}
+
+{#- The timeline's tail: on ccobs:changed (live updates) it fetches the events after its
+    cursor and replaces itself; "load" fetches at once when more than a page was new. A
+    trigger during a request replaces it (hx-sync), so the last change of a burst is
+    fetched; the cursor of the element that asked keeps the rows from repeating. -#}
+{% macro tail_element(tail) -%}
+<div id="timeline-tail" class="timeline__tail" hx-get="{{ tail.href }}" hx-trigger="{% if tail.now %}load, {% endif %}ccobs:changed from:body" hx-swap="outerHTML" hx-sync="this:replace"></div>
+{%- endmacro %}
+
+{#- The session header; out of band in the live fragment. -#}
+{% macro session_head(head, oob=False) -%}
+<header id="session-head" class="session-head strip--{{ head.status }}"{% if oob %} hx-swap-oob="true"{% endif %}>
+  <div class="session-head__title">
+    <h1 class="session-head__project">{% if head.project %}{{ head.project }}{% else %}<span class="strip__unknown">Unknown project</span>{% endif %}</h1>
+    <code class="session-head__short">{{ head.short_id }}</code>
+  </div>
+  {% if head.path %}<p class="session-head__path">{{ head.path }}</p>{% endif %}
+  <div class="session-head__status">
+    <span class="session-head__state">{{ head.state_label }}</span>
+    {% if head.doing %}<span class="session-head__doing">{{ head.doing }}</span>{% endif %}
+    {% if head.waiting %}<span class="session-head__elapsed"><span class="visually-hidden">Waiting for</span>{{ moment(head.waiting, "session-head__wait") }}</span>{% endif %}
+    {% if head.error_code %}<span class="session-head__error">Last error <code>{{ head.error_code }}</code></span>{% endif %}
+  </div>
+  <dl class="session-head__facts">
+    <div><dt>Started</dt><dd>{{ moment(head.started) }} ago</dd></div>
+    <div><dt>Last event</dt><dd>{{ moment(head.last_event) }} ago</dd></div>
+    {% if head.ended %}<div><dt>Ended</dt><dd>{{ moment(head.ended) }} ago</dd></div>{% endif %}
+    <div class="session-head__fact-id"><dt>Session ID</dt><dd><code class="session-head__id">{{ head.session_id }}</code></dd></div>
+  </dl>
+</header>
+{%- endmacro %}
+
+{#- The session's links to Grafana, each in a new tab: its events in Explore on Loki, its
+    tokens and cost in Explore on Prometheus, and the overview dashboard, over the
+    session's range. Outside the header, so the live refresh leaves them alone. -#}
+{% macro grafana_links(links) -%}
+<nav id="grafana-links" class="grafana-links" aria-labelledby="grafana-links-label">
+  <span class="grafana-links__label" id="grafana-links-label">Open in Grafana</span>
+  <a href="{{ links.logs }}" target="_blank" rel="noopener noreferrer">Logs</a>
+  <a href="{{ links.usage }}" target="_blank" rel="noopener noreferrer">Tokens and cost</a>
+  <a href="{{ links.dashboard }}" target="_blank" rel="noopener noreferrer">Dashboard</a>
+</nav>
+{%- endmacro %}
+
+{#- The blocks the live refresh replaces: the heading, every open block, and the closed
+    ones from the page's boundary up. Older pages go to #closed-blocks-older, outside. -#}
+{% macro blocks_region(blocks, oob=False) -%}
+<div id="blocks-live"{% if oob %} hx-swap-oob="true"{% endif %}>
+  <h2 class="session-section__title" id="blocks-heading">Blocks <span class="bay__count">{{ blocks.total }}</span></h2>
+  {% if blocks.open %}
+  <h3 class="session-section__subtitle">Waiting on you now</h3>
+  <ol id="open-blocks" class="blocks">
+  {% for b in blocks.open %}
+  {{ block_row(b) }}
+  {% endfor %}
+  </ol>
+  {% endif %}
+  {% if blocks.closed %}
+  <h3 class="session-section__subtitle">Closed, newest first</h3>
+  <ol id="closed-blocks" class="blocks">
+  {% for b in blocks.closed %}
+  {{ block_row(b) }}
+  {% endfor %}
+  </ol>
+  {% endif %}
+  {% if not blocks.open and not blocks.closed %}
+  <p class="session-section__empty">No blocks: this session never waited on you.</p>
+  {% endif %}
+</div>
+{%- endmacro %}
+
+{#- The agents the live refresh replaces: the heading and the tree of every running agent
+    and the stopped ones from the page's boundary up. Older pages go to #agents-older. -#}
+{% macro agents_region(agents, oob=False) -%}
+<div id="agents-live"{% if oob %} hx-swap-oob="true"{% endif %}>
+  <h2 class="session-section__title" id="agents-heading">Agents <span class="bay__count">{{ agents.total }}</span></h2>
+  {% if agents.rows %}
+  <p class="agents__root">Main thread</p>
+  <ol id="agents" class="agents">
+  {% for a in agents.rows %}
+  {{ agent_row(a) }}
+  {% endfor %}
+  </ol>
+  {% else %}
+  <p class="session-section__empty">No subagents ran in this session.</p>
+  {% endif %}
+</div>
+{%- endmacro %}
+
+{#- An older list, empty until a "Show older" page lands in it; out of band (emptied) when
+    the live refresh starts its window over. -#}
+{% macro older_list(id, cls, oob=False) -%}
+<ol id="{{ id }}" class="{{ cls }} {{ cls }}--older"{% if oob %} hx-swap-oob="true"{% endif %}></ol>
+{%- endmacro %}
+
+{#- The live refresh: on ccobs:changed it fetches the header, blocks and agents and
+    replaces itself; the URL keeps the page's boundaries and time (see ui.py). -#}
+{% macro live_element(live) -%}
+<div id="session-live" hidden hx-get="{{ live.href }}" hx-trigger="ccobs:changed from:body" hx-swap="outerHTML" hx-sync="this:replace"></div>
+{%- endmacro %}

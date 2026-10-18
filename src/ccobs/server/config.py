@@ -8,6 +8,7 @@ stops the app at start-up with a ``SettingsError`` that names every bad variable
 
 from __future__ import annotations
 
+import re
 from datetime import timedelta
 from pathlib import Path
 from typing import Final, Literal, Self
@@ -45,6 +46,11 @@ _BOUNDS: Final[dict[str, tuple[int, int]]] = {
 _MIN_RETENTION: Final = timedelta(days=1)
 _MAX_RETENTION: Final = timedelta(days=100 * 365)
 _MIN_STALE_AFTER: Final = timedelta(hours=1)
+# Grafana's only host name (ADR 0017), and the characters its URL may hold: unreserved
+# ones, ":" and "/" for the scheme, port and path, and "%" for an encoded path.
+_GRAFANA_HOST: Final = "localhost"
+_GRAFANA_URL_CHARACTERS: Final = re.compile(r"[A-Za-z0-9._~:/%-]+")
+_MAX_PORT: Final = 65535
 
 
 class SettingsError(ValueError):
@@ -91,6 +97,16 @@ class Settings(BaseSettings):
     # https, with a host and no credentials, query or fragment. Trailing slashes are
     # stripped, so that API paths are appended as f"{loki_url}/loki/api/v1/...".
     loki_url: str = "http://loki:3100"
+    # Prometheus's HTTP API on the compose network, for the session page's tokens and
+    # cost (ADR 0035): checked and stripped like loki_url, so that API paths are appended
+    # as f"{prometheus_url}/api/v1/...".
+    prometheus_url: str = "http://prometheus:9090"
+    # Grafana as the browser opens it, for the UI's links (ADR 0017): http or https on
+    # the host name localhost, since Grafana redirects every other one (127.0.0.1
+    # included) to its root URL, with an optional port and path and no user, query or
+    # fragment. Trailing slashes are stripped. compose derives it from
+    # CCOBS_GRAFANA_PORT, as Grafana's own root URL.
+    grafana_url: str = "http://localhost:4330"
     # Whether the app reads Claude Code's events back from Loki to complete hook data.
     telemetry_reconcile: bool = True
     log_level: Literal["debug", "info", "warning", "error"] = "info"
@@ -141,9 +157,9 @@ class Settings(BaseSettings):
             )
         return value
 
-    @field_validator("loki_url")
+    @field_validator("loki_url", "prometheus_url")
     @classmethod
-    def _check_loki_url(cls, value: str) -> str:
+    def _check_service_url(cls, value: str) -> str:
         # The value is never echoed: it may hold a password, and the error is logged.
         # Whitespace is checked first: urlsplit silently drops tabs and newlines.
         error = "must be an http or https URL with a host and no user, query or fragment"
@@ -158,6 +174,31 @@ class Settings(BaseSettings):
             _ = parts.port
         except ValueError:
             raise ValueError(error) from None
+        return value.rstrip("/")
+
+    @field_validator("grafana_url")
+    @classmethod
+    def _check_grafana_url(cls, value: str) -> str:
+        # Only URL characters that need no escaping in HTML, so the value is plain in an
+        # href; whitespace, quotes, "<", ">", "?", "#" and "@" are refused before
+        # urlsplit, which silently drops tabs and newlines.
+        error = (
+            "must be an http or https URL on localhost (ADR 0017: Grafana answers no other"
+            " host name), with no user, query or fragment"
+        )
+        if not _GRAFANA_URL_CHARACTERS.fullmatch(value):
+            raise ValueError(error)
+        parts = urlsplit(value)
+        if parts.scheme.lower() not in ("http", "https") or parts.hostname != _GRAFANA_HOST:
+            raise ValueError(error)
+        try:
+            port = parts.port
+        except ValueError:
+            raise ValueError(error) from None
+        # No port, or one from 1 to 65535: urlsplit reads "localhost:" as no port and
+        # accepts port 0.
+        if parts.netloc.endswith(":") or (port is not None and not 1 <= port <= _MAX_PORT):
+            raise ValueError(error)
         return value.rstrip("/")
 
     @field_validator(*_BOUNDS)

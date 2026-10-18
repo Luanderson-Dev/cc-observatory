@@ -2,20 +2,29 @@
 
 Settings come from ``CCOBS_*`` variables; invalid ones stop the app with exit code 2
 and one line per bad variable on stderr.
+
+The server is uvicorn's, with one change (``AppServer``): on shutdown it closes the live
+updates hub before uvicorn waits for open connections. uvicorn runs the lifespan's
+shutdown only after every connection has closed (or ``timeout_graceful_shutdown`` has
+run out and it cancels them), so a stream ended by the lifespan would hold every stop
+for the whole timeout (ADR 0032).
 """
 
 from __future__ import annotations
 
 import logging
+import socket
 import sys
+from collections.abc import Callable
 from typing import Final
 
 import uvicorn
+from fastapi import FastAPI
 
 from ccobs.server.app import create_app
 from ccobs.server.config import Settings, SettingsError, load_settings
 
-__all__ = ["configure_logging", "main"]
+__all__ = ["AppServer", "build_server", "configure_logging", "load_settings", "main"]
 
 _EXIT_BAD_SETTINGS: Final = 2
 _FORMAT: Final = "%(levelname)s:%(name)s: %(message)s"
@@ -42,16 +51,26 @@ def configure_logging(settings: Settings) -> None:
     logging.getLogger("sqlalchemy").setLevel(logging.WARNING)
 
 
-def main() -> None:
-    """Read the settings and serve the app until stopped."""
-    try:
-        settings = load_settings()
-    except SettingsError as error:
-        print(error, file=sys.stderr)
-        raise SystemExit(_EXIT_BAD_SETTINGS) from None
-    configure_logging(settings)
-    uvicorn.run(
-        create_app(settings),
+class AppServer(uvicorn.Server):
+    """uvicorn's server, which runs ``before_shutdown`` (on the event loop) before it
+    stops accepting connections and waits for the open ones."""
+
+    def __init__(self, config: uvicorn.Config, *, before_shutdown: Callable[[], None]) -> None:
+        super().__init__(config)
+        self._before_shutdown = before_shutdown
+
+    async def shutdown(self, sockets: list[socket.socket] | None = None) -> None:
+        self._before_shutdown()
+        await super().shutdown(sockets)
+
+
+def build_server(settings: Settings, app: FastAPI | None = None) -> AppServer:
+    """The server for ``app`` (``create_app(settings)`` by default), configured from the
+    settings, which closes the app's live updates hub first when it stops."""
+    if app is None:
+        app = create_app(settings)
+    config = uvicorn.Config(
+        app,
         host=settings.listen_host,
         port=settings.port,
         # One process: the hook queue and the writer live in it (ADR 0027).
@@ -66,12 +85,25 @@ def main() -> None:
         # RFC 9110 (section 6.6.1) asks an origin server with a clock for a Date header;
         # it reveals nothing.
         date_header=True,
-        # After SIGTERM, wait at most 5 s for open requests before the lifespan's
-        # shutdown (reconciler, sweeper and writer, 5 s each), so the whole stop stays
-        # well inside compose's 30 s stop_grace_period (ADR 0030). Without it uvicorn
-        # waits for every open connection, however long.
+        # After SIGTERM (and once AppServer has ended the live streams), wait at most 5 s
+        # for open requests before the lifespan's shutdown (reconciler, sweeper and
+        # writer, 5 s each), so the whole stop stays well inside compose's 30 s
+        # stop_grace_period (ADR 0030). Without it uvicorn waits for every open
+        # connection, however long.
         timeout_graceful_shutdown=5,
     )
+    return AppServer(config, before_shutdown=app.state.live.close)
+
+
+def main() -> None:
+    """Read the settings and serve the app until stopped."""
+    try:
+        settings = load_settings()
+    except SettingsError as error:
+        print(error, file=sys.stderr)
+        raise SystemExit(_EXIT_BAD_SETTINGS) from None
+    configure_logging(settings)
+    build_server(settings).run()
 
 
 if __name__ == "__main__":

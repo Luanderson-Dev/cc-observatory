@@ -23,7 +23,7 @@ from collections.abc import Iterator, Sequence
 from pathlib import Path
 from typing import Final
 
-import httpx
+import httpx2
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -46,7 +46,7 @@ from ccobs.server.ingest import (
     wall_clock_ms,
 )
 from ccobs.server.migrations import HEAD, upgrade_to_head
-from ccobs.server.writer import BlockClosedCallback, WriterCounts
+from ccobs.server.writer import WriterCounts, WriterObservers
 
 # The app without its metrics listener (only tests/server/test_metrics.py opens sockets)
 # and without its sweeper (tests/server/test_sweeps.py covers it).
@@ -107,9 +107,7 @@ class IdleWriter:
         )
 
 
-def idle_writer(
-    queue: HookQueue, repository: Repository, on_block_closed: BlockClosedCallback
-) -> IdleWriter:
+def idle_writer(queue: HookQueue, repository: Repository, observers: WriterObservers) -> IdleWriter:
     return IdleWriter()
 
 
@@ -142,7 +140,7 @@ def drain(queue: HookQueue) -> list[RawHook]:
     return items
 
 
-def assert_neutral(response: httpx.Response) -> None:
+def assert_neutral(response: httpx2.Response) -> None:
     assert response.status_code == 204
     assert response.content == b""
     assert "content-type" not in response.headers
@@ -778,7 +776,7 @@ def test_seq_skips_no_number_for_requests_dropped_before_the_queue(
 
 
 def _store_event(settings: Settings, seq: int) -> None:
-    engine = create_engine_for(settings.database_path)
+    engine = create_engine_for(settings.database_path, role="writer")
     try:
         upgrade_to_head(engine)
         repository = Repository(engine)
@@ -818,7 +816,7 @@ def test_seq_continues_after_a_restart(settings: Settings) -> None:
 
 def test_an_injected_repository_seeds_seq(settings: Settings, queue: HookQueue) -> None:
     _store_event(settings, 7)
-    engine = create_engine_for(settings.database_path)
+    engine = create_engine_for(settings.database_path, role="writer")
     try:
         with start(
             create_app(
@@ -846,7 +844,7 @@ def test_create_app_touches_no_database(settings: Settings) -> None:
 def test_the_lifespan_migrates_the_database_to_head(settings: Settings) -> None:
     with start(create_app(settings)) as client:
         assert client.get("/healthz").status_code == 200
-        engine = create_engine_for(settings.database_path)
+        engine = create_engine_for(settings.database_path, role="writer")
         try:
             with engine.connect() as connection:
                 version = connection.execute(text("SELECT version_num FROM alembic_version"))

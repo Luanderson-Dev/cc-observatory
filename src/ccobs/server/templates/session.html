@@ -1,0 +1,50 @@
+{% extends "base.html" %}
+{% from "_session.html" import event_row, more_control, tail_element, live_element, session_head, grafana_links, blocks_region, agents_region, older_list %}
+{% block title %}{% if not error and head.project %}{{ head.project }}{% else %}Session{% endif %} - cc-observatory{% endblock %}
+{% block content %}
+<p class="back-link"><a href="/">Overview</a></p>
+{% if error %}
+<h1 class="visually-hidden">Session</h1>
+{% include "_error.html" %}
+{% else %}
+{{ live_element(live) }}
+{{ session_head(head) }}
+{{ grafana_links(grafana) }}
+<div class="session-columns">
+  <div class="session-columns__side">
+    <section class="session-section" aria-labelledby="blocks-heading">
+      {{ blocks_region(blocks) }}
+      {{ older_list("closed-blocks-older", "blocks") }}
+      {{ more_control("blocks-more", blocks_more, "#closed-blocks-older", "Show older blocks") }}
+    </section>
+    {#- From Prometheus, on load and every minute (ui.py, "Tokens and cost"): not live. -#}
+    <section class="session-section" aria-labelledby="usage-heading">
+      <h2 class="session-section__title" id="usage-heading">Tokens and cost</h2>
+      <div id="usage" class="usage" hx-get="{{ usage_href }}" hx-trigger="load, every 60s" hx-swap="innerHTML">
+        <p class="session-section__empty">Loading tokens and cost…</p>
+      </div>
+      <p class="session-section__lede">From Claude Code's metrics in Prometheus, which can lag up to a minute behind the session.</p>
+    </section>
+    <section class="session-section" aria-labelledby="agents-heading">
+      {{ agents_region(agents) }}
+      {{ older_list("agents-older", "agents") }}
+      {{ more_control("agents-more", agents_more, "#agents-older", "Show older agents") }}
+    </section>
+  </div>
+  <section class="session-section session-columns__main" aria-labelledby="timeline-heading">
+    <h2 class="session-section__title" id="timeline-heading">Hook timeline</h2>
+    <p class="session-section__lede">Newest first. Metadata only: no prompts, tool inputs or outputs.</p>
+    {{ tail_element(tail) }}
+    <ol id="timeline" class="timeline">
+    {% for e in events %}
+    {{ event_row(e) }}
+    {% endfor %}
+    </ol>
+    {% if not events %}
+    <p id="timeline-empty" class="session-section__empty">No hook events stored for this session yet.</p>
+    {% endif %}
+    {{ more_control("events-more", events_more, "#timeline", "Show older events") }}
+  </section>
+</div>
+{% endif %}
+{% endblock %}

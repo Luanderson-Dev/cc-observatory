@@ -22,9 +22,11 @@ SERVER_PACKAGES = (
     "uvicorn",
     "sqlalchemy",
     "alembic",
+    "anyio",
     "pydantic-settings",
     "prometheus-client",
     "httpx",
+    "jinja2",
 )
 
 SERVER_MODULES = (
@@ -33,10 +35,13 @@ SERVER_MODULES = (
     "uvicorn",
     "sqlalchemy",
     "alembic",
+    "anyio",
     "pydantic",
     "pydantic_settings",
     "prometheus_client",
     "httpx",
+    "jinja2",
+    "markupsafe",
     "ccobs.server",
 )
 

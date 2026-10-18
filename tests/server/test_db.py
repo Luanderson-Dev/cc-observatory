@@ -10,6 +10,7 @@ import logging
 import shutil
 import subprocess
 import zipfile
+from collections.abc import Iterator
 from importlib import resources
 from pathlib import Path
 from typing import Any, Final
@@ -19,13 +20,19 @@ from alembic import command
 from alembic.autogenerate import compare_metadata
 from alembic.migration import MigrationContext
 from sqlalchemy import Engine, create_engine, inspect, text
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
+from sqlalchemy.pool import QueuePool
 
 from ccobs.domain.hooks import parse_hook
 from ccobs.domain.sessions import apply
 from ccobs.server import migrations
 from ccobs.server.db import engine as db_engine
-from ccobs.server.db.engine import BUSY_TIMEOUT_MS, create_engine_for, wal_enabled
+from ccobs.server.db.engine import (
+    BUSY_TIMEOUT_MS,
+    READER_POOL_SIZE,
+    create_engine_for,
+    wal_enabled,
+)
 from ccobs.server.db.models import Base
 from ccobs.server.db.repository import Repository, hook_event_row
 from ccobs.server.migrations import HEAD, MigrationError, alembic_config, upgrade_to_head
@@ -155,7 +162,14 @@ CONTENT_METADATA: Final = frozenset(
 
 @pytest.fixture
 def engine(tmp_path: Path) -> Engine:
-    return create_engine_for(tmp_path / "ccobs.db")
+    return create_engine_for(tmp_path / "ccobs.db", role="writer")
+
+
+@pytest.fixture
+def reader(tmp_path: Path) -> Iterator[Engine]:
+    engine = create_engine_for(tmp_path / "ccobs.db", role="reader")
+    yield engine
+    engine.dispose()
 
 
 @pytest.fixture
@@ -174,7 +188,7 @@ def _pragma(engine: Engine, name: str) -> object:
 
 def test_the_engine_creates_the_parent_directory(tmp_path: Path) -> None:
     path = tmp_path / "nested" / "data" / "ccobs.db"
-    engine = create_engine_for(path)
+    engine = create_engine_for(path, role="writer")
     with engine.connect() as connection:
         connection.execute(text("SELECT 1"))
     assert path.is_file()
@@ -211,7 +225,7 @@ def test_a_journal_mode_other_than_wal_warns_without_the_path(
 ) -> None:
     # Where WAL cannot work, SQLite answers with another mode; DELETE stands in for it.
     monkeypatch.setattr(db_engine, "_JOURNAL_MODE", "PRAGMA journal_mode=DELETE")
-    engine = create_engine_for(tmp_path / "ccobs.db")
+    engine = create_engine_for(tmp_path / "ccobs.db", role="writer")
     with caplog.at_level(logging.WARNING, logger="ccobs.server.db.engine"):
         assert not wal_enabled(engine)
     (record,) = caplog.records
@@ -231,17 +245,80 @@ def test_ddl_rolls_back_with_its_transaction(engine: Engine) -> None:
     assert "scratch" not in inspect(engine).get_table_names()
 
 
-def test_a_read_transaction_sees_one_snapshot(engine: Engine) -> None:
+def test_a_read_transaction_sees_one_snapshot(engine: Engine, reader: Engine) -> None:
     with engine.begin() as connection:
         connection.execute(text("CREATE TABLE scratch (x INTEGER)"))
-    with engine.connect() as reader:
-        before = reader.execute(text("SELECT count(*) FROM scratch")).scalar_one()
+    with reader.connect() as reading:
+        before = reading.execute(text("SELECT count(*) FROM scratch")).scalar_one()
         with engine.begin() as writer:
             writer.execute(text("INSERT INTO scratch VALUES (1)"))
-        during = reader.execute(text("SELECT count(*) FROM scratch")).scalar_one()
-    with engine.connect() as reader:
-        after = reader.execute(text("SELECT count(*) FROM scratch")).scalar_one()
+        during = reading.execute(text("SELECT count(*) FROM scratch")).scalar_one()
+    with reader.connect() as reading:
+        after = reading.execute(text("SELECT count(*) FROM scratch")).scalar_one()
     assert (before, during, after) == (0, 0, 1)
+
+
+# Roles (ADR 0033): the writer's engine and the readers' engine.
+
+
+def test_the_writer_engine_holds_one_connection(engine: Engine) -> None:
+    pool = engine.pool
+    assert isinstance(pool, QueuePool)
+    assert (pool.size(), pool._max_overflow) == (1, 0)
+
+
+def test_the_reader_engine_holds_four_connections(reader: Engine) -> None:
+    pool = reader.pool
+    assert isinstance(pool, QueuePool)
+    assert (pool.size(), pool._max_overflow) == (READER_POOL_SIZE, 0)
+    assert READER_POOL_SIZE == 4
+
+
+def test_the_reader_engine_sets_the_same_pragmas_and_query_only(
+    engine: Engine, reader: Engine
+) -> None:
+    assert _pragma(reader, "journal_mode") == "wal"
+    assert _pragma(reader, "foreign_keys") == 1
+    assert _pragma(reader, "busy_timeout") == BUSY_TIMEOUT_MS
+    assert _pragma(reader, "synchronous") == 1
+    assert _pragma(reader, "query_only") == 1
+    assert _pragma(engine, "query_only") == 0
+    reader.dispose()
+    # On every new connection, not once.
+    assert _pragma(reader, "query_only") == 1
+    assert wal_enabled(reader)
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "INSERT INTO scratch VALUES ('b')",
+        "UPDATE scratch SET x = 'c'",
+        "DELETE FROM scratch",
+        "CREATE TABLE other (y INTEGER)",
+        "DROP TABLE scratch",
+    ],
+)
+def test_a_reader_connection_cannot_write(engine: Engine, reader: Engine, statement: str) -> None:
+    with engine.begin() as connection:
+        connection.execute(text("CREATE TABLE scratch (x TEXT)"))
+        connection.execute(text("INSERT INTO scratch VALUES ('a')"))
+
+    with pytest.raises(OperationalError, match="readonly"), reader.begin() as connection:
+        connection.execute(text(statement))
+
+    with engine.connect() as connection:
+        assert connection.execute(text("SELECT x FROM scratch")).scalars().all() == ["a"]
+
+
+def test_the_reader_keeps_transactions_and_hidden_parameters(reader: Engine) -> None:
+    raw = reader.raw_connection()
+    try:
+        assert raw.driver_connection is not None
+        assert raw.driver_connection.isolation_level is None
+    finally:
+        raw.close()
+    assert reader.hide_parameters
 
 
 def test_errors_never_show_bound_values(engine: Engine) -> None:

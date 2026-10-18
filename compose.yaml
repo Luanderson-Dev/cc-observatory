@@ -340,6 +340,12 @@ services:
       # denied with Esc (ADR 0029).
       CCOBS_TELEMETRY_RECONCILE: ${CCOBS_TELEMETRY_RECONCILE:-true}
       CCOBS_LOKI_URL: ${CCOBS_LOKI_URL:-http://loki:3100}
+      # Prometheus's HTTP API, for the session page's tokens and cost (ADR 0035).
+      CCOBS_PROMETHEUS_URL: ${CCOBS_PROMETHEUS_URL:-http://prometheus:9090}
+      # Grafana as the browser opens it, for the UI's links: Grafana's root URL (above),
+      # the one it never redirects (ADR 0017), so it follows CCOBS_GRAFANA_PORT and is
+      # not a setting of its own.
+      CCOBS_GRAFANA_URL: http://localhost:${CCOBS_GRAFANA_PORT:-4330}
       CCOBS_LOG_LEVEL: ${CCOBS_LOG_LEVEL:-info}
       # The hook queue and body limits (ADR 0027); advanced settings.
       CCOBS_HOOK_QUEUE_MAX_ITEMS: ${CCOBS_HOOK_QUEUE_MAX_ITEMS:-10000}
@@ -364,7 +370,9 @@ services:
       - edge
     # No depends_on: the hook route must accept events from the first second, and Loki
     # serves only the reconciler, which retries on its next poll while Loki is down or
-    # still starting (ADR 0029). The collector starts the same way.
+    # still starting (ADR 0029). Prometheus serves only the session page's tokens and
+    # cost, which say so while it is down and refresh every minute (ADR 0035). The
+    # collector starts the same way.
 
 volumes:
   prometheus-data: {}

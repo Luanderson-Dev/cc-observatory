@@ -13,3 +13,9 @@ indent_size = 2
 
 [*.md]
 trim_trailing_whitespace = false
+
+# Vendored files and licence texts keep their published bytes (VENDOR.json checksums).
+[src/ccobs/server/static/{vendor,licenses}/**]
+end_of_line = unset
+insert_final_newline = unset
+trim_trailing_whitespace = unset

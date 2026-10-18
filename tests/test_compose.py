@@ -844,6 +844,10 @@ APP_IMAGE: Final = "cc-observatory-app:local"
 APP_FIXED_VARIABLES: Final = frozenset(
     {"CCOBS_LISTEN_HOST", "CCOBS_PORT", "CCOBS_METRICS_PORT", "CCOBS_DATA_DIR"}
 )
+# The app's settings that compose derives from another variable instead of passing
+# through: Grafana's URL is Grafana's root URL (ADR 0017), from CCOBS_GRAFANA_PORT, since
+# Grafana redirects every other URL there, so .env does not offer it.
+APP_DERIVED_VARIABLES: Final = {"CCOBS_GRAFANA_URL": "http://localhost:${CCOBS_GRAFANA_PORT:-4330}"}
 APP_HEALTHCHECK: Final = [
     "CMD",
     "python",
@@ -924,15 +928,25 @@ def test_app_starts_without_waiting_for_loki() -> None:
 
 def test_app_environment_passes_every_setting_but_the_fixed_ones() -> None:
     variables = set(_settings_variables().values())
-    assert variables >= APP_FIXED_VARIABLES
-    expected = {name: f"${{{name}:-" for name in variables - APP_FIXED_VARIABLES}
+    assert variables >= APP_FIXED_VARIABLES | set(APP_DERIVED_VARIABLES)
+    passed = variables - APP_FIXED_VARIABLES - set(APP_DERIVED_VARIABLES)
+    expected = {name: f"${{{name}:-" for name in passed}
     environment = _environment(_app())
-    assert set(environment) == set(expected)
+    assert set(environment) == set(expected) | set(APP_DERIVED_VARIABLES)
     for name, prefix in expected.items():
         assert environment[name].startswith(prefix), f"{name}: {environment[name]}"
+    for name, value in APP_DERIVED_VARIABLES.items():
+        assert environment[name] == value, f"{name}: {environment[name]}"
     assigned = _env_example()
-    for name in APP_FIXED_VARIABLES:
+    for name in APP_FIXED_VARIABLES | set(APP_DERIVED_VARIABLES):
         assert name not in assigned, f".env.example must not offer {name}: compose ignores it"
+
+
+def test_app_links_to_grafanas_root_url() -> None:
+    # The UI's Grafana links start at Grafana's root URL, the one URL Grafana does not
+    # redirect (ADR 0017), through the same port variable and default.
+    root_url = _environment(_services(COMPOSE)["grafana"])["GF_SERVER_ROOT_URL"]
+    assert _environment(_app())["CCOBS_GRAFANA_URL"] == root_url.removesuffix("/")
 
 
 def test_app_compose_defaults_are_the_settings_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -943,11 +957,14 @@ def test_app_compose_defaults_are_the_settings_defaults(monkeypatch: pytest.Monk
     defaults = Settings().model_dump()
     environment = _environment(_app())
     for name, value in environment.items():
-        interpolation = INTERPOLATION.fullmatch(value)
-        assert interpolation, f"{name}: {value}"
-        match = WITH_DEFAULT.fullmatch(interpolation["inner"])
-        assert match, f"{name}: {value}"
-        monkeypatch.setenv(name, match["default"])
+        assert INTERPOLATION.search(value), f"{name}: {value}"
+
+        def default(interpolation: re.Match[str], name: str = name) -> str:
+            match = WITH_DEFAULT.fullmatch(interpolation["inner"])
+            assert match, f"{name}: {interpolation[0]}"
+            return match["default"]
+
+        monkeypatch.setenv(name, INTERPOLATION.sub(default, value))
     assert Settings().model_dump() == defaults
 
 

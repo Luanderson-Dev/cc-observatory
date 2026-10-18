@@ -1,0 +1,9 @@
+{% extends "base.html" %}
+{% block title %}Session not found - cc-observatory{% endblock %}
+{% block content %}
+<div class="error-state not-found">
+  <h1>{{ error.title }}</h1>
+  <p>{{ error.detail }}</p>
+  <p class="not-found__links"><a href="/">Overview</a> <a href="/sessions">All sessions</a></p>
+</div>
+{% endblock %}

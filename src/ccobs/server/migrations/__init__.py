@@ -54,7 +54,7 @@ def upgrade_to_head(engine: Engine) -> None:
     database = engine.url.database
     if not database or database == ":memory:":
         raise ValueError("migrations need a database file")
-    migration_engine = create_engine_for(Path(database), foreign_keys=False)
+    migration_engine = create_engine_for(Path(database), role="writer", foreign_keys=False)
     try:
         with migration_engine.begin() as connection:
             command.upgrade(alembic_config(connection), "head")

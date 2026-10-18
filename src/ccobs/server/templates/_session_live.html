@@ -1,0 +1,17 @@
+{#- The session page's live refresh (ADR 0032): a new live element in place of the one
+    that asked, and the header, blocks and agents out of band. The older lists and their
+    "Show older" controls are replaced (emptied, with a pager from the new boundary) only
+    when a window grew past its cap and starts over. -#}
+{% from "_session.html" import live_element, session_head, blocks_region, agents_region, older_list, more_control %}
+{{ live_element(live) }}
+{{ session_head(head, oob=True) }}
+{{ blocks_region(blocks, oob=True) }}
+{{ agents_region(agents, oob=True) }}
+{% if blocks_more %}
+{{ older_list("closed-blocks-older", "blocks", oob=True) }}
+{{ more_control("blocks-more", blocks_more, "#closed-blocks-older", "Show older blocks", oob=True) }}
+{% endif %}
+{% if agents_more %}
+{{ older_list("agents-older", "agents", oob=True) }}
+{{ more_control("agents-more", agents_more, "#agents-older", "Show older agents", oob=True) }}
+{% endif %}

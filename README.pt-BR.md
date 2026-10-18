@@ -43,30 +43,37 @@ bloqueios e eventos ao vivo. O plano completo está no roteiro mais abaixo.
 
 Salvo indicação em contrário, o restante deste README descreve o projeto planejado.
 
-## O que ele vai mostrar
+## O que ele mostra
 
-Entre parênteses está a release que traz cada parte. Só a parte do Grafana chega com a
-v0.2.0 (veja "Como rodar a stack de observabilidade" mais abaixo); o resto está
-planejado.
+Entre parênteses está a release que traz cada parte. As partes até a v0.4.0 rodam a
+partir de um clone deste repositório (veja "Como rodar a stack de observabilidade" e
+"Experimente o app" mais abaixo); o resto está planejado.
 
-- **Visão geral ao vivo** das sessões do Claude Code na sua máquina: quais estão
-  trabalhando, esperando por você, ociosas ou encerradas (v0.4.0).
-- **Árvore de agentes**: o agente principal de cada sessão e os subagentes que ele
-  iniciou (v0.4.0).
+- **Visão geral ao vivo** das sessões do Claude Code na sua máquina, em uma interface
+  web em <http://127.0.0.1:4300>: primeiro as sessões esperando por você, com há quanto
+  tempo cada uma espera, depois as que estão trabalhando, ociosas, encerradas há pouco
+  ou paradas (`stale`). Ela se atualiza enquanto o Claude Code trabalha, sem recarregar
+  a página (v0.4.0).
 - **Bloqueios**: sessões esperando por você, como um pedido de permissão ou uma
-  elicitação de um servidor MCP, e há quanto tempo cada uma está esperando (registrados
-  a partir da v0.3.0 e exibidos na interface web a partir da v0.4.0).
-- **Eventos e logs** de cada sessão (v0.4.0).
-- **Tokens e custo** (v0.4.0) por dia, modelo e tipo de agente (com os nomes dos agentes
-  embutidos; os seus próprios agentes aparecem como `custom`, a menos que você ative os
-  detalhes de ferramentas) e por projeto (cruzado com o diretório de trabalho que os
-  hooks informam). O custo é uma estimativa que vem da telemetria do Claude Code, não o
-  valor que você paga.
-- **Página de saúde**: se cada parte da stack está no ar e recebendo dados (v0.4.0).
+  elicitação de um servidor MCP, com há quanto tempo cada uma está esperando e como
+  terminou (registrados a partir da v0.3.0 e exibidos na interface web a partir da
+  v0.4.0).
+- **Uma página por sessão** (v0.4.0) com os bloqueios dela, a **árvore de agentes** (os
+  subagentes, cada um sob o agente que o iniciou), os **tokens e o custo** (tokens por
+  tipo, tokens e custo por modelo) e a **linha do tempo dos hooks**, só com metadados.
+- **Eventos e logs** de cada sessão: a linha do tempo dos hooks na página dela e um link
+  para os eventos do Claude Code dela no Grafana (v0.4.0).
+- **Tokens e custo**: por sessão, na página dela (v0.4.0), e somando as sessões, por dia
+  e modelo, no dashboard de visão geral do Grafana (v0.2.0); por tipo de agente (com os
+  nomes dos agentes embutidos; os seus próprios agentes aparecem como `custom`, a menos
+  que você ative os detalhes de ferramentas) e por projeto (cruzado com o diretório de
+  trabalho que os hooks informam) estão planejados para a v0.7.0. O custo é uma estimativa que vem da
+  telemetria do Claude Code, não o valor que você paga.
+- **Página de saúde**: se cada parte da stack está no ar e recebendo dados (planejada, v0.7.0).
 - **Grafana** para análises mais profundas, provisionado com as fontes de dados e um
-  dashboard de visão geral do Claude Code (v0.2.0) e, mais tarde, com dashboards que o
-  app abre por links já filtrados pela sessão, agente ou projeto que você estava vendo
-  (v0.7.0).
+  dashboard de visão geral do Claude Code (v0.2.0); a página de cada sessão leva aos
+  logs, tokens e custo dela lá (v0.4.0) e, mais tarde, dashboards vão abrir já filtrados
+  pelo agente ou projeto que você estava vendo (v0.7.0).
 - **Alertas** (v0.6.0): notificações no navegador e, opcionalmente, um webhook do Discord
   quando uma sessão espera por você além de um limite de tempo, quando erros de API se
   repetem ou quando o custo estimado de uma sessão ou de um dia passa de um limite. Você
@@ -95,8 +102,10 @@ Grafana ◄── Prometheus, Loki, Tempo (provisioned datasources and dashboard
   agentes, bloqueios e alertas no SQLite.
 - **Estado ao vivo como métricas.** O app expõe esse estado ao vivo em `/metrics`, que o
   Prometheus coleta, para que ele apareça nos gráficos ao lado da telemetria.
-- **O app** também consulta o Prometheus e o Loki via HTTP para as telas de tokens, custo
-  e eventos.
+- **A interface web.** O app serve as próprias páginas, que acompanham as sessões ao
+  vivo por server-sent events, e lê os tokens e o custo de cada sessão no Prometheus.
+  Ele também fecha os pedidos de permissão negados com Esc a partir dos eventos do
+  Claude Code no Loki.
 - **O Grafana** já vem provisionado com as fontes de dados do Prometheus, do Loki e do
   Tempo e com os dashboards.
 - **Por que as duas fontes:** a telemetria diz o que uma sessão consumiu (tokens, custo,
@@ -112,8 +121,8 @@ de decisão de arquitetura em [docs/adr/](docs/adr/README.md) (em inglês).
 A partir da v0.2.0 você pode rodar a stack de observabilidade com um clone deste
 repositório e ver as métricas e os eventos do Claude Code no Grafana. A partir da v0.3.0
 a stack também roda o app (hooks, sessões e bloqueios; veja "Experimente o app" mais
-abaixo). A interface web dele chega na v0.4.0 e o `ccobs setup` na v0.5.0; até lá, você
-aponta o Claude Code para a stack manualmente.
+abaixo) e, a partir da v0.4.0, a interface web dele. O `ccobs setup` chega na v0.5.0;
+até lá, você aponta o Claude Code para a stack manualmente.
 
 1. Suba a stack:
 
@@ -186,13 +195,13 @@ aponta o Claude Code para a stack manualmente.
 - **Mais.** O [docs/stack.md](docs/stack.md) (em inglês) cobre como parar e atualizar a
   stack, as configurações, os dados e a retenção, a memória e a solução de problemas.
 
-## Experimente o app (a partir da v0.3.0)
+## Experimente o app (a partir da v0.3.0, interface web a partir da v0.4.0)
 
 A partir da v0.3.0, o `docker compose up -d` também faz o build da imagem do app a
 partir do seu clone e o inicia em <http://127.0.0.1:4300>. O app recebe os hooks do
-Claude Code e acompanha sessões, agentes e bloqueios no SQLite. A interface web dele
-chega na v0.4.0; até lá, você pode ver o que ele acompanha pela API JSON somente
-leitura.
+Claude Code e acompanha sessões, agentes e bloqueios no SQLite. A partir da v0.4.0 ele
+os mostra em uma interface web nesse endereço; ele também os serve por uma API JSON
+somente leitura.
 
 1. Suba ou atualize a stack como acima. O `docker compose ps` mostra o `app` como
    saudável assim que ele passa a atender requisições.
@@ -210,7 +219,12 @@ leitura.
    O seu `~/.claude/settings.json` continua como está, e só as sessões que você iniciar
    assim enviam hooks. A URL dos hooks usa `127.0.0.1`, não `localhost`.
 
-3. Veja as sessões:
+3. Abra <http://127.0.0.1:4300> no navegador. A visão geral mostra as suas sessões em
+   faixas por estado, primeiro as que esperam por você, e as acompanha ao vivo; clique
+   numa sessão para ver os bloqueios, os agentes, os tokens e o custo e a linha do tempo
+   dos hooks dela, e os links para os logs e o uso dela no Grafana. Até a primeira
+   sessão chegar, a visão geral mostra as configurações de hooks do passo 2. Os mesmos
+   dados estão na API JSON:
 
    ~~~bash
    curl -s http://127.0.0.1:4300/api/v1/sessions
@@ -223,11 +237,13 @@ leitura.
 - **Stack fora do ar.** Enquanto a stack estiver fora do ar, as sessões iniciadas com
   esses hooks mostram na transcrição um aviso de erro de hook na maioria dos eventos de
   hook; inicie o Claude Code sem `--settings` até a stack voltar.
-- **Negações com Esc.** Um pedido de permissão negado com Esc não dispara nenhum hook; o
-  app o fecha a partir dos eventos do Claude Code no Loki, então mantenha as
-  configurações de telemetria do passo 3 da seção anterior.
-- **Mais.** O [docs/app.md](docs/app.md) (em inglês) cobre a API, as métricas do app no
-  Grafana, as configurações e a retenção dele, a privacidade e a solução de problemas.
+- **Negações com Esc, tokens e custo.** Um pedido de permissão negado com Esc não
+  dispara nenhum hook; o app o fecha a partir dos eventos do Claude Code no Loki. Os
+  tokens e o custo de uma sessão vêm das métricas do Claude Code no Prometheus. Os dois
+  precisam das configurações de telemetria do passo 3 da seção anterior.
+- **Mais.** O [docs/app.md](docs/app.md) (em inglês) cobre a interface web, a API, as
+  métricas do app no Grafana, as configurações e a retenção dele, a privacidade e a
+  solução de problemas.
 
 ## Início rápido (planejado, disponível a partir da v0.5.0)
 
@@ -278,6 +294,11 @@ instalá-la.
   desligados. Durante o uso, nada sai da sua máquina, exceto o webhook opcional do
   Discord, se você configurar um, e as consultas de DNS pelo nome de um armazenamento
   enquanto ele estiver parado (veja o [SECURITY.md](SECURITY.md)).
+- **A interface web** (a partir da v0.4.0) também não tem login, não carrega nada da
+  internet e não muda nada. Ela mostra o diretório de trabalho só como o nome do
+  projeto, ou com o seu diretório pessoal como `~`, e recusa as requisições que outras
+  páginas web fazem pelo seu navegador (um link para ela continua só abrindo a
+  página).
 - **O Grafana não tem login.** Quem o abre é um Editor, que pode consultar os dados e
   salvar dashboards, mas não pode mudar as fontes de dados, os plugins, os usuários nem
   as configurações dele. Ele só responde como `localhost`, o que impede outras páginas

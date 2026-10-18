@@ -1,0 +1,46 @@
+{
+  "description": "Third-party files served by the app, copied unmodified from their source (ADR 0031). Update a file, its entry and its sha256 together; tests/server/test_static.py checks them.",
+  "files": [
+    {
+      "path": "vendor/htmx-2.0.11.min.js",
+      "name": "htmx",
+      "version": "2.0.11",
+      "source": "https://registry.npmjs.org/htmx.org/-/htmx.org-2.0.11.tgz",
+      "source_integrity": "sha512-Thx/WtpeOQqSrqBCw/A1cwGJGg4UrVa3+sW0GmrM3p4gJgO89ecH4qtbnyzDDWFvBTqjnIMCgELTNt636dtamA==",
+      "source_path": "package/dist/htmx.min.js",
+      "sha256": "d6fdc75f204e6bdefa99b69bf1e6d4ac69b8a364f77929f45c13476b4000f717",
+      "license": "0BSD",
+      "license_file": "licenses/htmx-LICENSE.txt"
+    },
+    {
+      "path": "fonts/atkinson-hyperlegible-next-wght.woff2",
+      "name": "Atkinson Hyperlegible Next (variable, upright)",
+      "version": "2.001 (googlefonts/atkinson-hyperlegible-next@7925f50f649b3813257faf2f4c0b381011f434f1)",
+      "source": "https://raw.githubusercontent.com/googlefonts/atkinson-hyperlegible-next/7925f50f649b3813257faf2f4c0b381011f434f1/fonts/webfonts/AtkinsonHyperlegibleNext%5Bwght%5D.woff2",
+      "source_path": "fonts/webfonts/AtkinsonHyperlegibleNext[wght].woff2",
+      "sha256": "abde1ad5cf78b9ac575ef90d991f2e9101eb0b3b6668bde9a00e2e1e27d99afd",
+      "license": "OFL-1.1",
+      "license_file": "licenses/atkinson-hyperlegible-next-OFL.txt"
+    },
+    {
+      "path": "fonts/atkinson-hyperlegible-next-italic-wght.woff2",
+      "name": "Atkinson Hyperlegible Next (variable, italic)",
+      "version": "2.001 (googlefonts/atkinson-hyperlegible-next@7925f50f649b3813257faf2f4c0b381011f434f1)",
+      "source": "https://raw.githubusercontent.com/googlefonts/atkinson-hyperlegible-next/7925f50f649b3813257faf2f4c0b381011f434f1/fonts/webfonts/AtkinsonHyperlegibleNext-Italic%5Bwght%5D.woff2",
+      "source_path": "fonts/webfonts/AtkinsonHyperlegibleNext-Italic[wght].woff2",
+      "sha256": "34491c5a87f711d314637962f69267d28c7df3ed498082c990cdfbbc02ebf3f2",
+      "license": "OFL-1.1",
+      "license_file": "licenses/atkinson-hyperlegible-next-OFL.txt"
+    },
+    {
+      "path": "fonts/atkinson-hyperlegible-mono-wght.woff2",
+      "name": "Atkinson Hyperlegible Mono (variable, upright)",
+      "version": "2.001 (googlefonts/atkinson-hyperlegible-next-mono@154d50362016cc3e873eb21d242cd0772384c8f9)",
+      "source": "https://raw.githubusercontent.com/googlefonts/atkinson-hyperlegible-next-mono/154d50362016cc3e873eb21d242cd0772384c8f9/fonts/webfonts/AtkinsonHyperlegibleMono%5Bwght%5D.woff2",
+      "source_path": "fonts/webfonts/AtkinsonHyperlegibleMono[wght].woff2",
+      "sha256": "4cf41c5cacdb2e98311929f3a482e95b2299ca34e6f389e8968a9075e355d58a",
+      "license": "OFL-1.1",
+      "license_file": "licenses/atkinson-hyperlegible-mono-OFL.txt"
+    }
+  ]
+}

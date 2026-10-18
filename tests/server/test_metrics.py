@@ -50,10 +50,14 @@ from ccobs.domain.app_metrics import (
     LOKI_RESULTS,
     METRICS_PATH,
     OTHER_EVENT,
+    PROMETHEUS_QUERIES,
+    PROMETHEUS_RESULTS,
     RECEIVED_EVENTS,
     SESSION_STATES,
     SESSIONS,
     SESSIONS_ENDED,
+    UI_STREAMS,
+    UI_STREAMS_REFUSED,
     AppMetric,
 )
 from ccobs.domain.denials import OpenBlock
@@ -70,7 +74,7 @@ from ccobs.server.metrics import (
     MetricsListener,
     address_family,
 )
-from ccobs.server.writer import BlockClosedCallback, Writer, WriterCounts
+from ccobs.server.writer import Writer, WriterCounts, WriterObservers
 
 # The app without its sweeper and reconciler: tests/server/test_sweeps.py and
 # tests/server/test_reconcile.py cover them.
@@ -128,16 +132,15 @@ class ManualWriter(Writer):
         pass
 
 
-def manual(
-    queue: HookQueue, repository: Repository, on_block_closed: BlockClosedCallback
-) -> ManualWriter:
+def manual(queue: HookQueue, repository: Repository, observers: WriterObservers) -> ManualWriter:
     return ManualWriter(
         queue,
         repository,
         HOST,
         stale_after_ms=12 * HOUR_MS,
         batch_wait_s=0,
-        on_block_closed=on_block_closed,
+        on_block_closed=observers.on_block_closed,
+        on_committed=observers.on_committed,
     )
 
 
@@ -252,8 +255,9 @@ def test_the_exposition_has_exactly_the_documented_series(client: TestClient) ->
 
     assert types == {metric.name: metric.type for metric in APP_METRICS}
     assert "_created" not in text
-    # The fixed total of ADR 0028, plus the two Loki query series of ADR 0029.
-    assert sum(len(found) for found in samples.values()) == 65
+    # The fixed total of ADR 0028, plus the two Loki query series of ADR 0029, the two
+    # live stream series of ADR 0032 and the four Prometheus query series of ADR 0035.
+    assert sum(len(found) for found in samples.values()) == 71
     for metric in APP_METRICS:
         assert samples[metric.name], metric.name
         for sample in samples[metric.name]:
@@ -271,12 +275,15 @@ def test_states_kinds_reasons_and_events_are_exported_with_zeros(client: TestCli
     assert by_label(samples, HOOK_EVENTS_DROPPED, "reason") == dict.fromkeys(DROP_REASONS, 0)
     assert by_label(samples, HOOK_EVENTS_RECEIVED, "event") == dict.fromkeys(EVENT_LABELS, 0)
     assert by_label(samples, LOKI_QUERIES, "result") == dict.fromkeys(LOKI_RESULTS, 0)
+    assert by_label(samples, PROMETHEUS_QUERIES, "result") == dict.fromkeys(PROMETHEUS_RESULTS, 0)
     for metric in (
         AGENTS_RUNNING,
         SESSIONS_ENDED,
         HOOK_EVENTS_PROCESSED,
         HOOK_QUEUE_DEPTH,
         HOOK_QUEUE_BYTES,
+        UI_STREAMS,
+        UI_STREAMS_REFUSED,
     ):
         assert single(samples, metric) == 0, metric.name
     histogram = samples[BLOCK_DURATION.name]
@@ -549,9 +556,7 @@ def test_the_listener_stops_before_the_writer(settings: Settings, queue: HookQue
                 sessions_ended=0,
             )
 
-    def factory(
-        hooks: HookQueue, repository: Repository, on_block_closed: BlockClosedCallback
-    ) -> Recorder:
+    def factory(hooks: HookQueue, repository: Repository, observers: WriterObservers) -> Recorder:
         return Recorder()
 
     app = create_app(settings, queue=queue, writer_factory=factory, metrics_port=0)
@@ -755,3 +760,19 @@ def test_app_metrics_turn_created_series_off() -> None:
     text = generate_latest(metrics.registry).decode()
     assert "_created" not in text
     assert f'{BLOCK_DURATION.name}_count{{host="{HOST}",kind="permission"}} 1.0' in text
+
+
+def test_prometheus_queries_are_counted_by_result() -> None:
+    # The usage reader's on_query (ADR 0035); every result exported, with zeros.
+    metrics = AppMetrics(HOST, HookQueue(1, 1))
+    for result in ("ok", "ok", "timeout", "invalid"):
+        metrics.count_prometheus_query(result)
+
+    _, samples = parse(generate_latest(metrics.registry).decode())
+
+    assert by_label(samples, PROMETHEUS_QUERIES, "result") == {
+        "ok": 2,
+        "error": 0,
+        "timeout": 1,
+        "invalid": 1,
+    }

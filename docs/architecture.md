@@ -8,9 +8,10 @@ repository holds:
   configs in `stack/`; [stack.md](stack.md) is the reference for running it;
 - the Python package: a CLI that prints its version, `ccobs.domain` (the stored
   telemetry names of [ADR 0014](adr/0014-stored-telemetry-names.md), the hook parser,
-  the session state machine and the hook settings, all free of I/O), and
-  `ccobs.server`, the app of milestone 2 (from v0.3.0), which the stack builds and runs
-  as its `app` service; [app.md](app.md) is the reference for operating it;
+  the session state machine, the hook settings, and the UI's presentation rules, agent
+  tree, Grafana links and usage queries, all free of I/O), and `ccobs.server`, the app
+  of milestones 2 and 3 (from v0.3.0, its web UI from v0.4.0), which the stack builds
+  and runs as its `app` service; [app.md](app.md) is the reference for operating it;
 - the tooling around them, unit tests, and integration tests that run the stack in an
   isolated compose project;
 - development-only tools, not packaged: fixture capture (`tools/capture/`) and the
@@ -18,9 +19,9 @@ repository holds:
   service, an egress check);
 - sanitized fixtures recorded from real Claude Code sessions (`tests/fixtures/`).
 
-The app's web UI and alerts and the `ccobs` commands on this page are the planned
-design, and each part names the milestone that brings it (milestones and releases are
-listed in the roadmap in the [README](../README.md)).
+The app's alerts and the `ccobs` commands on this page are the planned design, and each
+part names the milestone that brings it (milestones and releases are listed in the
+roadmap in the [README](../README.md)).
 
 Decisions and their reasons are recorded as architecture decision records (ADRs, MADR
 format) in [`docs/adr/`](adr/README.md). When this page and an ADR disagree, the ADR
@@ -62,16 +63,16 @@ and [app.md](app.md) the app's.
 
 ## Components
 
-| Component               | Responsibility                                                                                                                                                                                                                                                                                           | Milestone                                                |
-| ----------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------- |
-| Claude Code             | The program being observed. It exports telemetry over OTLP and calls the app's hook endpoint, both configured in the user settings: by hand until `ccobs setup` writes them (milestone 4).                                                                                                               | (external)                                               |
-| OpenTelemetry Collector | Receives OTLP on 4317 (gRPC) and 4318 (HTTP), deletes personal attributes and, by default, content, sets the `host` label and routes each signal to its backend.                                                                                                                                         | 1                                                        |
-| Prometheus              | Stores the metrics that the collector pushes to its OTLP receiver. Scrapes its own and the collector's metrics, and the app's metrics listener (from v0.3.0).                                                                                                                                            | 1                                                        |
-| Loki                    | Stores Claude Code's events (OpenTelemetry log records). The app reads its `tool_decision` rejects back (from v0.3.0).                                                                                                                                                                                   | 1                                                        |
-| Tempo                   | Stores traces. Runs only in the optional `traces` compose profile, because tracing is a beta feature in Claude Code and is off by default.                                                                                                                                                               | 1                                                        |
-| Grafana                 | Deep analysis, with provisioned datasources (Prometheus, Loki, Tempo) and dashboards. No login: whoever opens it is an Editor.                                                                                                                                                                           | 1 (datasources, overview dashboard), 6 (more dashboards) |
-| App (FastAPI, SQLite)   | From v0.3.0: receives hooks, runs the session state machine, stores sessions, agents and blocks, serves a read-only JSON API and its live state as metrics, and reads Claude Code's rejects from Loki. Later: serves the web UI, queries Prometheus and Loki for its views, stores and sends the alerts. | 2 (ingestion, API, metrics), 3 (UI), 5 (alerts)          |
-| `ccobs` CLI             | `setup`, `uninstall`, `doctor` and `status`: edits `~/.claude/settings.json` and checks the stack. Published on PyPI as `cc-observatory`; it never imports server-only dependencies at import time.                                                                                                      | 4                                                        |
+| Component               | Responsibility                                                                                                                                                                                                                                                                                                                                                          | Milestone                                                |
+| ----------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------- |
+| Claude Code             | The program being observed. It exports telemetry over OTLP and calls the app's hook endpoint, both configured in the user settings: by hand until `ccobs setup` writes them (milestone 4).                                                                                                                                                                              | (external)                                               |
+| OpenTelemetry Collector | Receives OTLP on 4317 (gRPC) and 4318 (HTTP), deletes personal attributes and, by default, content, sets the `host` label and routes each signal to its backend.                                                                                                                                                                                                        | 1                                                        |
+| Prometheus              | Stores the metrics that the collector pushes to its OTLP receiver. Scrapes its own and the collector's metrics, and the app's metrics listener (from v0.3.0). Answers the app's queries for each session's tokens and cost (from v0.4.0).                                                                                                                               | 1                                                        |
+| Loki                    | Stores Claude Code's events (OpenTelemetry log records). The app reads its `tool_decision` rejects back (from v0.3.0).                                                                                                                                                                                                                                                  | 1                                                        |
+| Tempo                   | Stores traces. Runs only in the optional `traces` compose profile, because tracing is a beta feature in Claude Code and is off by default.                                                                                                                                                                                                                              | 1                                                        |
+| Grafana                 | Deep analysis, with provisioned datasources (Prometheus, Loki, Tempo) and dashboards. No login: whoever opens it is an Editor. The app's pages link to it (from v0.4.0).                                                                                                                                                                                                | 1 (datasources, overview dashboard), 6 (more dashboards) |
+| App (FastAPI, SQLite)   | From v0.3.0: receives hooks, runs the session state machine, stores sessions, agents and blocks, serves a read-only JSON API and its live state as metrics, and reads Claude Code's rejects from Loki. From v0.4.0: serves the web UI with live updates, reads each session's tokens and cost from Prometheus and links to Grafana. Later: stores and sends the alerts. | 2 (ingestion, API, metrics), 3 (UI), 5 (alerts)          |
+| `ccobs` CLI             | `setup`, `uninstall`, `doctor` and `status`: edits `~/.claude/settings.json` and checks the stack. Published on PyPI as `cc-observatory`; it never imports server-only dependencies at import time.                                                                                                                                                                     | 4                                                        |
 
 ## Two data paths
 
@@ -207,6 +208,93 @@ rules and what confirms each one; when this summary and the ADR disagree, the AD
 
 Open blocks drive the alerts (milestone 5).
 
+## The web UI (from v0.4.0)
+
+The app serves its own pages at <http://127.0.0.1:4300>: the overview, with sessions in
+bays by state; All sessions, a paged list; and a page per session, with its blocks, its
+agent tree, its tokens and cost and its hook timeline. [app.md](app.md#the-web-ui)
+describes what each page shows.
+
+- **Server-rendered** ([ADR 0031](adr/0031-server-rendered-pages-with-htmx-and-vendored-assets.md)).
+  `ccobs.server.ui` renders Jinja2 templates (`src/ccobs/server/templates/`) from view
+  objects built from stored rows and the pure rules in `ccobs.domain.presentation` and
+  `ccobs.domain.agent_tree`. htmx 2 swaps the fragments a page refetches. htmx, the
+  fonts, the stylesheet and the app's own scripts ship in `src/ccobs/server/static/`,
+  the vendored files pinned with SHA-256 checksums in `VENDOR.json`, so nothing loads
+  from another origin and the UI works offline. The UI is read-only: every route but
+  the hook route serves only `GET`.
+- **No full paths, no content.** No page holds the full `cwd`: the overview shows
+  the project name and the session page the path with the home directory as `~`.
+  Homes are recognised by the shape of the path, so a home elsewhere (such as
+  `/home2/<user>`), a `/home/<group>/<user>` layout or an MSYS or Cygwin home mounted
+  outside `/home` or `Users` can still show the username
+  (`ccobs.domain.presentation`). The app stores no content, so no page can show it.
+
+### Live updates
+
+A page does not receive session data over the stream. It is told which sessions
+changed, and it refetches its own fragments, through the same read path as a page load
+([ADR 0032](adr/0032-live-updates-change-hub-sse-pings-and-refetch.md)):
+
+~~~text
+hook ─► queue ─► writer thread ─► commit ─► ChangeHub.notify_threadsafe(session IDs)
+                                               │  (call_soon_threadsafe, O(1))
+                                               ▼
+                       event loop: one subscription per open stream, coalesced 250 ms
+                                               │
+                     GET /ui/stream ◄──────────┘  "event: changed" (IDs or "all")
+                          │
+                live.js ─► ccobs:changed ─► htmx refetches /ui/board or
+                                            /ui/sessions/{id}/live and new events
+                                               │
+                                               ▼
+                                 read gate (4 query-only readers) ─► SQLite
+~~~
+
+- The writer calls the hub once per successful commit, without blocking and doing
+  nothing when no stream is open; the stream itself never reads the database.
+- Each page also refetches whenever its stream connects or reconnects, so whatever it
+  missed while disconnected shows up, with no event IDs to replay.
+- At most 16 streams are open at once; the next gets a 503 and its page retries with a
+  backoff up to a minute.
+
+### Writer and readers
+
+The writer thread has a database engine of its own, a pool of exactly one connection
+that no reader can take. The API and the pages read through a second engine of 4
+connections set to `query_only`, behind a read gate that runs at most 4 reads at once
+off the default threadpool; a read that waits more than 5 seconds for a slot gets a 503
+"database busy". Every list that grows with a session's history pages by keyset, so
+each read is bounded by a page size
+([ADR 0033](adr/0033-separate-writer-and-reader-engines-and-capped-reads.md)).
+
+### Tokens, cost and Grafana links
+
+Hooks carry no token or cost data, so the session page reads its totals from Claude
+Code's own metrics in Prometheus: `ccobs.domain.usage` builds three PromQL queries on
+the session ID, over the session's time window, and `ccobs.server.usage` sends them to
+`CCOBS_PROMETHEUS_URL` with a 3-second timeout and keeps the answer for 30 seconds (5
+minutes once the session is over). `ccobs.domain.grafana_links` builds the links to
+Grafana's Explore (Loki logs, Prometheus tokens and cost) and to the overview dashboard,
+on `CCOBS_GRAFANA_URL`, which compose derives from Grafana's port, since Grafana answers
+only as `localhost`
+([ADR 0035](adr/0035-per-session-tokens-and-cost-from-prometheus-and-grafana-links.md)).
+
+### Browser defences
+
+Any web page can make the browser send requests to localhost, and the app has no login.
+On top of the `Host` allowlist, the JSON-only hook route and the absence of CORS
+([ADR 0027](adr/0027-the-app-http-surface-and-hook-queue.md)), the app refuses with a
+403 any browser request whose `Sec-Fetch-Site` is `cross-site` or `same-site` unless it
+is a top-level `GET` navigation, and sends on every response but the hook route's a
+strict Content Security Policy (only its own scripts, styles, fonts and images, plus
+`data:` images, nothing from another origin, no inline code, no framing), `nosniff`, `no-referrer`, `Cross-Origin-Resource-Policy` and
+`Cross-Origin-Opener-Policy` set to `same-origin`, and `Cache-Control: no-store` outside
+`/static/`
+([ADR 0034](adr/0034-browser-hardening-csp-fetch-metadata-and-response-headers.md)).
+The hook route keeps its empty 204 whatever these headers say.
+[SECURITY.md](../SECURITY.md) has the threat model.
+
 ## Key constraints
 
 - **Hooks never interfere with Claude Code.** The endpoint validates, enqueues and
@@ -258,7 +346,11 @@ Open blocks drive the alerts (milestone 5).
 - **Paths are personal data.** `cwd`, `transcript_path` and other paths in hook payloads
   contain the OS username. Test fixtures come from real sessions but are sanitized, and
   a guard test fails if personal data shows up in them.
-- **Local only.** Published ports bind to `127.0.0.1` and there is no login. See
+- **Local only.** Published ports bind to `127.0.0.1` and there is no login. Since any
+  web page can send requests to localhost, the app accepts only the `Host` names
+  `localhost`, `127.0.0.1` and `[::1]`, sends no CORS headers, ignores hooks that are
+  not `application/json`, and from v0.4.0 refuses cross-site browser requests and sends
+  a strict CSP ([Browser defences](#browser-defences)). See
   [SECURITY.md](../SECURITY.md).
 - **Grafana: no login, anonymous Editors, `localhost` only**
   ([ADR 0017](adr/0017-grafana-access-and-dns-rebinding.md)). Its settings are
