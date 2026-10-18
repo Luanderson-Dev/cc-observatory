@@ -65,3 +65,4 @@ the ADR wins.
 | [0034](0034-browser-hardening-csp-fetch-metadata-and-response-headers.md)     | Browser hardening: a strict CSP, Fetch Metadata and response headers                  | Accepted |
 | [0035](0035-per-session-tokens-and-cost-from-prometheus-and-grafana-links.md) | Per-session tokens and cost from Prometheus, and links from the UI to Grafana         | Accepted |
 | [0036](0036-the-telemetry-env-block-that-ccobs-setup-writes.md)               | The telemetry env block that `ccobs setup` writes                                     | Accepted |
+| [0037](0037-how-ccobs-setup-and-uninstall-change-claude-codes-settings.md)    | `ccobs setup` and `uninstall` recognize their entries and keep a state file           | Accepted |

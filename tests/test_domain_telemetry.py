@@ -89,6 +89,8 @@ ALLOWED_IMPORTS: Final = frozenset(
     | {"urllib.parse"}
     # Pure arithmetic: math.isfinite and math.fsum (ccobs.domain.usage).
     | {"math"}
+    # copy.deepcopy of parsed JSON (ccobs.domain.settings_merge).
+    | {"copy"}
     # Domain modules, each one checked by the same test.
     | {
         "ccobs.domain.durations",
@@ -97,6 +99,7 @@ ALLOWED_IMPORTS: Final = frozenset(
         "ccobs.domain.hooks",
         "ccobs.domain.sessions",
         "ccobs.domain.telemetry",
+        "ccobs.domain.telemetry_settings",
     }
 )
 # Builtins that read or write outside the process, or run code from strings.

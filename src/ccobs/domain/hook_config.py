@@ -33,6 +33,7 @@ __all__ = [
     "NOT_REGISTERED",
     "REGISTERED_HTTP_EVENTS",
     "hook_settings",
+    "is_hook_url",
 ]
 
 HOOK_PATH: Final = "/hooks"
@@ -113,10 +114,18 @@ _HOOK_URL: Final = re.compile(
 )
 
 
-def _check_url(url: str) -> str:
+def is_hook_url(url: object) -> bool:
+    """Whether ``url`` is a string that ``hook_settings`` accepts: http to 127.0.0.1, an
+    optional port up to 65535, and a path ending in ``HOOK_PATH``. Never raises."""
+    if not isinstance(url, str):
+        return False
     match = _HOOK_URL.fullmatch(url)
     port = match["port"] if match else None
-    if match is None or (port is not None and int(port) > _MAX_PORT):
+    return match is not None and (port is None or int(port) <= _MAX_PORT)
+
+
+def _check_url(url: str) -> str:
+    if not is_hook_url(url):
         # The URL is not echoed: it came from the user's input.
         raise ValueError(
             f"the hook URL must be http to 127.0.0.1 (not localhost, which may resolve to "

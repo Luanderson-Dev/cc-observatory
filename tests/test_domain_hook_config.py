@@ -28,6 +28,7 @@ from ccobs.domain.hook_config import (
     NOT_REGISTERED,
     REGISTERED_HTTP_EVENTS,
     hook_settings,
+    is_hook_url,
 )
 from ccobs.domain.hooks import UnknownHookEvent, parse_hook
 from ccobs.domain.sessions import SessionChanged, apply
@@ -304,65 +305,70 @@ def test_the_default_url_is_the_app_port() -> None:
     assert DEFAULT_HOOK_URL == "http://127.0.0.1:4300/hooks"
 
 
-@pytest.mark.parametrize(
-    "url",
-    [
-        "http://127.0.0.1:4300/hooks",
-        "http://127.0.0.1/hooks",
-        "http://127.0.0.1:1/hooks",
-        "http://127.0.0.1:65535/hooks",
-        "http://127.0.0.1:24300/ccobs/hooks",
-        "http://127.0.0.1:24300/a/b_c-d.e~/hooks",
-    ],
+ACCEPTED_URLS: Final = (
+    "http://127.0.0.1:4300/hooks",
+    "http://127.0.0.1/hooks",
+    "http://127.0.0.1:1/hooks",
+    "http://127.0.0.1:65535/hooks",
+    "http://127.0.0.1:24300/ccobs/hooks",
+    "http://127.0.0.1:24300/a/b_c-d.e~/hooks",
 )
+REJECTED_URLS: Final = (
+    "",
+    "127.0.0.1:4300/hooks",
+    "https://127.0.0.1:4300/hooks",
+    "ftp://127.0.0.1:4300/hooks",
+    "http://example.com:4300/hooks",
+    "http://192.168.0.10:4300/hooks",
+    "http://0.0.0.0:4300/hooks",
+    "http://127.0.0.2:4300/hooks",
+    "http://::1:4300/hooks",
+    # ADR 0018 publishes ports on 127.0.0.1 only: localhost may resolve to ::1, and
+    # [::1] never connects (and risks curl's URL globbing).
+    "http://localhost:4300/hooks",
+    "http://localhost:24300/ccobs/hooks",
+    "http://[::1]:4300/hooks",
+    "http://127.0.0.1.example.com/hooks",
+    "http://127.0.0.1@example.com/hooks",
+    "http://user@127.0.0.1:4300/hooks",
+    "http://LOCALHOST:4300/hooks",
+    "http://127.0.0.1:4300",
+    "http://127.0.0.1:4300/",
+    "http://127.0.0.1:4300/hook",
+    "http://127.0.0.1:4300/hooks/",
+    "http://127.0.0.1:4300/myhooks",
+    "http://127.0.0.1:4300/hooks?x=1",
+    "http://127.0.0.1:4300/hooks#x",
+    "http://127.0.0.1:4300/../hooks",
+    "http://127.0.0.1:4300/./hooks",
+    "http://127.0.0.1:4300//hooks",
+    "http://127.0.0.1:0/hooks",
+    "http://127.0.0.1:65536/hooks",
+    "http://127.0.0.1:04300/hooks",
+    "http://127.0.0.1:/hooks",
+    "http://127.0.0.1:4300/ho oks/hooks",
+    " http://127.0.0.1:4300/hooks",
+    "http://127.0.0.1:4300/hooks\n",
+)
+
+
+@pytest.mark.parametrize("url", ACCEPTED_URLS)
 def test_accepted_urls(url: str) -> None:
     settings = hook_settings(url, windows=False)
     assert url in json.dumps(settings)
+    assert is_hook_url(url)
 
 
-@pytest.mark.parametrize(
-    "url",
-    [
-        "",
-        "127.0.0.1:4300/hooks",
-        "https://127.0.0.1:4300/hooks",
-        "ftp://127.0.0.1:4300/hooks",
-        "http://example.com:4300/hooks",
-        "http://192.168.0.10:4300/hooks",
-        "http://0.0.0.0:4300/hooks",
-        "http://127.0.0.2:4300/hooks",
-        "http://::1:4300/hooks",
-        # ADR 0018 publishes ports on 127.0.0.1 only: localhost may resolve to ::1, and
-        # [::1] never connects (and risks curl's URL globbing).
-        "http://localhost:4300/hooks",
-        "http://localhost:24300/ccobs/hooks",
-        "http://[::1]:4300/hooks",
-        "http://127.0.0.1.example.com/hooks",
-        "http://127.0.0.1@example.com/hooks",
-        "http://user@127.0.0.1:4300/hooks",
-        "http://LOCALHOST:4300/hooks",
-        "http://127.0.0.1:4300",
-        "http://127.0.0.1:4300/",
-        "http://127.0.0.1:4300/hook",
-        "http://127.0.0.1:4300/hooks/",
-        "http://127.0.0.1:4300/myhooks",
-        "http://127.0.0.1:4300/hooks?x=1",
-        "http://127.0.0.1:4300/hooks#x",
-        "http://127.0.0.1:4300/../hooks",
-        "http://127.0.0.1:4300/./hooks",
-        "http://127.0.0.1:4300//hooks",
-        "http://127.0.0.1:0/hooks",
-        "http://127.0.0.1:65536/hooks",
-        "http://127.0.0.1:04300/hooks",
-        "http://127.0.0.1:/hooks",
-        "http://127.0.0.1:4300/ho oks/hooks",
-        " http://127.0.0.1:4300/hooks",
-        "http://127.0.0.1:4300/hooks\n",
-    ],
-)
+@pytest.mark.parametrize("url", REJECTED_URLS)
 def test_rejected_urls(url: str) -> None:
     with pytest.raises(ValueError, match="hook URL"):
         hook_settings(url, windows=False)
+    assert not is_hook_url(url)
+
+
+@pytest.mark.parametrize("value", [None, 4300, b"http://127.0.0.1:4300/hooks", [DEFAULT_HOOK_URL]])
+def test_is_hook_url_is_false_for_a_non_string(value: object) -> None:
+    assert is_hook_url(value) is False
 
 
 def test_a_rejected_url_is_not_echoed() -> None:
