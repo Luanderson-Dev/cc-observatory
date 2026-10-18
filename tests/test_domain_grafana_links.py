@@ -21,6 +21,7 @@ import yaml
 from ccobs.domain import grafana_links
 from ccobs.domain.grafana_links import (
     DASHBOARD_UID,
+    LOGS_MAX_LINES,
     LOKI_UID,
     MAX_DATA_POINTS,
     MIN_INTERVAL,
@@ -245,6 +246,12 @@ def test_a_value_that_is_not_utf8_is_refused() -> None:
 # The Explore links.
 
 
+def test_the_logs_link_asks_for_explores_default_line_limit() -> None:
+    # Explicit in the link: without it, a query run through /api/ds/query gets the
+    # backend's 100 lines, not the 1000 Explore's frontend asks for by default.
+    assert LOGS_MAX_LINES == 1000
+
+
 def test_the_logs_link_opens_explore_on_loki_with_the_session_query() -> None:
     panes = _panes(session_logs_url(BASE, host=HOST, session_id=SID, time_range=RANGE))
     assert panes == {
@@ -257,6 +264,7 @@ def test_the_logs_link_opens_explore_on_loki_with_the_session_query() -> None:
                     "expr": session_events_query(HOST, SID),
                     "queryType": "range",
                     "editorMode": "code",
+                    "maxLines": LOGS_MAX_LINES,
                 }
             ],
             "range": {"from": RANGE.grafana_from, "to": RANGE.grafana_to},

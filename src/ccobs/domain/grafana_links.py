@@ -12,6 +12,10 @@ Facts the links rely on, each checked by ``tests/test_domain_grafana_links.py``:
   metadata key, and the Prometheus names and labels, from ``ccobs.domain.telemetry``
   (ADRs 0014, 0015 and 0022); every value is quoted with ``telemetry.quote``, so a
   session ID or host cannot leave its LogQL or PromQL string;
+- Grafana's line limit for a Loki query: Explore's frontend asks for the datasource's
+  ``maxLines``, 1000 by default (the provisioned Loki datasource does not set it), while
+  a query that names none gets the backend's 100 lines; the Logs link names
+  ``LOGS_MAX_LINES`` so it shows the same up to 1000 events wherever it runs;
 - Grafana 13.2's Explore URL, ``/explore?schemaVersion=1&panes=<JSON>&orgId=1``, each
   pane holding its datasource, its queries and its range (epoch milliseconds as strings,
   or ``now``); the JSON is ASCII-only and the whole query string percent-encoded.
@@ -47,6 +51,7 @@ from ccobs.domain.telemetry import (
 
 __all__ = [
     "DASHBOARD_UID",
+    "LOGS_MAX_LINES",
     "LOKI_UID",
     "MAX_DATA_POINTS",
     "MIN_INTERVAL",
@@ -88,6 +93,9 @@ WINDOW_AFTER_MS: Final = 120_000
 # Grafana's relative time for the current moment: the range of a live session keeps
 # growing while its page stays open.
 NOW: Final = "now"
+# The Logs link's line limit: Grafana's default for Explore on Loki (see the docstring).
+# A longer session shows its newest events first; Explore's options raise the limit.
+LOGS_MAX_LINES: Final = 1000
 # The dashboard's time series panels' minimum interval and data points, so a session's
 # chart has the same steps (one per minute at least) as the overview's.
 MIN_INTERVAL: Final = "1m"
@@ -197,6 +205,7 @@ def session_logs_url(grafana_url: str, *, host: str, session_id: str, time_range
         "expr": session_events_query(host, session_id),
         "queryType": "range",
         "editorMode": "code",
+        "maxLines": LOGS_MAX_LINES,
     }
     return _explore(grafana_url, {"logs": _pane(LOKI_UID, query, time_range)})
 

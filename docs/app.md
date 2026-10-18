@@ -144,7 +144,8 @@ stylesheet behind. Pages and their parts are never cached (`Cache-Control: no-st
   host label in a new tab.
 - A session's **Open in Grafana** has three links, each opening a new tab:
   - **Logs**: Explore on Loki with the session's Claude Code events,
-    `{service_name="claude-code", host="<host>"} | session_id="<id>"`;
+    `{service_name="claude-code", host="<host>"} | session_id="<id>"`, up to the newest
+    1000 events (raise the line limit in Explore's options for a longer session);
   - **Tokens and cost**: Explore on Prometheus, split in two: the session's tokens by
     type and its cost by model, per interval, as the dashboard draws them;
   - **Dashboard**: the Claude Code overview for the app's host label.

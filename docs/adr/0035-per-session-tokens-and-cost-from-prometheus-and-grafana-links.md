@@ -141,7 +141,11 @@ half minute.
   schema, `/explore?schemaVersion=1&panes=<JSON>&orgId=1`, ASCII-only JSON,
   percent-encoded. Every value in a query is quoted with `telemetry.quote`.
   - **Logs**: one Loki pane,
-    `{service_name="claude-code", host="<host>"} | session_id="<id>"`.
+    `{service_name="claude-code", host="<host>"} | session_id="<id>"`, with `maxLines`
+    1000 (Explore's default when the datasource sets none; Grafana's backend uses 100
+    for a query that names no limit), so the link shows the same events wherever its
+    query runs. A longer session shows its newest 1000 events; Explore's options raise
+    the limit.
   - **Tokens and cost**: two Prometheus panes, the session's tokens by type and its
     cost by model, each on its own scale, in the dashboard's per-interval form
     `sum by (<label>) (increase(<selector>[$__interval] anchored offset -$__interval))`
