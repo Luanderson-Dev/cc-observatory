@@ -54,6 +54,8 @@ from ccobs.domain.app_metrics import (
     SESSION_STATES,
     SESSIONS,
     SESSIONS_ENDED,
+    UI_STREAMS,
+    UI_STREAMS_REFUSED,
     AppMetric,
 )
 from ccobs.domain.denials import OpenBlock
@@ -70,7 +72,7 @@ from ccobs.server.metrics import (
     MetricsListener,
     address_family,
 )
-from ccobs.server.writer import BlockClosedCallback, Writer, WriterCounts
+from ccobs.server.writer import Writer, WriterCounts, WriterObservers
 
 # The app without its sweeper and reconciler: tests/server/test_sweeps.py and
 # tests/server/test_reconcile.py cover them.
@@ -128,16 +130,15 @@ class ManualWriter(Writer):
         pass
 
 
-def manual(
-    queue: HookQueue, repository: Repository, on_block_closed: BlockClosedCallback
-) -> ManualWriter:
+def manual(queue: HookQueue, repository: Repository, observers: WriterObservers) -> ManualWriter:
     return ManualWriter(
         queue,
         repository,
         HOST,
         stale_after_ms=12 * HOUR_MS,
         batch_wait_s=0,
-        on_block_closed=on_block_closed,
+        on_block_closed=observers.on_block_closed,
+        on_committed=observers.on_committed,
     )
 
 
@@ -252,8 +253,9 @@ def test_the_exposition_has_exactly_the_documented_series(client: TestClient) ->
 
     assert types == {metric.name: metric.type for metric in APP_METRICS}
     assert "_created" not in text
-    # The fixed total of ADR 0028, plus the two Loki query series of ADR 0029.
-    assert sum(len(found) for found in samples.values()) == 65
+    # The fixed total of ADR 0028, plus the two Loki query series of ADR 0029 and the two
+    # live stream series of ADR 0032.
+    assert sum(len(found) for found in samples.values()) == 67
     for metric in APP_METRICS:
         assert samples[metric.name], metric.name
         for sample in samples[metric.name]:
@@ -277,6 +279,8 @@ def test_states_kinds_reasons_and_events_are_exported_with_zeros(client: TestCli
         HOOK_EVENTS_PROCESSED,
         HOOK_QUEUE_DEPTH,
         HOOK_QUEUE_BYTES,
+        UI_STREAMS,
+        UI_STREAMS_REFUSED,
     ):
         assert single(samples, metric) == 0, metric.name
     histogram = samples[BLOCK_DURATION.name]
@@ -549,9 +553,7 @@ def test_the_listener_stops_before_the_writer(settings: Settings, queue: HookQue
                 sessions_ended=0,
             )
 
-    def factory(
-        hooks: HookQueue, repository: Repository, on_block_closed: BlockClosedCallback
-    ) -> Recorder:
+    def factory(hooks: HookQueue, repository: Repository, observers: WriterObservers) -> Recorder:
         return Recorder()
 
     app = create_app(settings, queue=queue, writer_factory=factory, metrics_port=0)

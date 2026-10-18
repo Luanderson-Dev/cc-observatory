@@ -29,7 +29,7 @@ from ccobs.server.config import Settings
 from ccobs.server.db.repository import Repository
 from ccobs.server.ingest import HookQueue
 from ccobs.server.sweeps import RETENTION_INTERVAL_S, TICK_INTERVAL_S, Sweeper
-from ccobs.server.writer import BlockClosedCallback, Writer
+from ccobs.server.writer import Writer, WriterObservers
 
 HOST: Final = "test-host"
 BASE: Final = 1_800_000_000_000
@@ -365,7 +365,7 @@ def clock() -> Clock:
 @pytest.fixture
 def client(settings: Settings, clock: Clock) -> Iterator[TestClient]:
     def manual(
-        queue: HookQueue, repository: Repository, on_block_closed: BlockClosedCallback
+        queue: HookQueue, repository: Repository, observers: WriterObservers
     ) -> ManualWriter:
         return ManualWriter(queue, repository, HOST, stale_after_ms=12 * HOUR_MS, batch_wait_s=0)
 

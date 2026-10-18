@@ -46,7 +46,7 @@ from ccobs.server.ingest import (
     wall_clock_ms,
 )
 from ccobs.server.migrations import HEAD, upgrade_to_head
-from ccobs.server.writer import BlockClosedCallback, WriterCounts
+from ccobs.server.writer import WriterCounts, WriterObservers
 
 # The app without its metrics listener (only tests/server/test_metrics.py opens sockets)
 # and without its sweeper (tests/server/test_sweeps.py covers it).
@@ -107,9 +107,7 @@ class IdleWriter:
         )
 
 
-def idle_writer(
-    queue: HookQueue, repository: Repository, on_block_closed: BlockClosedCallback
-) -> IdleWriter:
+def idle_writer(queue: HookQueue, repository: Repository, observers: WriterObservers) -> IdleWriter:
     return IdleWriter()
 
 

@@ -36,7 +36,7 @@ from ccobs.server.db.models import AgentModel, BlockModel, SessionModel
 from ccobs.server.db.repository import Repository
 from ccobs.server.ingest import HookQueue
 from ccobs.server.reads import ReadGate
-from ccobs.server.writer import BlockClosedCallback, Writer
+from ccobs.server.writer import Writer, WriterObservers
 
 HOOK_FIXTURES: Final = Path(__file__).parents[1] / "fixtures" / "hooks"
 STATIC: Final = Path(__file__).parents[2] / "src" / "ccobs" / "server" / "static"
@@ -96,7 +96,7 @@ def clock() -> Clock:
 @contextmanager
 def started(settings: Settings, clock: Clock) -> Iterator[TestClient]:
     def manual(
-        queue: HookQueue, repository: Repository, on_block_closed: BlockClosedCallback
+        queue: HookQueue, repository: Repository, observers: WriterObservers
     ) -> ManualWriter:
         return ManualWriter(queue, repository, HOST, stale_after_ms=12 * HOUR_MS, batch_wait_s=0)
 
@@ -481,6 +481,58 @@ def test_the_board_fragment_is_the_board_alone(client: TestClient) -> None:
     assert 'data-waiting="2"' in fragment
 
 
+# Live updates (ADR 0032): the board refetches itself when live.js says sessions changed.
+
+BOARD_TRIGGER: Final = (
+    'hx-get="/ui/board" hx-trigger="ccobs:changed from:body" hx-swap="outerHTML" '
+    'hx-sync="this:replace"'
+)
+
+
+def board_tag(body: str) -> str:
+    found = re.search(r'<section id="board"[^>]*>', body)
+    assert found is not None
+    return found.group(0)
+
+
+def test_the_board_refetches_itself_when_sessions_change(client: TestClient) -> None:
+    seed(client, *board_sessions())
+
+    # The fragment carries the trigger too, so the board keeps listening after a swap.
+    for url in ("/", "/ui/board"):
+        assert BOARD_TRIGGER in board_tag(page(client, url)), url
+
+
+def test_an_empty_or_failed_board_keeps_listening(client: TestClient) -> None:
+    assert BOARD_TRIGGER in board_tag(page(client, "/"))
+    app_of(client).state.reads = FailingGate(BROKEN)
+    for url in ("/", "/ui/board"):
+        assert BOARD_TRIGGER in board_tag(page(client, url, status=503)), url
+
+
+def test_the_overview_opens_the_live_stream(client: TestClient) -> None:
+    body = page(client, "/")
+
+    expected = '<div id="live-status" class="live-status" role="status" data-stream="/ui/stream">'
+    assert expected + "</div>" in body
+
+
+def test_all_sessions_opens_no_live_stream(client: TestClient) -> None:
+    body = page(client, "/sessions")
+
+    assert '<div id="live-status" class="live-status" role="status"></div>' in body
+    assert "data-stream" not in body
+
+
+def test_collapsed_bays_name_themselves_for_app_js(client: TestClient) -> None:
+    seed(client, *board_sessions())
+
+    body = page(client, "/")
+
+    assert re.search(r'<details class="bay bay--ended" data-bay="ended">', body)
+    assert re.search(r'<details class="bay bay--stale" data-bay="stale">', body)
+
+
 def test_each_request_takes_one_read_slot(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -784,12 +836,13 @@ def test_the_scripts_load_in_order_without_inline_code(client: TestClient) -> No
     head = body.split("</head>", 1)[0]
 
     scripts = re.findall(r"<script\b([^>]*)>(.*?)</script>", body, re.DOTALL)
-    assert [content for _, content in scripts] == ["", "", ""]
+    assert [content for _, content in scripts] == ["", "", "", ""]
     sources = [re.search(r'src="([^"]+)"', attributes) for attributes, _ in scripts]
     assert [found.group(1) if found else None for found in sources] == [
         "/static/js/theme.js",
         "/static/vendor/htmx-2.0.11.min.js",
         "/static/js/app.js",
+        "/static/js/live.js",
     ]
     # theme.js runs before the first paint; the others after parsing.
     assert "defer" not in scripts[0][0]

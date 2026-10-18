@@ -8,8 +8,10 @@
 - ``GET /sessions/{session_id}``: one session: its header, its blocks (open ones first,
   then closed ones newest first), its agents as a tree and its hook timeline, newest
   first. ``/ui/sessions/{session_id}/blocks``, ``.../agents`` and ``.../events`` return
-  the next page of each list for the "Show older" controls, and ``.../events?after=``
-  the events newer than a cursor, for the timeline's tail (see "Session page").
+  the next page of each list for the "Show older" controls, ``.../events?after=`` the
+  events newer than a cursor, for the timeline's tail, and ``.../live`` the header,
+  blocks and agents again, for the live refresh (see "Session page" and "Live
+  refresh").
 - ``/static``: the package's ``static/`` directory.
 
 Each request reads the database once, through the read gate (``ccobs.server.reads``,
@@ -28,7 +30,7 @@ nothing appears twice. Agents are a tree (``ccobs.domain.agent_tree``), newest f
 among siblings, so older agents belong at the bottom; an older page is a tree of its own
 agents, whose launchers may be on another page. The timeline's tail is an element that
 refetches ``events?after=<the newest seq shown>`` on the ``ccobs:changed`` event (live
-updates dispatch it, stage 9) and swaps itself: the response prepends the newer rows to
+updates dispatch it, ADR 0032) and swaps itself: the response prepends the newer rows to
 the timeline out of band and carries a new tail with the new cursor. A trigger during
 a request replaces it (``hx-sync``), so the last change of a burst is never lost, and
 the rows are the same for the same cursor; a tail more than a page behind triggers
@@ -39,6 +41,27 @@ or tail request leaves the page as it was. ``app.js`` drops a row an older page 
 (a block open, or an agent running, when the page loaded) and keeps the focus on the
 pager. Only the
 metadata ADR 0023 stores reaches the page, and only through the view objects.
+
+Live refresh (ADR 0032). The overview's board refetches ``/ui/board`` on
+``ccobs:changed`` and replaces itself. On the session page, a hidden element refetches
+``.../live`` and replaces itself, while the header, the blocks and the agents come out
+of band: one read of the session detail per change, besides the tail's. "Show older"
+pages land in lists of their own (``#closed-blocks-older``, ``#agents-older``) that the
+refresh leaves alone, so the pages a user loaded stay. To keep the two parts contiguous,
+the refresh does not take the latest closed blocks and stopped agents (that window
+slides, and rows would fall between it and the older pages): the page sends its
+boundaries, the oldest closed block and stopped agent it showed, which are the cursors
+of its "Show older" controls, its render time, and the IDs of the blocks open and agents
+running below a boundary (at most ``LIVE_KEEP_LIMIT`` of each). The refresh holds every
+open block and running agent, every closed and stopped one from the boundaries up, those
+the page named, whatever their close time reads, and those that closed or stopped after
+the page loaded. So a row the page showed open or running stays on it once it closes,
+unless the page had more than ``LIVE_KEEP_LIMIT`` of them below a boundary; nothing
+shows twice (``app.js`` drops from the older lists a row the refresh now holds). The
+window only grows; past ``LIVE_CLOSED_LIMIT`` rows it starts over: the latest page, the
+older list emptied and a "Show older" control from the new boundary, all out of band,
+with the time of that refresh as its new start and the rows then open below the new
+boundary named, so the next refresh does not start over again.
 
 Static cache policy: files under ``static/vendor/`` carry their version in their name
 (``tests/server/test_static.py`` checks htmx's), so a new version is a new URL and they
@@ -63,7 +86,7 @@ from pathlib import Path
 from typing import Annotated, Final, Literal
 from urllib.parse import quote, urlencode
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse
 from jinja2 import Environment, FileSystemLoader, StrictUndefined
 from sqlalchemy.exc import SQLAlchemyError
@@ -96,6 +119,7 @@ from ccobs.server.db.repository import (
     SessionDetail,
     StripRow,
 )
+from ccobs.server.live import STREAM_PATH
 from ccobs.server.reads import ReadGate
 
 __all__ = [
@@ -104,6 +128,9 @@ __all__ = [
     "CLOSED_BAY_LIMIT",
     "EVENTS_PAGE_SIZE",
     "IMMUTABLE",
+    "LIVE_CLOSED_LIMIT",
+    "LIVE_KEEP_ID_MAX",
+    "LIVE_KEEP_LIMIT",
     "REVALIDATE",
     "SESSIONS_PAGE_SIZE",
     "STATIC_DIR",
@@ -129,6 +156,15 @@ SESSIONS_PAGE_SIZE: Final = 50
 BLOCKS_PAGE_SIZE: Final = 50
 AGENTS_PAGE_SIZE: Final = 50
 EVENTS_PAGE_SIZE: Final = 50
+# How many closed blocks (and stopped agents) the live refresh of a session page holds
+# before its window starts over at the latest page (see "Live refresh").
+LIVE_CLOSED_LIMIT: Final = 200
+# How many open blocks (and running agents) below its boundary a live link names; a
+# session rarely has more than one or two, and the URL must stay short.
+LIVE_KEEP_LIMIT: Final = 8
+# The longest agent ID a live link carries (Claude Code's are short; a stored ID may
+# reach 256 characters, three times that once quoted).
+LIVE_KEEP_ID_MAX: Final = 128
 # An agent tree deeper than this is drawn at this depth (the CSS has a class per depth).
 _MAX_DEPTH: Final = 6
 _SEQ: Final = re.compile(r"[0-9]{1,19}")
@@ -434,7 +470,13 @@ def _status(context: dict[str, object]) -> int:
 async def overview(request: Request, repository: _Repo, reads: _Reads) -> Response:
     """The strip board, in a full page."""
     context = await _board_context(request, repository, reads)
-    return _render("overview.html", status_code=_status(context), nav="overview", **context)
+    return _render(
+        "overview.html",
+        status_code=_status(context),
+        nav="overview",
+        live_stream=STREAM_PATH,
+        **context,
+    )
 
 
 @router.get("/ui/board", response_class=HTMLResponse)
@@ -594,6 +636,31 @@ class Tail:
 
     href: str
     now: bool
+
+
+@dataclass(frozen=True, kw_only=True)
+class BlocksRegion:
+    """The blocks the live refresh replaces: every open one, then the closed ones,
+    newest first; ``total`` counts every block of the session."""
+
+    open: list[BlockView]
+    closed: list[BlockView]
+    total: int
+
+
+@dataclass(frozen=True, kw_only=True)
+class AgentsRegion:
+    """The agents the live refresh replaces, as a tree; ``total`` counts every agent."""
+
+    rows: list[AgentView]
+    total: int
+
+
+@dataclass(frozen=True, kw_only=True)
+class LiveLink:
+    """The live refresh's URL: the page's boundaries and render time."""
+
+    href: str
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -771,6 +838,95 @@ def _tail(session_id: str, after: int, *, now: bool) -> Tail:
     return Tail(href=_session_href(session_id, "events", after=after), now=now)
 
 
+def _blocks_region(detail: SessionDetail, now_ms: int, keep: int | None = None) -> BlocksRegion:
+    """The detail's blocks: open ones in ``block_id`` order, closed ones newest first, at
+    most ``keep`` of those."""
+    views = [_block_view(block, now_ms) for block in detail.blocks]
+    closed = [block for block in reversed(views) if not block.is_open]
+    return BlocksRegion(
+        open=[block for block in views if block.is_open],
+        closed=closed if keep is None else closed[:keep],
+        total=detail.blocks_total,
+    )
+
+
+@dataclass(frozen=True, kw_only=True)
+class _AgentsShown:
+    region: AgentsRegion
+    # The stopped agents shown, and every agent shown, in first-seen order.
+    stopped: list[Agent]
+    agents: list[Agent]
+
+    @property
+    def boundary(self) -> str | None:
+        """The oldest stopped agent shown: the "Show older" cursor and the boundary."""
+        return self.stopped[0].agent_id if self.stopped else None
+
+    def kept(self) -> tuple[str, ...]:
+        """The running agents below the boundary (see ``_Window``)."""
+        if not self.stopped:
+            return ()
+        # The boundary is the oldest stopped agent shown, so every agent shown before it
+        # (in first-seen order) is running.
+        below = self.agents[: self.agents.index(self.stopped[0])]
+        # An ID too long to carry is left out rather than making the link too long.
+        ids = [agent.agent_id for agent in below if len(agent.agent_id) <= LIVE_KEEP_ID_MAX]
+        return tuple(ids[:LIVE_KEEP_LIMIT])
+
+
+def _agents_region(detail: SessionDetail, now_ms: int, keep: int | None = None) -> _AgentsShown:
+    """The detail's agents as a tree, with the latest ``keep`` stopped ones at most."""
+    stopped = [agent for agent in detail.agents if agent.status != "running"]
+    if keep is not None:
+        stopped = stopped[-keep:]
+    kept = {agent.agent_id for agent in stopped}
+    agents = [
+        agent for agent in detail.agents if agent.status == "running" or agent.agent_id in kept
+    ]
+    region = AgentsRegion(
+        rows=_agent_views(agents, detail.parents, now_ms), total=detail.agents_total
+    )
+    return _AgentsShown(region=region, stopped=stopped, agents=agents)
+
+
+def _kept_blocks(blocks: BlocksRegion, boundary: int | None) -> tuple[int, ...]:
+    """The open blocks below the boundary (see ``_Window``)."""
+    if boundary is None:
+        return ()
+    return tuple(block.block_id for block in blocks.open if block.block_id < boundary)[
+        :LIVE_KEEP_LIMIT
+    ]
+
+
+@dataclass(frozen=True, kw_only=True)
+class _Window[K]:
+    """One section's live window (see "Live refresh"): its boundary (``None``: no
+    closed or stopped row was shown, so everything), the time from which a row that
+    closes joins it, and the rows open or running below the boundary when it was set,
+    which join it however their close time reads (a sweep stops an agent at its last
+    event, a late hook closes a block at its receive time)."""
+
+    start: K | None
+    since_ms: int
+    keep: tuple[K, ...]
+
+
+def _live_link(session_id: str, blocks: _Window[int], agents: _Window[str]) -> LiveLink:
+    query: list[tuple[str, object]] = []
+    for prefix, window in (("blocks", blocks), ("agents", agents)):
+        if window.start is not None:
+            query.append((f"{prefix}_from", window.start))
+        query.append((f"{prefix}_since", window.since_ms))
+    query.extend(("keep_block", block_id) for block_id in blocks.keep)
+    query.extend(("keep_agent", agent_id) for agent_id in agents.keep)
+    href = "/ui/sessions/" + quote(session_id, safe="") + "/live?" + urlencode(query)
+    return LiveLink(href=href)
+
+
+def _live_stream(session_id: str) -> str:
+    return STREAM_PATH + "?" + urlencode({"session": session_id})
+
+
 def _session_read(repository: Repository, session_id: str, limit: int) -> SessionRead | None:
     detail = repository.get_session(session_id)
     if detail is None:
@@ -797,17 +953,19 @@ async def session_page(
     if found is None:
         return _not_found_page()
     detail = found.detail
-    blocks = [_block_view(block, now_ms) for block in detail.blocks]
-    # Closed ones newest first: the detail lists blocks in block_id order.
-    closed_blocks = [block for block in reversed(blocks) if not block.is_open]
+    blocks = _blocks_region(detail, now_ms)
+    # The oldest closed block and stopped agent shown: the "Show older" cursors, and the
+    # live refresh's boundaries.
+    blocks_from = blocks.closed[-1].block_id if blocks.closed else None
     blocks_next = None
-    if detail.blocks_total > len(detail.blocks) and closed_blocks:
-        blocks_next = _session_href(session_id, "blocks", before=closed_blocks[-1].block_id)
-    stopped = [agent for agent in detail.agents if agent.status != "running"]
+    if detail.blocks_total > len(detail.blocks) and blocks_from is not None:
+        blocks_next = _session_href(session_id, "blocks", before=blocks_from)
+    shown = _agents_region(detail, now_ms)
+    agents_from = shown.boundary
     agents_next = None
-    if detail.agents_total > len(detail.agents) and stopped:
-        # The oldest stopped agent shown: every running one is on this page already.
-        agents_next = _session_href(session_id, "agents", before=stopped[0].agent_id)
+    if detail.agents_total > len(detail.agents) and agents_from is not None:
+        # Every running agent is on this page already.
+        agents_next = _session_href(session_id, "agents", before=agents_from)
     events = found.events[:EVENTS_PAGE_SIZE]
     events_next = None
     if len(found.events) > EVENTS_PAGE_SIZE:
@@ -816,13 +974,16 @@ async def session_page(
         "session.html",
         nav=None,
         error=None,
+        live_stream=_live_stream(session_id),
+        live=_live_link(
+            session_id,
+            _Window(start=blocks_from, since_ms=now_ms, keep=_kept_blocks(blocks, blocks_from)),
+            _Window(start=agents_from, since_ms=now_ms, keep=shown.kept()),
+        ),
         head=_session_head(detail, now_ms),
-        open_blocks=[block for block in blocks if block.is_open],
-        closed_blocks=closed_blocks,
-        blocks_total=detail.blocks_total,
+        blocks=blocks,
         blocks_more=More(href=blocks_next),
-        agents=_agent_views(detail.agents, detail.parents, now_ms),
-        agents_total=detail.agents_total,
+        agents=shown.region,
         agents_more=More(href=agents_next),
         events=[_event_view(row, now_ms) for row in events],
         events_more=More(href=events_next),
@@ -996,6 +1157,115 @@ async def events_fragment(
         "_events_page.html",
         events=[_event_view(row, now_ms) for row in reversed(page)],
         more=More(href=next_href),
+    )
+
+
+def _live_read(
+    repository: Repository, session_id: str, blocks: _Window[int], agents: _Window[str]
+) -> SessionDetail | None:
+    # One more than the cap: whether the window grew past it.
+    return repository.get_session(
+        session_id,
+        closed_limit=LIVE_CLOSED_LIMIT + 1,
+        blocks_from=blocks.start,
+        agents_from=agents.start,
+        blocks_since_ms=blocks.since_ms,
+        agents_since_ms=agents.since_ms,
+        keep_blocks=blocks.keep,
+        keep_agents=agents.keep,
+    )
+
+
+def _parse_windows(
+    query: Mapping[str, str | None], keep_block: Sequence[str], keep_agent: Sequence[str]
+) -> tuple[_Window[int], _Window[str]] | None:
+    """The two windows of a live link; ``None`` if any part is not valid."""
+    blocks_since = _parse_seq(query["blocks_since"])
+    agents_since = _parse_seq(query["agents_since"])
+    blocks_from, agents_from = query["blocks_from"], query["agents_from"]
+    blocks_start = None if blocks_from is None else _parse_seq(blocks_from)
+    kept_blocks = [_parse_seq(value) for value in keep_block]
+    if (
+        blocks_since is None
+        or agents_since is None
+        or (blocks_from is not None and blocks_start is None)
+        or (agents_from is not None and not is_valid_session_id(agents_from))
+        or len(keep_block) > LIVE_KEEP_LIMIT
+        or len(keep_agent) > LIVE_KEEP_LIMIT
+        or not all(is_valid_session_id(value) for value in keep_agent)
+    ):
+        return None
+    blocks_keep = tuple(block_id for block_id in kept_blocks if block_id is not None)
+    if len(blocks_keep) != len(kept_blocks):
+        return None
+    return (
+        _Window(start=blocks_start, since_ms=blocks_since, keep=blocks_keep),
+        _Window(start=agents_from, since_ms=agents_since, keep=tuple(keep_agent)),
+    )
+
+
+@router.get("/ui/sessions/{session_id}/live", response_class=HTMLResponse)
+async def live_fragment(
+    request: Request,
+    repository: _Repo,
+    reads: _Reads,
+    session_id: str,
+    blocks_since: str | None = None,
+    agents_since: str | None = None,
+    blocks_from: str | None = None,
+    agents_from: str | None = None,
+    keep_block: Annotated[list[str] | None, Query()] = None,
+    keep_agent: Annotated[list[str] | None, Query()] = None,
+) -> Response:
+    """The header, blocks and agents again, out of band, and a new live element (see
+    "Live refresh"): for each section its boundary (``*_from``, when the page showed a
+    closed block or a stopped agent), the time from which closed rows join
+    (``*_since``) and the rows open or running below the boundary (``keep_*``)."""
+    if not is_valid_session_id(session_id):
+        return _fragment_error(_NO_SESSION, _NOT_FOUND)
+    windows = _parse_windows(
+        {
+            "blocks_since": blocks_since,
+            "agents_since": agents_since,
+            "blocks_from": blocks_from,
+            "agents_from": agents_from,
+        },
+        keep_block or [],
+        keep_agent or [],
+    )
+    if windows is None:
+        return _fragment_error(_BAD_LINK, _BAD_REQUEST)
+    block_window, agent_window = windows
+    # Before the read: a window that starts over takes rows closed from here on.
+    now_ms = _now_ms(request)
+    found = await _read(reads, _live_read, repository, session_id, block_window, agent_window)
+    if isinstance(found, ErrorView):
+        return _fragment_error(found, _SERVICE_UNAVAILABLE)
+    if found is None:
+        return _fragment_error(_NO_SESSION, _NOT_FOUND)
+    blocks = _blocks_region(found, now_ms)
+    blocks_more = None
+    if len(blocks.closed) > LIVE_CLOSED_LIMIT:
+        # The window starts over at the latest page, with a pager below it.
+        blocks = _blocks_region(found, now_ms, keep=BLOCKS_PAGE_SIZE)
+        start = blocks.closed[-1].block_id
+        block_window = _Window(start=start, since_ms=now_ms, keep=_kept_blocks(blocks, start))
+        blocks_more = More(href=_session_href(session_id, "blocks", before=start))
+    shown = _agents_region(found, now_ms)
+    agents_more = None
+    if len(shown.stopped) > LIVE_CLOSED_LIMIT:
+        shown = _agents_region(found, now_ms, keep=AGENTS_PAGE_SIZE)
+        boundary = shown.boundary
+        agent_window = _Window(start=boundary, since_ms=now_ms, keep=shown.kept())
+        agents_more = More(href=_session_href(session_id, "agents", before=boundary))
+    return _render(
+        "_session_live.html",
+        live=_live_link(session_id, block_window, agent_window),
+        head=_session_head(found, now_ms),
+        blocks=blocks,
+        blocks_more=blocks_more,
+        agents=shown.region,
+        agents_more=agents_more,
     )
 
 

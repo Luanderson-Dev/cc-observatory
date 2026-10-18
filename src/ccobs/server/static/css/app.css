@@ -596,6 +596,22 @@ details[open] > .bay__summary .bay__title::before {
   color: var(--error);
 }
 
+/* Live updates paused (live.js): a quiet line above the content, empty and hidden while
+   the stream is up. The text says what happened; the band is not the only signal. */
+.live-status {
+  margin-bottom: var(--space-4);
+  padding: var(--space-2) var(--space-4);
+  border-left: var(--band-width) solid var(--ink-muted);
+  border-radius: var(--radius-strip);
+  background: var(--strip);
+  color: var(--ink);
+  font-size: var(--text-sm);
+}
+
+.live-status:empty {
+  display: none;
+}
+
 .hook-settings-box {
   position: relative;
 }
@@ -847,6 +863,13 @@ details[open] > .bay__summary .bay__title::before {
 .block__when {
   color: var(--ink-muted);
   font-size: var(--text-sm);
+}
+
+/* The older pages of a list sit right under the rows the live refresh replaces. An
+   empty one takes no room and is not announced as an empty list. */
+.blocks--older:empty,
+.agents--older:empty {
+  display: none;
 }
 
 .agents__root {

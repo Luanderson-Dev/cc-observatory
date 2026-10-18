@@ -51,7 +51,7 @@ from ccobs.server.reconcile import (
     Reconciler,
 )
 from ccobs.server.sweeps import Sweeper
-from ccobs.server.writer import BlockClosedCallback, Writer
+from ccobs.server.writer import Writer, WriterObservers
 
 FIXTURES: Final = Path(__file__).parents[1] / "fixtures"
 HOOKS: Final = FIXTURES / "hooks" / "interactive-permission-compact.jsonl"
@@ -689,16 +689,15 @@ def clock() -> Clock:
     return Clock()
 
 
-def manual(
-    queue: HookQueue, repository: Repository, on_block_closed: BlockClosedCallback
-) -> ManualWriter:
+def manual(queue: HookQueue, repository: Repository, observers: WriterObservers) -> ManualWriter:
     return ManualWriter(
         queue,
         repository,
         HOST,
         stale_after_ms=12 * HOUR_MS,
         batch_wait_s=0,
-        on_block_closed=on_block_closed,
+        on_block_closed=observers.on_block_closed,
+        on_committed=observers.on_committed,
     )
 
 

@@ -26,7 +26,7 @@ from starlette.routing import Mount
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from ccobs.domain.hook_config import HOOK_PATH
-from ccobs.server import api, ui
+from ccobs.server import api, live, ui
 from ccobs.server import app as server_app
 from ccobs.server.config import Settings
 from ccobs.server.guards import (
@@ -878,7 +878,7 @@ def test_the_middlewares_wrap_in_order(app: FastAPI) -> None:
 
 # The routers that create_app includes: FastAPI lists an included router in app.routes
 # as one entry without a path, so their routes are read from the routers themselves.
-INCLUDED_ROUTERS: Final = (api.router, ui.router)
+INCLUDED_ROUTERS: Final = (api.router, ui.router, live.router)
 # A file under a mount: the mount's own path matches nothing.
 MOUNTED_FILE: Final = "/x"
 
@@ -903,6 +903,7 @@ def test_the_read_only_check_sees_every_route(app: FastAPI) -> None:
     assert f"/api/v1/sessions/{SESSION_ID}/events" in paths
     assert "/" in paths
     assert "/ui/board" in paths
+    assert "/ui/stream" in paths
     assert "/static" + MOUNTED_FILE in paths
     assert not any("{" in path for path in paths)
     # A router included without being added to INCLUDED_ROUTERS fails here.

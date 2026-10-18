@@ -41,7 +41,7 @@ from ccobs.server.db.repository import Repository, SessionView
 from ccobs.server.ingest import HookQueue
 from ccobs.server.migrations import MigrationError
 from ccobs.server.reads import READ_SLOTS, ReadGate
-from ccobs.server.writer import BlockClosedCallback, Writer
+from ccobs.server.writer import Writer, WriterObservers
 
 HOOK_FIXTURES: Final = Path(__file__).parents[1] / "fixtures" / "hooks"
 # Agents and a permission block; an elicitation block and idle; compaction and a
@@ -179,7 +179,7 @@ def started(settings: Settings, clock: Clock, **options: Any) -> Iterator[TestCl
     """The app with a manual writer, started, behind a good ``Host``."""
 
     def manual(
-        queue: HookQueue, repository: Repository, on_block_closed: BlockClosedCallback
+        queue: HookQueue, repository: Repository, observers: WriterObservers
     ) -> ManualWriter:
         return ManualWriter(queue, repository, HOST, stale_after_ms=12 * HOUR_MS, batch_wait_s=0)
 

@@ -13,6 +13,8 @@ import functools
 import json
 import logging
 import os
+import subprocess
+import sys
 import threading
 import time
 from collections import Counter
@@ -33,6 +35,7 @@ from ccobs.domain.hook_config import HOOK_PATH
 from ccobs.domain.hooks import parse_hook
 from ccobs.domain.sessions import SessionState, apply
 from ccobs.server import app as server_app
+from ccobs.server.changes import ALL, Change
 from ccobs.server.config import Settings
 from ccobs.server.db.engine import create_engine_for
 from ccobs.server.db.models import (
@@ -44,8 +47,9 @@ from ccobs.server.db.models import (
 )
 from ccobs.server.db.repository import Applied, HookEventRow, Repository, hook_event_row
 from ccobs.server.ingest import DROP_REASONS, HookQueue, RawHook
+from ccobs.server.live import ChangeHub
 from ccobs.server.migrations import upgrade_to_head
-from ccobs.server.writer import BlockClosedCallback, Writer, WriterCounts
+from ccobs.server.writer import Writer, WriterCounts, WriterObservers
 
 # The app without its metrics listener (only tests/server/test_metrics.py opens sockets)
 # and without its sweeper (tests/server/test_sweeps.py covers it).
@@ -410,9 +414,7 @@ def test_the_lifespan_uses_an_injected_writer_factory(settings: Settings) -> Non
 
     recorder = Recorder()
 
-    def factory(
-        queue: HookQueue, repository: Repository, on_block_closed: BlockClosedCallback
-    ) -> Recorder:
+    def factory(queue: HookQueue, repository: Repository, observers: WriterObservers) -> Recorder:
         calls.append(("factory", repository.max_seq()))
         return recorder
 
@@ -1123,6 +1125,160 @@ def test_counts_are_safe_to_read_from_another_thread(
 
     assert seen
     assert writer.counts().events_processed == len(lines)
+
+
+# Live updates (ADR 0032): the writer names the sessions each commit changed.
+
+
+class Commits:
+    """An ``on_committed`` that records each change and, at that moment, how many hook
+    events the database holds: the callback must come after the commit."""
+
+    def __init__(self, engine: Engine) -> None:
+        self.engine = engine
+        self.calls: list[tuple[Change, int]] = []
+
+    def __call__(self, change: Change) -> None:
+        self.calls.append((change, count(self.engine, HookEventModel)))
+
+    @property
+    def changes(self) -> list[Change]:
+        return [change for change, _ in self.calls]
+
+
+def test_each_commit_names_the_sessions_it_changed_once_committed(
+    make_writer: Callable[..., Writer], feed: Feeder, repo: FlakyRepository
+) -> None:
+    commits = Commits(repo.engine)
+    writer = make_writer(on_committed=commits)
+    feed(payload("UserPromptSubmit"))
+    feed(payload("UserPromptSubmit", OTHER))
+
+    run_all(writer)
+
+    # One batch, one commit, one call: both sessions, with their rows already stored.
+    assert commits.calls == [(frozenset({SESSION, OTHER}), 2)]
+
+
+def test_a_batch_that_writes_nothing_names_nothing(
+    make_writer: Callable[..., Writer], feed: Feeder, repo: FlakyRepository
+) -> None:
+    commits = Commits(repo.engine)
+    writer = make_writer(on_committed=commits)
+    feed.raw(b"not json", BASE)
+
+    run_all(writer)
+
+    assert commits.calls == []
+
+
+def test_a_failed_batch_names_only_what_its_retries_committed(
+    make_writer: Callable[..., Writer], feed: Feeder, repo: FlakyRepository
+) -> None:
+    commits = Commits(repo.engine)
+    writer = make_writer(on_committed=commits)
+    feed(payload("UserPromptSubmit"))
+    failing = feed(payload("UserPromptSubmit", OTHER))
+    repo.fail_seqs = {failing.seq}
+
+    run_all(writer)
+
+    assert commits.calls == [(frozenset({SESSION}), 1)]
+    repo.fail_seqs = set()
+    repo.fail_all = True
+    feed(payload("Stop"))
+    run_all(writer)
+    assert commits.calls == [(frozenset({SESSION}), 1)]
+
+
+def test_ticks_and_telemetry_closes_name_their_sessions(
+    make_writer: Callable[..., Writer], feed: Feeder, repo: FlakyRepository
+) -> None:
+    commits = Commits(repo.engine)
+    writer, session_id = _blocked(lambda **kwargs: make_writer(on_committed=commits), feed)
+    at = BASE + PERMISSION_PREFIX[-1][0] + 500
+    commits.calls.clear()
+
+    writer.submit_telemetry_close(session_id, PERMISSION_TOOL_USE_ID, at)
+    run_all(writer)
+    writer.submit_tick(at + STALE_AFTER_MS)
+    run_all(writer)
+
+    assert commits.changes == [frozenset({session_id}), frozenset({session_id})]
+
+
+def test_retention_that_deletes_sessions_names_every_session(
+    make_writer: Callable[..., Writer], feed: Feeder, repo: FlakyRepository
+) -> None:
+    commits = Commits(repo.engine)
+    writer, _ = _blocked(lambda **kwargs: make_writer(on_committed=commits), feed)
+    last = BASE + PERMISSION_PREFIX[-1][0]
+    writer.submit_tick(last + STALE_AFTER_MS)
+    run_all(writer)
+    commits.calls.clear()
+
+    writer.submit_retention(last - 1)  # nothing that old
+    run_all(writer)
+    assert commits.calls == []
+    repo.fail_retention = True
+    writer.submit_retention(last + 1)
+    run_all(writer)
+    assert commits.calls == []
+    repo.fail_retention = False
+    writer.submit_retention(last + 1)
+    run_all(writer)
+
+    assert commits.changes == [ALL]
+
+
+def test_a_failing_commit_callback_is_logged_and_ignored(
+    make_writer: Callable[..., Writer],
+    feed: Feeder,
+    repo: FlakyRepository,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.DEBUG, logger="ccobs")
+
+    def callback(change: Change) -> None:
+        raise ValueError(CANARY)
+
+    writer = make_writer(on_committed=callback)
+    feed.lines(fixture_lines(TOOLS))
+    run_all(writer)
+
+    assert count(repo.engine, HookEventModel) == len(fixture_lines(TOOLS))
+    assert writer.counts().events_processed == len(fixture_lines(TOOLS))
+    assert "ValueError" in caplog.text
+    assert CANARY not in caplog.text
+    assert SESSION not in caplog.text
+
+
+def test_the_writer_does_not_import_the_web_framework() -> None:
+    # The writer names changes with ccobs.server.changes, which needs only the standard
+    # library; the hub, which needs Starlette, lives in ccobs.server.live.
+    code = (
+        "import sys, ccobs.server.writer;"
+        "names = ('starlette', 'fastapi', 'ccobs.server.live');"
+        "print(sorted(m for m in names if m in sys.modules))"
+    )
+    completed = subprocess.run(  # noqa: S603 - this interpreter, fixed arguments
+        [sys.executable, "-c", code], check=True, capture_output=True, text=True
+    )
+
+    assert completed.stdout.strip() == "[]"
+
+
+def test_the_app_feeds_the_hub_from_the_writer(settings: Settings) -> None:
+    app = create_app(settings)
+    with TestClient(app, base_url=f"http://{GOOD_HOST}") as client:
+        hub: ChangeHub = app.state.live
+        portal = client.portal
+        assert portal is not None
+        subscription = portal.call(hub.subscribe, None)
+        assert subscription is not None
+        response = client.post(HOOK_PATH, content=body(payload("UserPromptSubmit")), headers=JSON)
+        assert response.status_code == 204
+        wait_until(lambda: portal.call(subscription.take) == frozenset({SESSION}))
 
 
 # The thread and shutdown.

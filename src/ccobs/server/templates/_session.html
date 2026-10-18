@@ -75,3 +75,83 @@
 {% macro tail_element(tail) -%}
 <div id="timeline-tail" class="timeline__tail" hx-get="{{ tail.href }}" hx-trigger="{% if tail.now %}load, {% endif %}ccobs:changed from:body" hx-swap="outerHTML" hx-sync="this:replace"></div>
 {%- endmacro %}
+
+{#- The session header; out of band in the live fragment. -#}
+{% macro session_head(head, oob=False) -%}
+<header id="session-head" class="session-head strip--{{ head.status }}"{% if oob %} hx-swap-oob="true"{% endif %}>
+  <div class="session-head__title">
+    <h1 class="session-head__project">{% if head.project %}{{ head.project }}{% else %}<span class="strip__unknown">Unknown project</span>{% endif %}</h1>
+    <code class="session-head__short">{{ head.short_id }}</code>
+  </div>
+  {% if head.path %}<p class="session-head__path">{{ head.path }}</p>{% endif %}
+  <div class="session-head__status">
+    <span class="session-head__state">{{ head.state_label }}</span>
+    {% if head.doing %}<span class="session-head__doing">{{ head.doing }}</span>{% endif %}
+    {% if head.waiting %}<span class="session-head__elapsed"><span class="visually-hidden">Waiting for</span>{{ moment(head.waiting, "session-head__wait") }}</span>{% endif %}
+    {% if head.error_code %}<span class="session-head__error">Last error <code>{{ head.error_code }}</code></span>{% endif %}
+  </div>
+  <dl class="session-head__facts">
+    <div><dt>Started</dt><dd>{{ moment(head.started) }} ago</dd></div>
+    <div><dt>Last event</dt><dd>{{ moment(head.last_event) }} ago</dd></div>
+    {% if head.ended %}<div><dt>Ended</dt><dd>{{ moment(head.ended) }} ago</dd></div>{% endif %}
+    <div class="session-head__fact-id"><dt>Session ID</dt><dd><code class="session-head__id">{{ head.session_id }}</code></dd></div>
+  </dl>
+</header>
+{%- endmacro %}
+
+{#- The blocks the live refresh replaces: the heading, every open block, and the closed
+    ones from the page's boundary up. Older pages go to #closed-blocks-older, outside. -#}
+{% macro blocks_region(blocks, oob=False) -%}
+<div id="blocks-live"{% if oob %} hx-swap-oob="true"{% endif %}>
+  <h2 class="session-section__title" id="blocks-heading">Blocks <span class="bay__count">{{ blocks.total }}</span></h2>
+  {% if blocks.open %}
+  <h3 class="session-section__subtitle">Waiting on you now</h3>
+  <ol id="open-blocks" class="blocks">
+  {% for b in blocks.open %}
+  {{ block_row(b) }}
+  {% endfor %}
+  </ol>
+  {% endif %}
+  {% if blocks.closed %}
+  <h3 class="session-section__subtitle">Closed, newest first</h3>
+  <ol id="closed-blocks" class="blocks">
+  {% for b in blocks.closed %}
+  {{ block_row(b) }}
+  {% endfor %}
+  </ol>
+  {% endif %}
+  {% if not blocks.open and not blocks.closed %}
+  <p class="session-section__empty">No blocks: this session never waited on you.</p>
+  {% endif %}
+</div>
+{%- endmacro %}
+
+{#- The agents the live refresh replaces: the heading and the tree of every running agent
+    and the stopped ones from the page's boundary up. Older pages go to #agents-older. -#}
+{% macro agents_region(agents, oob=False) -%}
+<div id="agents-live"{% if oob %} hx-swap-oob="true"{% endif %}>
+  <h2 class="session-section__title" id="agents-heading">Agents <span class="bay__count">{{ agents.total }}</span></h2>
+  {% if agents.rows %}
+  <p class="agents__root">Main thread</p>
+  <ol id="agents" class="agents">
+  {% for a in agents.rows %}
+  {{ agent_row(a) }}
+  {% endfor %}
+  </ol>
+  {% else %}
+  <p class="session-section__empty">No subagents ran in this session.</p>
+  {% endif %}
+</div>
+{%- endmacro %}
+
+{#- An older list, empty until a "Show older" page lands in it; out of band (emptied) when
+    the live refresh starts its window over. -#}
+{% macro older_list(id, cls, oob=False) -%}
+<ol id="{{ id }}" class="{{ cls }} {{ cls }}--older"{% if oob %} hx-swap-oob="true"{% endif %}></ol>
+{%- endmacro %}
+
+{#- The live refresh: on ccobs:changed it fetches the header, blocks and agents and
+    replaces itself; the URL keeps the page's boundaries and time (see ui.py). -#}
+{% macro live_element(live) -%}
+<div id="session-live" hidden hx-get="{{ live.href }}" hx-trigger="ccobs:changed from:body" hx-swap="outerHTML" hx-sync="this:replace"></div>
+{%- endmacro %}

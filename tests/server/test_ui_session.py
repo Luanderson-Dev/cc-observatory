@@ -19,11 +19,12 @@ import subprocess
 from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
 from typing import Any, Final
+from urllib.parse import urlencode
 
 import pytest
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
-from sqlalchemy import Engine, insert, select
+from sqlalchemy import Engine, insert, select, update
 from sqlalchemy.exc import OperationalError
 
 from ccobs.domain.hook_config import HOOK_PATH
@@ -40,7 +41,7 @@ from ccobs.server.db.models import (
 from ccobs.server.db.repository import Repository
 from ccobs.server.ingest import HookQueue
 from ccobs.server.reads import ReadGate
-from ccobs.server.writer import BlockClosedCallback, Writer
+from ccobs.server.writer import Writer, WriterObservers
 
 HOOK_FIXTURES: Final = Path(__file__).parents[1] / "fixtures" / "hooks"
 APP_JS: Final = Path(__file__).parents[2] / "src" / "ccobs" / "server" / "static" / "js" / "app.js"
@@ -112,7 +113,7 @@ def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[TestClie
     settings = Settings(data_dir=tmp_path / "data", host_label=HOST)
 
     def manual(
-        queue: HookQueue, repository: Repository, on_block_closed: BlockClosedCallback
+        queue: HookQueue, repository: Repository, observers: WriterObservers
     ) -> ManualWriter:
         return ManualWriter(queue, repository, HOST, stale_after_ms=12 * HOUR_MS, batch_wait_s=0)
 
@@ -312,7 +313,14 @@ def test_an_unknown_or_invalid_session_is_a_styled_404_without_echo(
 
 
 @pytest.mark.parametrize(
-    "suffix", ["blocks?before=5", "agents?before=a1", "events?before=5", "events?after=0"]
+    "suffix",
+    [
+        "blocks?before=5",
+        "agents?before=a1",
+        "events?before=5",
+        "events?after=0",
+        "live?blocks_since=1&agents_since=1",
+    ],
 )
 def test_the_fragments_of_an_unknown_session_are_404(client: TestClient, suffix: str) -> None:
     for session_id in ("unknown-session", "%01bad"):
@@ -499,7 +507,9 @@ def test_the_blocks_pager_pages_to_the_end_without_duplicates(client: TestClient
     href = more_href(body, "blocks-more")
     assert href == url("blocks?before=80")
     control = section(body, "blocks-more")
-    assert 'hx-target="#closed-blocks"' in control
+    # Older pages go to a list of their own, which the live refresh leaves alone.
+    assert 'hx-target="#closed-blocks-older"' in control
+    assert '<ol id="closed-blocks-older" class="blocks blocks--older"></ol>' in body
     assert 'hx-swap="beforeend"' in control
 
     fragments = 0
@@ -641,6 +651,8 @@ def test_the_agents_pager_pages_to_the_end_without_duplicates(client: TestClient
     assert len(seen) == 52
     href = more_href(body, "agents-more")
     assert href == url("agents?before=stopped-070")
+    assert 'hx-target="#agents-older"' in section(body, "agents-more")
+    assert '<ol id="agents-older" class="agents agents--older"></ol>' in body
 
     fragments = 0
     while href is not None:
@@ -1006,6 +1018,336 @@ def test_an_agent_cursor_is_quoted(client: TestClient) -> None:
     assert len(agent_ids(page(client, href))) == 10
 
 
+# Live refresh (ADR 0032): the header, the open blocks and running agents, and what
+# closed or stopped since the page loaded; never the older pages the user loaded.
+
+
+def live_element(body: str) -> str:
+    found = re.search(r'<div\b[^>]*\bid="session-live"[^>]*>', body)
+    assert found is not None
+    return found.group(0)
+
+
+def live_url(
+    *,
+    blocks_from: int | None = None,
+    agents_from: str | None = None,
+    blocks_since: int = NOW,
+    agents_since: int = NOW,
+    keep_blocks: Sequence[int] = (),
+    keep_agents: Sequence[str] = (),
+) -> str:
+    query: list[tuple[str, object]] = []
+    if blocks_from is not None:
+        query.append(("blocks_from", blocks_from))
+    query.append(("blocks_since", blocks_since))
+    if agents_from is not None:
+        query.append(("agents_from", agents_from))
+    query.append(("agents_since", agents_since))
+    query += [("keep_block", block_id) for block_id in keep_blocks]
+    query += [("keep_agent", agent_id) for agent_id in keep_agents]
+    return url("live?" + urlencode(query))
+
+
+def clock_of(client: TestClient) -> Clock:
+    clock = app_of(client).state.clock
+    assert isinstance(clock, Clock)
+    return clock
+
+
+def live_href(body: str) -> str:
+    href = re.search(r'hx-get="([^"]+)"', live_element(body))
+    assert href is not None
+    return html.unescape(href.group(1))
+
+
+def change(client: TestClient, model: Any, where: dict[str, object], **values: object) -> None:
+    table = model.__table__
+    condition = [table.c[name] == value for name, value in where.items()]
+    with engine_of(client).begin() as connection:
+        connection.execute(
+            update(table).where(*condition, table.c.session_id == SID).values(values)
+        )
+
+
+def stopped_agent(
+    agent_id: str, started_at_ms: int, stopped_at_ms: int = NOW - MINUTE_MS
+) -> RowValues:
+    return agent_row(
+        agent_id,
+        started_at_ms,
+        status="stopped",
+        stopped_at_ms=stopped_at_ms,
+        stop_reason="stopped",
+    )
+
+
+def test_the_page_listens_for_changes_to_its_session(client: TestClient) -> None:
+    seed(
+        client,
+        [session_row()],
+        blocks=[closed_block(3, NOW - HOUR_MS, MINUTE_MS, "denied")],
+        agents=[stopped_agent("a1", NOW - HOUR_MS), agent_row("r1", NOW - MINUTE_MS)],
+    )
+
+    body = page(client, f"/sessions/{SID}")
+    element = live_element(body)
+
+    # The page's boundaries: its oldest closed block and stopped agent, and its time.
+    assert live_href(body) == live_url(blocks_from=3, agents_from="a1")
+    assert " hidden " in element
+    assert 'hx-trigger="ccobs:changed from:body"' in element
+    assert 'hx-swap="outerHTML"' in element
+    assert 'hx-sync="this:replace"' in element
+    stream = f"/ui/stream?{urlencode({'session': SID})}"
+    status = f'<div id="live-status" class="live-status" role="status" data-stream="{stream}">'
+    assert status + "</div>" in body
+
+
+def test_a_page_without_closed_rows_has_no_boundaries(client: TestClient) -> None:
+    seed(client, [session_row()])
+
+    assert live_href(page(client, f"/sessions/{SID}")) == live_url()
+
+
+def test_the_live_fragment_refreshes_the_header_blocks_and_agents(client: TestClient) -> None:
+    seed(
+        client,
+        [session_row(status="waiting_user")],
+        blocks=[block_row(4, NOW - MINUTE_MS)],
+        agents=[agent_row("r1", NOW - MINUTE_MS)],
+    )
+    href = live_href(page(client, f"/sessions/{SID}"))
+    # The session moves on: the block closes and another opens, the agent stops and
+    # another starts.
+    change(client, SessionModel, {}, status="working")
+    change(client, BlockModel, {"block_id": 4}, closed_at_ms=NOW, close_reason="denied")
+    seed(client, blocks=[block_row(7, NOW)], agents=[agent_row("r2", NOW)])
+    change(client, AgentModel, {"agent_id": "r1"}, status="stopped", stopped_at_ms=NOW)
+
+    fragment = page(client, href)
+
+    assert "<html" not in fragment
+    # The main swap: the element that asked, with the same boundaries.
+    assert fragment.lstrip().startswith('<div id="session-live"')
+    assert live_href(fragment) == href
+    header = '<header id="session-head" class="session-head strip--working" hx-swap-oob="true">'
+    assert header in fragment
+    assert '<span class="session-head__state">Working</span>' in section(fragment, "session-head")
+    assert '<div id="blocks-live" hx-swap-oob="true">' in fragment
+    assert block_ids(section(fragment, "open-blocks")) == [7]
+    assert block_ids(section(fragment, "closed-blocks")) == [4]
+    assert 'Blocks <span class="bay__count">2</span>' in fragment
+    assert '<div id="agents-live" hx-swap-oob="true">' in fragment
+    assert agent_ids(section(fragment, "agents")) == ["r2", "r1"]
+    assert 'Agents <span class="bay__count">2</span>' in fragment
+    # The older lists and their controls are left as they are.
+    for untouched in ("closed-blocks-older", "blocks-more", "agents-older", "agents-more"):
+        assert untouched not in fragment
+
+
+def test_the_live_blocks_keep_their_boundary_and_take_blocks_closed_since(
+    client: TestClient,
+) -> None:
+    closed = [
+        closed_block(block_id, NOW - HOUR_MS, MINUTE_MS, "denied") for block_id in range(10, 130)
+    ]
+    seed(
+        client,
+        [session_row(status="waiting_user")],
+        blocks=[block_row(5, NOW - HOUR_MS), *closed],
+    )
+    body = page(client, f"/sessions/{SID}")
+    href = live_href(body)
+    # Block 5, open below the boundary, is named in the link.
+    assert href == live_url(blocks_from=80, keep_blocks=[5])
+    assert more_href(body, "blocks-more") == url("blocks?before=80")
+    # Block 5 closes with a time before the page's (as a sweep or a late hook would
+    # close it); two new blocks close.
+    change(client, BlockModel, {"block_id": 5}, closed_at_ms=NOW - 1, close_reason="stale")
+    seed(
+        client,
+        blocks=[closed_block(block_id, NOW, MINUTE_MS, "denied") for block_id in (300, 301)],
+    )
+
+    fragment = page(client, href)
+
+    # Everything from the boundary up, plus block 5: the pager, still before=80, goes on
+    # below the boundary with no gap and no repeat.
+    assert block_ids(section(fragment, "closed-blocks")) == [301, 300, *range(129, 79, -1), 5]
+    assert 'id="open-blocks"' not in fragment
+    assert live_href(fragment) == href
+
+
+def test_a_live_block_window_past_its_cap_starts_over_with_a_new_pager(
+    client: TestClient,
+) -> None:
+    old = [closed_block(block_id, NOW - HOUR_MS, MINUTE_MS, "denied") for block_id in range(1, 61)]
+    seed(client, [session_row()], blocks=old)
+    href = live_href(page(client, f"/sessions/{SID}"))
+    assert href == live_url(blocks_from=11)
+    new = range(100, 100 + ui.LIVE_CLOSED_LIMIT)
+    seed(client, blocks=[closed_block(block_id, NOW, MINUTE_MS, "denied") for block_id in new])
+
+    fragment = page(client, href)
+
+    # The latest page of closed blocks, the older list emptied and a pager from there.
+    assert block_ids(section(fragment, "closed-blocks")) == list(range(299, 249, -1))
+    emptied = '<ol id="closed-blocks-older" class="blocks blocks--older" hx-swap-oob="true"></ol>'
+    assert emptied in fragment
+    assert '<div id="blocks-more" class="more" hx-swap-oob="true">' in fragment
+    assert more_href(fragment, "blocks-more") == url("blocks?before=250")
+    assert 'hx-target="#closed-blocks-older"' in section(fragment, "blocks-more")
+    assert live_href(fragment) == live_url(blocks_from=250)
+    assert "agents-older" not in fragment
+    assert block_ids(page(client, url("blocks?before=250")))[:2] == [249, 248]
+
+
+def test_after_a_reset_the_next_refresh_holds_the_new_page_and_new_rows_only(
+    client: TestClient,
+) -> None:
+    old = [closed_block(block_id, NOW - HOUR_MS, MINUTE_MS, "denied") for block_id in range(1, 61)]
+    seed(client, [session_row()], blocks=old)
+    href = live_href(page(client, f"/sessions/{SID}"))
+    burst = range(100, 100 + ui.LIVE_CLOSED_LIMIT)
+    seed(client, blocks=[closed_block(block_id, NOW, MINUTE_MS, "denied") for block_id in burst])
+    # The reset happens later than the burst closed.
+    clock_of(client).now = NOW + 2 * MINUTE_MS
+    reset = page(client, href)
+    assert "closed-blocks-older" in reset
+    second_href = live_href(reset)
+    assert second_href == live_url(blocks_from=250, blocks_since=NOW + 2 * MINUTE_MS)
+    seed(
+        client,
+        blocks=[
+            closed_block(block_id, NOW + 2 * MINUTE_MS, SECOND_MS, "denied")
+            for block_id in (400, 401)
+        ],
+    )
+
+    again = page(client, second_href)
+
+    # No new reset: the 50 rows of the new page and the two new ones, older lists kept.
+    region = block_ids(section(again, "closed-blocks"))
+    assert region == [401, 400, *range(299, 249, -1)]
+    assert "closed-blocks-older" not in again
+    assert "blocks-more" not in again
+    assert live_href(again) == second_href
+    # The pager from the new boundary repeats nothing the region holds.
+    older = block_ids(page(client, url("blocks?before=250")))
+    assert older
+    assert not set(older) & set(region)
+
+
+def test_the_live_agents_keep_their_boundary_and_take_agents_stopped_since(
+    client: TestClient,
+) -> None:
+    stopped = [
+        stopped_agent(f"stopped-{index:03d}", NOW - HOUR_MS + index * SECOND_MS)
+        for index in range(60)
+    ]
+    seed(client, [session_row()], agents=[*stopped, agent_row("running-0", NOW - 2 * HOUR_MS)])
+    href = live_href(page(client, f"/sessions/{SID}"))
+    # The running agent below the boundary is named in the link.
+    assert href == live_url(agents_from="stopped-010", keep_agents=["running-0"])
+    # It stops with a time before the page's (the stale sweep stops an agent at its last
+    # event); a new agent starts.
+    change(client, AgentModel, {"agent_id": "running-0"}, status="stopped", stopped_at_ms=NOW - 1)
+    seed(client, agents=[agent_row("new-agent", NOW)])
+
+    fragment = page(client, href)
+
+    shown = agent_ids(section(fragment, "agents"))
+    assert sorted(shown) == sorted(
+        ["new-agent", "running-0", *[f"stopped-{index:03d}" for index in range(10, 60)]]
+    )
+    assert live_href(fragment) == href
+
+
+def test_a_live_link_leaves_out_agent_ids_too_long_to_carry(client: TestClient) -> None:
+    long_id = "r" * (ui.LIVE_KEEP_ID_MAX + 1)
+    fits = "f" * ui.LIVE_KEEP_ID_MAX
+    seed(
+        client,
+        [session_row()],
+        agents=[
+            agent_row(long_id, NOW - 3 * HOUR_MS),
+            agent_row(fits, NOW - 3 * HOUR_MS + 1),
+            stopped_agent("stopped-1", NOW - HOUR_MS),
+        ],
+    )
+
+    href = live_href(page(client, f"/sessions/{SID}"))
+
+    assert href == live_url(agents_from="stopped-1", keep_agents=[fits])
+    # The refresh still works, and the running agent left out is shown while it runs.
+    assert sorted(agent_ids(section(page(client, href), "agents"))) == sorted(
+        [long_id, fits, "stopped-1"]
+    )
+
+
+def test_a_live_agent_window_past_its_cap_starts_over_with_a_new_pager(
+    client: TestClient,
+) -> None:
+    old = [stopped_agent(f"old-{index:03d}", NOW - 2 * HOUR_MS + index) for index in range(60)]
+    seed(client, [session_row()], agents=old)
+    href = live_href(page(client, f"/sessions/{SID}"))
+    assert href == live_url(agents_from="old-010")
+    limit = ui.LIVE_CLOSED_LIMIT
+    seed(
+        client,
+        agents=[stopped_agent(f"new-{index:03d}", NOW - HOUR_MS + index) for index in range(limit)],
+    )
+
+    fragment = page(client, href)
+
+    newest = [f"new-{index:03d}" for index in range(limit - 50, limit)]
+    assert sorted(agent_ids(section(fragment, "agents"))) == newest
+    emptied = '<ol id="agents-older" class="agents agents--older" hx-swap-oob="true"></ol>'
+    assert emptied in fragment
+    assert '<div id="agents-more" class="more" hx-swap-oob="true">' in fragment
+    boundary = newest[0]
+    assert more_href(fragment, "agents-more") == url(f"agents?before={boundary}")
+    assert 'hx-target="#agents-older"' in section(fragment, "agents-more")
+    assert live_href(fragment) == live_url(agents_from=boundary)
+    assert "closed-blocks-older" not in fragment
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "",
+        "blocks_since=1",
+        "agents_since=1",
+        "blocks_since=x&agents_since=1",
+        "blocks_since=1&agents_since=" + str(2**63),
+        "blocks_since=1&agents_since=1&blocks_from=x",
+        "blocks_since=1&agents_since=1&blocks_from=",
+        "blocks_since=1&agents_since=1&agents_from=%01",
+        "blocks_since=1&agents_since=1&agents_from=" + "x" * 300,
+        "blocks_since=1&agents_since=1&keep_block=x",
+        "blocks_since=1&agents_since=1&keep_agent=%01",
+        "blocks_since=1&agents_since=1" + "&keep_block=1" * 9,
+        "blocks_since=1&agents_since=1" + "&keep_agent=a" * 9,
+    ],
+)
+def test_an_invalid_live_link_is_a_400_without_echo(client: TestClient, query: str) -> None:
+    seed(client, [session_row()])
+
+    body = page(client, url(f"live?{query}"), status=400)
+
+    assert "This page link is not valid" in body
+    assert "xxxx" not in body
+
+
+def test_an_unknown_agent_boundary_still_refreshes(client: TestClient) -> None:
+    seed(client, [session_row()], agents=[agent_row("r1", NOW)])
+
+    fragment = page(client, url("live?blocks_since=1&agents_since=1&agents_from=gone-agent"))
+
+    assert agent_ids(section(fragment, "agents")) == ["r1"]
+
+
 # Reads and errors.
 
 
@@ -1036,11 +1378,18 @@ def test_each_request_takes_one_read_slot(
         url("events?before=9"),
         url("events?after=0"),
         url("events?after=0", "unknown"),
+        url("live?blocks_from=3&blocks_since=1&agents_from=a1&agents_since=1"),
+        url("live?blocks_since=1&agents_since=1", "unknown"),
     ):
         calls.clear()
         client.get(target)
         assert len(calls) == 1, target
-    for invalid in ("/sessions/%01", url("events?before=x"), url("agents?before=%01")):
+    for invalid in (
+        "/sessions/%01",
+        url("events?before=x"),
+        url("agents?before=%01"),
+        url("live?blocks_since=x&agents_since=1"),
+    ):
         calls.clear()
         client.get(invalid)
         assert calls == [], invalid
@@ -1072,6 +1421,7 @@ BROKEN: Final = OperationalError("SELECT secret", {}, Exception("disk I/O error"
         url("agents?before=a1"),
         url("events?before=9"),
         url("events?after=0"),
+        url("live?blocks_since=1&agents_since=1"),
     ],
 )
 def test_a_failed_read_says_what_failed_with_503(
@@ -1088,11 +1438,17 @@ def test_a_failed_read_says_what_failed_with_503(
         assert "<html" not in body
     else:
         assert '<header class="masthead">' in body
+        # Nothing to refresh: the page does not open a live stream.
+        assert "data-stream" not in body
 
 
 def test_session_pages_are_guarded_and_never_stored(client: TestClient) -> None:
     seed(client, [session_row()])
-    for target in (f"/sessions/{SID}", url("events?after=0")):
+    for target in (
+        f"/sessions/{SID}",
+        url("events?after=0"),
+        url("live?blocks_since=1&agents_since=1"),
+    ):
         response = client.get(target)
         assert response.headers["cache-control"] == "no-store"
         assert "default-src 'none'" in response.headers["content-security-policy"]
@@ -1166,3 +1522,200 @@ def test_app_js_follows_up_pager_swaps() -> None:
 
     for event in ("htmx:beforeRequest", "htmx:beforeSwap", "htmx:afterSettle"):
         assert f'addEventListener("{event}"' in script, event
+
+
+# app.js after a live refresh (ADR 0032): an older list never repeats a row the refreshed
+# region holds, and the board keeps its open bays and focus across its swap.
+
+LIVE_SWAPS_SCRIPT: Final = """
+const src = require('fs').readFileSync(process.argv[1], 'utf8');
+const sandbox = {window: {}, document: {addEventListener() {}, readyState: 'loading'}};
+new Function('window', 'document', src)(sandbox.window, sandbox.document);
+const w = sandbox.window;
+const row = (key, value) => ({
+  attrs: {[key]: value},
+  getAttribute(name) { return name in this.attrs ? this.attrs[name] : null; },
+  hasAttribute(name) { return name in this.attrs; },
+});
+const ids = (rows) => rows.map((r) => Object.values(r.attrs)[0]);
+function list(rows) {
+  return {
+    children: rows,
+    removeChild(r) { this.children = this.children.filter((c) => c !== r); },
+    querySelectorAll(selector) {
+      const key = selector.slice(1, -1);
+      return this.children.filter((r) => r.hasAttribute(key));
+    },
+  };
+}
+const b = (id) => row('data-block-id', id);
+const a = (id) => row('data-agent-id', id);
+const lists = {
+  'blocks-live': list([b('9'), b('5')]),
+  'closed-blocks-older': list([b('4'), b('5'), b('3')]),
+  'agents-live': list([a('new'), a('ran')]),
+  'agents-older': list([a('ran'), a('old')]),
+};
+w.ccobsDropOlderRepeats({getElementById: (id) => lists[id] || null});
+const noRegion = {'closed-blocks-older': list([b('1')])};
+w.ccobsDropOlderRepeats({getElementById: (id) => noRegion[id] || null});
+
+// The board: two collapsible bays, a strip link and a summary that can take the focus.
+let focused = null;
+function focusable(name, attrs) {
+  return Object.assign({
+    name, attrs, tagName: name === 'summary' ? 'SUMMARY' : 'A',
+    getAttribute(k) { return k in this.attrs ? this.attrs[k] : null; },
+    hasAttribute(k) { return k in this.attrs; },
+    focus() { focused = this.name + ':' + (this.attrs.href || this.bay); },
+  });
+}
+function board(openKeys) {
+  const bays = ['ended', 'stale'].map((key) => {
+    const summary = focusable('summary', {});
+    summary.bay = key;
+    const details = {
+      open: openKeys.includes(key), summary,
+      getAttribute(k) { return k === 'data-bay' ? key : null; },
+      querySelector(selector) { return selector === 'summary' ? summary : null; },
+    };
+    summary.parentNode = details;
+    return details;
+  });
+  const links = [focusable('a', {href: '/sessions/s1'}), focusable('a', {href: '/sessions/s2'})];
+  const nodes = [...bays.map((d) => d.summary), ...links];
+  return {
+    bays, links,
+    contains(node) { return nodes.includes(node); },
+    querySelectorAll(selector) {
+      if (selector === 'details[data-bay]') return bays;
+      if (selector === 'a[href]') return links;
+      return [];
+    },
+  };
+}
+const results = [];
+const old1 = board(['stale']);
+const state1 = w.ccobsBoardState(old1, old1.links[1]);
+const new1 = board([]);
+w.ccobsRestoreBoard(new1, state1);
+results.push({open: new1.bays.map((d) => d.open), focused});
+focused = null;
+const old2 = board(['ended']);
+const new2 = board([]);
+w.ccobsRestoreBoard(new2, w.ccobsBoardState(old2, old2.bays[0].summary));
+results.push({open: new2.bays.map((d) => d.open), focused});
+focused = null;
+const old3 = board([]);
+const new3 = board([]);
+w.ccobsRestoreBoard(new3, w.ccobsBoardState(old3, {tagName: 'BUTTON'}));
+results.push({open: new3.bays.map((d) => d.open), focused});
+console.log(JSON.stringify({
+  blocks: ids(lists['closed-blocks-older'].children),
+  agents: ids(lists['agents-older'].children),
+  untouched: ids(noRegion['closed-blocks-older'].children),
+  boards: results,
+}));
+"""
+
+
+def test_app_js_keeps_older_lists_and_the_board_steady_across_live_swaps() -> None:
+    node = shutil.which("node")
+    if node is None:
+        if os.environ.get("CI"):
+            pytest.fail("node is not installed, and CI must run this test")
+        pytest.skip("node is not installed")
+    completed = subprocess.run(  # noqa: S603 - node from PATH, fixed arguments
+        [node, "-e", LIVE_SWAPS_SCRIPT, str(APP_JS)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert json.loads(completed.stdout) == {
+        # A row the refresh now holds leaves the older list; the rest stay in order.
+        "blocks": ["4", "3"],
+        "agents": ["old"],
+        "untouched": ["1"],
+        "boards": [
+            # The open bay stays open; the focused strip link keeps the focus.
+            {"open": [False, True], "focused": "a:/sessions/s2"},
+            {"open": [True, False], "focused": "summary:ended"},
+            # Focus outside the board's links and summaries is left alone.
+            {"open": [False, False], "focused": None},
+        ],
+    }
+
+
+def test_app_js_moves_the_focus_to_the_heading_at_the_end_of_a_list() -> None:
+    script = APP_JS.read_text(encoding="utf-8")
+
+    # After the last page with nothing new, the focus goes to the list's heading, and a
+    # response that is not swapped forgets the pressed button.
+    assert 'closest("section")' in script
+    assert 'querySelector("h2")' in script
+    assert "pressed = null;" in script
+
+
+STALE_PAGER_SCRIPT: Final = """
+const src = require('fs').readFileSync(process.argv[1], 'utf8');
+const triggered = [];
+const sandbox = {
+  window: {htmx: {trigger(elt, name) { triggered.push(elt.name + ':' + name); }}},
+  document: {addEventListener() {}, readyState: 'loading'},
+};
+new Function('window', 'document', src)(sandbox.window, sandbox.document);
+const w = sandbox.window;
+function button(name) {
+  return {
+    name, attrs: {},
+    classList: {contains: (cls) => cls === 'more__button'},
+    parentNode: {id: 'blocks-more'},
+    setAttribute(k, v) { this.attrs[k] = v; },
+    hasAttribute(k) { return k in this.attrs; },
+    removeAttribute(k) { delete this.attrs[k]; },
+  };
+}
+// In flight when a live reset replaces its control: aborted, once.
+const stale = button('stale');
+w.ccobsPagerRequest({detail: {elt: stale}});
+w.ccobsAbortStalePager({target: stale});
+w.ccobsAbortStalePager({target: stale});
+// Its own response came first: the swap that replaces it aborts nothing.
+const done = button('done');
+w.ccobsPagerRequest({detail: {elt: done}});
+const response = {requestConfig: {elt: done}, target: {children: []}, shouldSwap: true};
+w.ccobsBeforePager({detail: response});
+w.ccobsAbortStalePager({target: done});
+// Never pressed, or not a pager at all: nothing.
+w.ccobsAbortStalePager({target: button('idle')});
+w.ccobsAbortStalePager({target: {name: 'row', classList: {contains: () => false}}});
+console.log(JSON.stringify(triggered));
+"""
+
+
+def test_app_js_aborts_a_pager_request_whose_control_a_live_reset_replaces() -> None:
+    node = shutil.which("node")
+    if node is None:
+        if os.environ.get("CI"):
+            pytest.fail("node is not installed, and CI must run this test")
+        pytest.skip("node is not installed")
+    completed = subprocess.run(  # noqa: S603 - node from PATH, fixed arguments
+        [node, "-e", STALE_PAGER_SCRIPT, str(APP_JS)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert json.loads(completed.stdout) == ["stale:htmx:abort"]
+
+
+def test_app_js_wires_the_stale_pager_abort_to_htmx_cleanup() -> None:
+    script = APP_JS.read_text(encoding="utf-8")
+    htmx = (APP_JS.parents[1] / "vendor" / "htmx-2.0.11.min.js").read_text(encoding="utf-8")
+
+    assert 'addEventListener("htmx:beforeCleanupElement", abortStalePager)' in script
+    assert 'trigger(element, "htmx:abort")' in script
+    # The htmx events this relies on: cleanup before removal, and abort of the XHR.
+    assert '"htmx:beforeCleanupElement"' in htmx
+    assert 'addEventListener("htmx:abort"' in htmx

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from collections.abc import Iterator
@@ -45,14 +46,30 @@ def _clean_logging() -> Iterator[None]:
         logger.propagate = propagate
 
 
+# The uvicorn settings main() passes, read back from the server's config.
+CONFIG_FIELDS = (
+    "host",
+    "port",
+    "workers",
+    "access_log",
+    "log_level",
+    "proxy_headers",
+    "server_header",
+    "date_header",
+    "timeout_graceful_shutdown",
+)
+
+
 @pytest.fixture
 def runs(monkeypatch: pytest.MonkeyPatch) -> list[tuple[Any, dict[str, Any]]]:
     calls: list[tuple[Any, dict[str, Any]]] = []
 
-    def fake_run(app: Any, **kwargs: Any) -> None:
-        calls.append((app, kwargs))
+    def fake_run(self: uvicorn.Server, sockets: Any = None) -> None:
+        assert isinstance(self, server_main.AppServer)
+        config = self.config
+        calls.append((config.app, {name: getattr(config, name) for name in CONFIG_FIELDS}))
 
-    monkeypatch.setattr(uvicorn, "run", fake_run)
+    monkeypatch.setattr(server_main.AppServer, "run", fake_run)
     return calls
 
 
@@ -102,10 +119,11 @@ def test_good_settings_run_one_uvicorn_worker(
 def test_graceful_shutdown_fits_the_compose_stop_grace_period(
     runs: list[tuple[Any, dict[str, Any]]],
 ) -> None:
-    # After SIGTERM uvicorn waits at most this long for open requests, then runs the
-    # lifespan's shutdown: the reconciler, the sweeper and the writer get 5 s each. The
-    # sum stays well inside compose's 30 s stop_grace_period (ADR 0030), so Docker never
-    # has to kill the app (exit 137) with hooks still queued.
+    # After SIGTERM the server ends the UI's live streams, then uvicorn waits at most this
+    # long for open requests, then runs the lifespan's shutdown: the reconciler, the
+    # sweeper and the writer get 5 s each. The sum stays well inside compose's 30 s
+    # stop_grace_period (ADR 0030), so Docker never has to kill the app (exit 137) with
+    # hooks still queued.
     server_main.main()
 
     ((_, kwargs),) = runs
@@ -169,3 +187,27 @@ def test_the_app_loggers_follow_the_log_level(
     assert len(app_logger.handlers) == 1
     assert not app_logger.propagate
     assert logging.getLogger("alembic").level == max(expected, logging.WARNING)
+
+
+def test_the_server_closes_the_live_streams_before_uvicorn_waits_for_connections(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    order: list[str] = []
+    app = FastAPI()
+
+    class Hub:
+        def close(self) -> None:
+            order.append("close streams")
+
+    app.state.live = Hub()
+
+    async def shutdown(self: uvicorn.Server, sockets: Any = None) -> None:
+        order.append("uvicorn shutdown")
+
+    monkeypatch.setattr(uvicorn.Server, "shutdown", shutdown)
+    settings = server_main.load_settings()
+    server = server_main.build_server(settings, app)
+
+    asyncio.run(server.shutdown())
+
+    assert order == ["close streams", "uvicorn shutdown"]

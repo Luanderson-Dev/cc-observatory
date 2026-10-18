@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% from "_session.html" import moment, block_row, agent_row, event_row, more_control, tail_element %}
+{% from "_session.html" import event_row, more_control, tail_element, live_element, session_head, blocks_region, agents_region, older_list %}
 {% block title %}{% if not error and head.project %}{{ head.project }}{% else %}Session{% endif %} - cc-observatory{% endblock %}
 {% block content %}
 <p class="back-link"><a href="/">Overview</a></p>
@@ -7,63 +7,19 @@
 <h1 class="visually-hidden">Session</h1>
 {% include "_error.html" %}
 {% else %}
-<header id="session-head" class="session-head strip--{{ head.status }}">
-  <div class="session-head__title">
-    <h1 class="session-head__project">{% if head.project %}{{ head.project }}{% else %}<span class="strip__unknown">Unknown project</span>{% endif %}</h1>
-    <code class="session-head__short">{{ head.short_id }}</code>
-  </div>
-  {% if head.path %}<p class="session-head__path">{{ head.path }}</p>{% endif %}
-  <div class="session-head__status">
-    <span class="session-head__state">{{ head.state_label }}</span>
-    {% if head.doing %}<span class="session-head__doing">{{ head.doing }}</span>{% endif %}
-    {% if head.waiting %}<span class="session-head__elapsed"><span class="visually-hidden">Waiting for</span>{{ moment(head.waiting, "session-head__wait") }}</span>{% endif %}
-    {% if head.error_code %}<span class="session-head__error">Last error <code>{{ head.error_code }}</code></span>{% endif %}
-  </div>
-  <dl class="session-head__facts">
-    <div><dt>Started</dt><dd>{{ moment(head.started) }} ago</dd></div>
-    <div><dt>Last event</dt><dd>{{ moment(head.last_event) }} ago</dd></div>
-    {% if head.ended %}<div><dt>Ended</dt><dd>{{ moment(head.ended) }} ago</dd></div>{% endif %}
-    <div class="session-head__fact-id"><dt>Session ID</dt><dd><code class="session-head__id">{{ head.session_id }}</code></dd></div>
-  </dl>
-</header>
+{{ live_element(live) }}
+{{ session_head(head) }}
 <div class="session-columns">
   <div class="session-columns__side">
     <section class="session-section" aria-labelledby="blocks-heading">
-      <h2 class="session-section__title" id="blocks-heading">Blocks <span class="bay__count">{{ blocks_total }}</span></h2>
-      {% if open_blocks %}
-      <h3 class="session-section__subtitle">Waiting on you now</h3>
-      <ol id="open-blocks" class="blocks">
-      {% for b in open_blocks %}
-      {{ block_row(b) }}
-      {% endfor %}
-      </ol>
-      {% endif %}
-      {% if closed_blocks %}
-      <h3 class="session-section__subtitle">Closed, newest first</h3>
-      <ol id="closed-blocks" class="blocks">
-      {% for b in closed_blocks %}
-      {{ block_row(b) }}
-      {% endfor %}
-      </ol>
-      {{ more_control("blocks-more", blocks_more, "#closed-blocks", "Show older blocks") }}
-      {% endif %}
-      {% if not open_blocks and not closed_blocks %}
-      <p class="session-section__empty">No blocks: this session never waited on you.</p>
-      {% endif %}
+      {{ blocks_region(blocks) }}
+      {{ older_list("closed-blocks-older", "blocks") }}
+      {{ more_control("blocks-more", blocks_more, "#closed-blocks-older", "Show older blocks") }}
     </section>
     <section class="session-section" aria-labelledby="agents-heading">
-      <h2 class="session-section__title" id="agents-heading">Agents <span class="bay__count">{{ agents_total }}</span></h2>
-      {% if agents %}
-      <p class="agents__root">Main thread</p>
-      <ol id="agents" class="agents">
-      {% for a in agents %}
-      {{ agent_row(a) }}
-      {% endfor %}
-      </ol>
-      {{ more_control("agents-more", agents_more, "#agents", "Show older agents") }}
-      {% else %}
-      <p class="session-section__empty">No subagents ran in this session.</p>
-      {% endif %}
+      {{ agents_region(agents) }}
+      {{ older_list("agents-older", "agents") }}
+      {{ more_control("agents-more", agents_more, "#agents-older", "Show older agents") }}
     </section>
   </div>
   <section class="session-section session-columns__main" aria-labelledby="timeline-heading">

@@ -59,6 +59,8 @@ def test_the_proposed_series_are_all_there() -> None:
         "ccobs_build_info": ("gauge", ("host", "version")),
         "ccobs_database_wal": ("gauge", ("host",)),
         "ccobs_loki_queries_total": ("counter", ("host", "result")),
+        "ccobs_ui_streams": ("gauge", ("host",)),
+        "ccobs_ui_streams_refused_total": ("counter", ("host",)),
     }
 
 

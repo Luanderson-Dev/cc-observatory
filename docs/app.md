@@ -276,13 +276,42 @@ still being built for v0.4.0; this section lists what is there so far.
   stopped agents, and the latest 50 hook events; "Show older ..." appends the next 50
   in place (from `/ui/sessions/{session_id}/blocks`, `.../agents` and `.../events`). An
   unknown session ID gets a "Session not found" page (404).
-- `GET /ui/board` returns the overview's board alone; live updates, which refetch it
-  when a session changes, come in a later stage of v0.4.0. Until then, reload the page.
+- `GET /ui/board` returns the overview's board alone, and
+  `GET /ui/sessions/{session_id}/live` a session's header, blocks and agents, for the
+  live updates below.
 - **Times** are elapsed times ticking in the browser; hover one for the moment in your
   time zone.
 - **Theme**: system, light or dark, from the toggle in the header; the choice is kept in
   the browser's local storage for the app's origin.
 - If the app cannot read its database, the page says so with a 503 and a short reason.
+
+### Live updates
+
+The overview and the session page follow your sessions without a reload
+([ADR 0032](adr/0032-live-updates-change-hub-sse-pings-and-refetch.md)):
+
+- Each of these pages opens one server-sent events stream, `GET /ui/stream` (the session
+  page adds `?session=<id>`). The stream carries no session data, only "these sessions
+  changed", at most once every quarter of a second, and a keep-alive comment every 15
+  seconds. The page then refetches its own parts: the overview its board, the session
+  page its header, blocks and agents, and the new rows of its timeline. All sessions
+  has no live updates; reload it.
+- Older pages you loaded with "Show older ..." stay as they are; new and newly closed
+  rows appear above them, and a block or agent the page showed open or running stays
+  on it once it closes (up to 8 of each that sit below the older pages). After 200 such
+  rows in one visit, that list starts over at the latest page, with a fresh
+  "Show older ..." button.
+- On the overview, a collapsed bay you opened stays open, and the focus stays on the
+  strip you were on.
+- Each time the stream connects, the first time included, the page refetches once, so
+  whatever changed while it was not listening shows up.
+- If the stream drops (the app restarts, the laptop sleeps), the page says
+  "Live updates paused. Reconnecting…" and tries again after 5 seconds, then 10, 20 and
+  so on up to a minute, until it connects; then the message goes away.
+- The app serves at most 16 streams at once, for all tabs and browsers together; the
+  17th gets a 503, and that tab shows the paused message and retries.
+- The stream is read-only, never reads the database, and answers only the app's own
+  pages: another site, Grafana included, gets a 403 (see [Browser defences](#browser-defences)).
 
 Static files under `/static/` are cached by the browser: the versioned htmx file for a
 year, everything else revalidated with its `ETag` on each load, so an upgrade never
@@ -361,7 +390,8 @@ seconds as the job `ccobs-app`, so the series are in Grafana's Prometheus dataso
 (Explore). The debug override publishes the listener on `127.0.0.1:4301`
 (`CCOBS_APP_METRICS_PORT`) for debugging. Names, labels and the reasons behind them are
 in [ADR 0028](adr/0028-app-metrics-and-their-listener.md); the Loki counter is in
-[ADR 0029](adr/0029-closing-esc-denials-from-loki.md).
+[ADR 0029](adr/0029-closing-esc-denials-from-loki.md), the live stream series in
+[ADR 0032](adr/0032-live-updates-change-hub-sse-pings-and-refetch.md).
 
 | Series                              | Type      | Labels            | Meaning                                                                              |
 | ----------------------------------- | --------- | ----------------- | ------------------------------------------------------------------------------------ |
@@ -378,9 +408,11 @@ in [ADR 0028](adr/0028-app-metrics-and-their-listener.md); the Loki counter is i
 | `ccobs_build_info`                  | gauge     | `host`, `version` | Always 1; `version` is the running cc-observatory version.                           |
 | `ccobs_database_wal`                | gauge     | `host`            | 1 if the database runs in WAL mode, 0 if its filesystem refused WAL.                 |
 | `ccobs_loki_queries_total`          | counter   | `host`, `result`  | Queries sent to Loki for Esc denials, by result (`ok`, `error`).                     |
+| `ccobs_ui_streams`                  | gauge     | `host`            | Live update streams open to the web UI.                                              |
+| `ccobs_ui_streams_refused_total`    | counter   | `host`            | Live update streams refused because 16 were already open.                            |
 
 - Every label takes its values from a closed list, and every value is exported, with 0
-  when empty: 65 series per host, however many sessions there are. No series has a
+  when empty: 67 series per host, however many sessions there are. No series has a
   session ID.
 - The drop reasons are `full` (the queue is full), `too_large` (a body over
   `CCOBS_HOOK_BODY_MAX_BYTES`), `bad_content_type`, `bad_host`, `bad_request` (not a
@@ -584,6 +616,26 @@ over `CCOBS_HOOK_BODY_MAX_BYTES`, `invalid` a body that is not a hook payload, a
 `internal` an error in the app, which its log names by type. Dropped hooks still got an
 empty 204, so Claude Code showed nothing.
 
+### "Live updates paused. Reconnecting…"
+
+The page lost its live updates stream and retries on its own, from every 5 seconds up to
+once a minute; what it shows may be out of date until the message goes away. Reload the
+page to retry at once.
+
+- **The app is down or restarting**: `docker compose ps app` should say `healthy`; see
+  [The app is unhealthy](#the-app-is-unhealthy-or-keeps-restarting).
+- **Too many streams**: the app serves 16 at once, one per overview or session tab, for
+  every browser together. `ccobs_ui_streams` shows how many are open and
+  `ccobs_ui_streams_refused_total` how many were refused; the log says
+  `live stream refused`. Close tabs you do not need.
+- **Many tabs in one browser**: browsers open at most about 6 connections to one host
+  over HTTP/1.1, and each tab with live updates holds one. With six or more such tabs,
+  other requests to the app (pages, refetches) wait for a free connection and the pages
+  look frozen. Close some tabs, or open the extra ones as `127.0.0.1:4300` and
+  `localhost:4300`, which browsers count as two hosts.
+- **A proxy or extension buffering responses**: the stream must reach the page as it is
+  written. The app needs no proxy; open it directly at `http://127.0.0.1:4300`.
+
 ### Reading the app's logs
 
 ~~~bash
@@ -627,5 +679,8 @@ measurement, or unverified.
 - **Counters** reset when the app restarts (by design).
 - **Fake hooks** (by design): any local process can post them; there is no
   authentication ([SECURITY.md](../SECURITY.md)).
+- **Live updates** (by design): at most 16 streams at once; each change costs every open
+  overview tab one read and every session tab two, coalesced over a quarter of a second.
+  A strip that changes bay moves without an animation.
 - **Memory** (measured on Docker Desktop 29.8, WSL 2): 63.8 MiB idle, 70.1 MiB after
   about 2,750 hooks, against a 256m limit ([stack.md](stack.md#memory-and-disk)).

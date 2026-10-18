@@ -742,6 +742,137 @@ def test_a_short_session_detail_holds_everything(repo: Repository) -> None:
     assert len(detail.blocks) == 1
 
 
+LATE: Final = BASE + 10**7
+
+
+def _close_late(repo: Repository, block: Block, agent: Agent) -> None:
+    """Mark ``block`` and ``agent`` as closed and stopped at ``LATE``, long after the
+    others, as if they were open and running when a page loaded."""
+    with repo.engine.begin() as connection:
+        connection.execute(
+            update(BlockModel)
+            .where(BlockModel.session_id == SESSION, BlockModel.block_id == block.block_id)
+            .values(closed_at_ms=LATE)
+        )
+        connection.execute(
+            update(AgentModel)
+            .where(AgentModel.session_id == SESSION, AgentModel.agent_id == agent.agent_id)
+            .values(stopped_at_ms=LATE)
+        )
+
+
+def test_a_windowed_detail_holds_everything_from_the_boundaries_or_closed_since(
+    repo: Repository,
+) -> None:
+    # The live refresh of a session page (ADR 0032): every open block and running agent,
+    # the closed and stopped ones from the page's boundaries up, and the ones that
+    # closed or stopped after the page loaded, whatever their position.
+    seeded(repo)
+    agents, blocks = all_rows(repo)
+    closed = [b for b in blocks if b.closed_at_ms is not None]
+    stopped = [a for a in agents if a.status == "stopped"]
+    old_block = closed[0]
+    old_agent = next(a for a in stopped if a.started_at_ms is not None)
+    _close_late(repo, old_block, old_agent)
+    block_from, agent_from = closed[-30], stopped[-30]
+
+    detail = repo.get_session(
+        SESSION,
+        closed_limit=500,
+        blocks_from=block_from.block_id,
+        agents_from=agent_from.agent_id,
+        blocks_since_ms=LATE,
+        agents_since_ms=LATE,
+    )
+
+    assert detail is not None
+    assert [b.block_id for b in detail.blocks] == [
+        b.block_id
+        for b in blocks
+        if b.closed_at_ms is None or b.block_id >= block_from.block_id or b == old_block
+    ]
+    assert [a.agent_id for a in detail.agents] == [
+        a.agent_id
+        for a in agents
+        if a.status == "running" or agent_key(a) >= agent_key(agent_from) or a == old_agent
+    ]
+    assert (detail.agents_total, detail.blocks_total) == (AGENTS, BLOCKS)
+
+
+def test_a_windowed_detail_holds_the_kept_rows_whatever_their_close_time(
+    repo: Repository,
+) -> None:
+    # A block open and an agent running when the page loaded, below its boundaries, may
+    # close with a time before the page's (a sweep, a late hook): the page names them.
+    seeded(repo)
+    agents, blocks = all_rows(repo)
+    closed = [b for b in blocks if b.closed_at_ms is not None]
+    stopped = [a for a in agents if a.status == "stopped"]
+    block_from, agent_from = closed[-30], stopped[-30]
+    old_block, old_agent = closed[0], stopped[0]
+
+    detail = repo.get_session(
+        SESSION,
+        closed_limit=500,
+        blocks_from=block_from.block_id,
+        agents_from=agent_from.agent_id,
+        blocks_since_ms=LATE,
+        agents_since_ms=LATE,
+        keep_blocks=[old_block.block_id],
+        keep_agents=[old_agent.agent_id],
+    )
+
+    assert detail is not None
+    assert old_block in detail.blocks
+    assert old_agent in detail.agents
+    assert closed[1] not in detail.blocks
+    assert stopped[1] not in detail.agents
+
+
+def test_a_windowed_detail_keeps_the_latest_up_to_its_limit(repo: Repository) -> None:
+    seeded(repo)
+    agents, blocks = all_rows(repo)
+    closed = [b for b in blocks if b.closed_at_ms is not None]
+    stopped = [a for a in agents if a.status == "stopped"]
+
+    detail = repo.get_session(
+        SESSION,
+        closed_limit=10,
+        blocks_from=closed[-30].block_id,
+        agents_from=stopped[-30].agent_id,
+        blocks_since_ms=LATE,
+        agents_since_ms=LATE,
+    )
+
+    assert detail is not None
+    assert [b for b in detail.blocks if b.closed_at_ms is not None] == closed[-10:]
+    assert [a for a in detail.agents if a.status == "stopped"] == stopped[-10:]
+
+
+def test_a_window_without_a_start_time_holds_only_rows_from_its_boundary(
+    repo: Repository,
+) -> None:
+    seeded(repo)
+    _, blocks = all_rows(repo)
+    closed = [b for b in blocks if b.closed_at_ms is not None]
+
+    detail = repo.get_session(SESSION, closed_limit=500, blocks_from=closed[-30].block_id)
+
+    assert detail is not None
+    assert [b for b in detail.blocks if b.closed_at_ms is not None] == closed[-30:]
+
+
+def test_an_unknown_agent_boundary_holds_the_latest_stopped_agents(repo: Repository) -> None:
+    seeded(repo)
+    agents, _ = all_rows(repo)
+    stopped = [a for a in agents if a.status == "stopped"]
+
+    detail = repo.get_session(SESSION, agents_from="no-such-agent", agents_since_ms=LATE)
+
+    assert detail is not None
+    assert [a for a in detail.agents if a.status == "stopped"] == stopped[-DETAIL_CLOSED_LIMIT:]
+
+
 @pytest.mark.parametrize("limit", [1, 7, 50, 500])
 def test_block_pages_cover_every_block_once(repo: Repository, limit: int) -> None:
     seeded(repo)

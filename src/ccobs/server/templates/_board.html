@@ -1,5 +1,7 @@
 {% from "_strip.html" import strip %}
-<section id="board" class="board" aria-label="Sessions by state"{% if board %} data-waiting="{{ board.waiting }}"{% endif %}>
+{#- The board refetches itself when live.js says sessions changed (ADR 0032); this
+    fragment carries the same attributes, so the new board keeps listening. -#}
+<section id="board" class="board" aria-label="Sessions by state" hx-get="/ui/board" hx-trigger="ccobs:changed from:body" hx-swap="outerHTML" hx-sync="this:replace"{% if board %} data-waiting="{{ board.waiting }}"{% endif %}>
 {% if error %}
 {% include "_error.html" %}
 {% elif not board.any_session %}
@@ -7,7 +9,7 @@
 {% else %}
 {% for bay in board.bays %}
 {% if bay.collapsible %}
-<details class="bay bay--{{ bay.key }}">
+<details class="bay bay--{{ bay.key }}" data-bay="{{ bay.key }}">
   <summary class="bay__summary"><h2 class="bay__title">{{ bay.heading }} <span class="bay__count">{{ bay.total }}</span></h2></summary>
   <ol class="strips">
   {% for s in bay.strips %}

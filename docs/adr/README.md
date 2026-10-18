@@ -60,5 +60,6 @@ the ADR wins.
 | [0029](0029-closing-esc-denials-from-loki.md)                             | Permission blocks denied with Esc are closed from Loki's `tool_decision` rejects      | Accepted |
 | [0030](0030-the-app-container.md)                                         | The app container: built locally from the clone, non-root, published on loopback      | Accepted |
 | [0031](0031-server-rendered-pages-with-htmx-and-vendored-assets.md)       | Server-rendered pages with htmx 2 and vendored, checksummed assets                    | Accepted |
+| [0032](0032-live-updates-change-hub-sse-pings-and-refetch.md)             | Live updates: a change hub fed by the writer, SSE pings and refetch                   | Accepted |
 | [0033](0033-separate-writer-and-reader-engines-and-capped-reads.md)       | Separate writer and reader engines, capped reads and bounded session detail           | Accepted |
 | [0034](0034-browser-hardening-csp-fetch-metadata-and-response-headers.md) | Browser hardening: a strict CSP, Fetch Metadata and response headers                  | Accepted |

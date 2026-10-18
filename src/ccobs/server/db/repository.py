@@ -11,7 +11,7 @@ tables, and the bookkeeping no table holds comes from ``session_state``.
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass, fields, replace
 from typing import Any, Final
 
@@ -28,6 +28,7 @@ from sqlalchemy import (
     tuple_,
 )
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.orm import InstrumentedAttribute
 
 from ccobs.domain.hooks import (
     Elicitation,
@@ -462,9 +463,31 @@ class Repository:
             statement = select(SessionModel.session_id).where(SessionModel.session_id == session_id)
             return connection.execute(statement).first() is not None
 
-    def get_session(self, session_id: str) -> SessionDetail | None:
+    def get_session(
+        self,
+        session_id: str,
+        *,
+        closed_limit: int = DETAIL_CLOSED_LIMIT,
+        blocks_from: int | None = None,
+        agents_from: str | None = None,
+        blocks_since_ms: int | None = None,
+        agents_since_ms: int | None = None,
+        keep_blocks: Collection[int] = (),
+        keep_agents: Collection[str] = (),
+    ) -> SessionDetail | None:
         """The bounded detail of a session (``SessionDetail``); ``None`` if it is not
-        stored. One connection, so every part comes from the same read transaction."""
+        stored. One connection, so every part comes from the same read transaction.
+
+        By default the detail holds the latest ``closed_limit`` closed blocks and stopped
+        agents. The live refresh of a session page (ADR 0032) narrows them to a window:
+        with ``blocks_from``, only the closed blocks from that ``block_id`` up, plus those
+        closed at or after ``blocks_since_ms`` and those in ``keep_blocks``; with
+        ``agents_from``, only the stopped agents from that agent's position up (first
+        seen, ``agent_id``, as ``list_agents`` pages), plus those stopped at or after
+        ``agents_since_ms`` and those in ``keep_agents``. An ``agents_from`` that names no
+        agent of the session narrows nothing. Either way, at most the latest
+        ``closed_limit`` of them, by ``block_id`` and by position.
+        """
         with self.engine.connect() as connection:
             row = (
                 connection.execute(
@@ -476,11 +499,29 @@ class Repository:
             if row is None:
                 return None
             of_session = AgentModel.session_id == session_id
+            stopped_filter = [of_session, AgentModel.status != _RUNNING]
+            if agents_from is not None:
+                position = connection.execute(
+                    select(_AGENT_FIRST_SEEN).where(of_session, AgentModel.agent_id == agents_from)
+                ).one_or_none()
+                if position is not None:
+                    window = tuple_(_AGENT_FIRST_SEEN, AgentModel.agent_id) >= tuple_(
+                        position[0], agents_from
+                    )
+                    stopped_filter.append(
+                        _widened(
+                            window,
+                            AgentModel.stopped_at_ms,
+                            agents_since_ms,
+                            AgentModel.agent_id,
+                            keep_agents,
+                        )
+                    )
             latest_stopped = (
                 select(AgentModel.agent_id)
-                .where(of_session, AgentModel.status != _RUNNING)
+                .where(*stopped_filter)
                 .order_by(_AGENT_FIRST_SEEN.desc(), AgentModel.agent_id.desc())
-                .limit(DETAIL_CLOSED_LIMIT)
+                .limit(closed_limit)
             )
             agents = [
                 _agent(agent)
@@ -494,11 +535,22 @@ class Repository:
                 ).mappings()
             ]
             in_session = BlockModel.session_id == session_id
+            closed_filter = [in_session, BlockModel.closed_at_ms.is_not(None)]
+            if blocks_from is not None:
+                closed_filter.append(
+                    _widened(
+                        BlockModel.block_id >= blocks_from,
+                        BlockModel.closed_at_ms,
+                        blocks_since_ms,
+                        BlockModel.block_id,
+                        keep_blocks,
+                    )
+                )
             latest_closed = (
                 select(BlockModel.block_id)
-                .where(in_session, BlockModel.closed_at_ms.is_not(None))
+                .where(*closed_filter)
                 .order_by(BlockModel.block_id.desc())
-                .limit(DETAIL_CLOSED_LIMIT)
+                .limit(closed_limit)
             )
             blocks = connection.execute(
                 select(BlockModel.__table__)
@@ -673,6 +725,23 @@ class Repository:
         with self.engine.connect() as connection:
             rows = connection.execute(statement).mappings().all()
             return _strip_rows(connection, rows)
+
+
+def _widened[K](
+    window: ColumnElement[bool],
+    ended_at: InstrumentedAttribute[int | None],
+    since_ms: int | None,
+    key: InstrumentedAttribute[K],
+    keep: Collection[K],
+) -> ColumnElement[bool]:
+    """``window``, or closed (stopped) at or after ``since_ms`` when it is given, or one
+    of ``keep``."""
+    clauses = [window]
+    if since_ms is not None:
+        clauses.append(ended_at >= since_ms)
+    if keep:
+        clauses.append(key.in_(list(keep)))
+    return or_(*clauses)
 
 
 def _strip_rows(connection: Connection, rows: Sequence[RowMapping]) -> list[StripRow]:

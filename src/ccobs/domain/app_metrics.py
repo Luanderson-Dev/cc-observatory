@@ -50,6 +50,8 @@ __all__ = [
     "SESSIONS_ENDED",
     "SESSION_STATES",
     "STATE_LABEL",
+    "UI_STREAMS",
+    "UI_STREAMS_REFUSED",
     "VERSION_LABEL",
     "AppMetric",
     "LokiQueryResult",
@@ -204,6 +206,22 @@ LOKI_QUERIES: Final = AppMetric(
     (HOST_LABEL, RESULT_LABEL),
 )
 
+# The web UI's live update streams (ADR 0032): how many are open, and how many were
+# refused because the cap of open streams was reached.
+UI_STREAMS: Final = AppMetric(
+    "ccobs_ui_streams",
+    "gauge",
+    "Live update streams (server-sent events) open to the web UI.",
+    (HOST_LABEL,),
+)
+UI_STREAMS_REFUSED: Final = AppMetric(
+    "ccobs_ui_streams_refused_total",
+    "counter",
+    "Live update streams refused because the cap of open streams was reached, since the"
+    " app started.",
+    (HOST_LABEL,),
+)
+
 APP_METRICS: Final = (
     SESSIONS,
     SESSIONS_ENDED,
@@ -218,6 +236,8 @@ APP_METRICS: Final = (
     BUILD_INFO,
     DATABASE_WAL,
     LOKI_QUERIES,
+    UI_STREAMS,
+    UI_STREAMS_REFUSED,
 )
 
 
