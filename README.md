@@ -64,9 +64,9 @@ the rest is planned.
 - **Tokens and cost**: per session on its page (v0.4.0), and across sessions by day and
   model in Grafana's overview dashboard (v0.2.0); by agent type (built-in agent names;
   your own agents show as `custom` unless you opt in to tool details) and by project
-  (joined from the working directory that hooks report) are planned. Cost is an
-  estimate that comes from Claude Code's telemetry, not the amount you are billed.
-- **Health page**: whether each part of the stack is up and receiving data (planned).
+  (joined from the working directory that hooks report) are planned for v0.7.0. Cost
+  is an estimate that comes from Claude Code's telemetry, not the amount you are billed.
+- **Health page**: whether each part of the stack is up and receiving data (planned, v0.7.0).
 - **Grafana** for deeper analysis, provisioned with its datasources and a Claude Code
   overview dashboard (v0.2.0); each session's page links to its logs, tokens and cost
   there (v0.4.0), and later dashboards will open already filtered to the agent or

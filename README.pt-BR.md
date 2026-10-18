@@ -67,9 +67,9 @@ partir de um clone deste repositório (veja "Como rodar a stack de observabilida
   e modelo, no dashboard de visão geral do Grafana (v0.2.0); por tipo de agente (com os
   nomes dos agentes embutidos; os seus próprios agentes aparecem como `custom`, a menos
   que você ative os detalhes de ferramentas) e por projeto (cruzado com o diretório de
-  trabalho que os hooks informam) estão planejados. O custo é uma estimativa que vem da
+  trabalho que os hooks informam) estão planejados para a v0.7.0. O custo é uma estimativa que vem da
   telemetria do Claude Code, não o valor que você paga.
-- **Página de saúde**: se cada parte da stack está no ar e recebendo dados (planejada).
+- **Página de saúde**: se cada parte da stack está no ar e recebendo dados (planejada, v0.7.0).
 - **Grafana** para análises mais profundas, provisionado com as fontes de dados e um
   dashboard de visão geral do Claude Code (v0.2.0); a página de cada sessão leva aos
   logs, tokens e custo dela lá (v0.4.0) e, mais tarde, dashboards vão abrir já filtrados
