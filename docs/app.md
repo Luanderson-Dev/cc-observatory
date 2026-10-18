@@ -1,10 +1,10 @@
 # The app
 
-A reference for operating the app, from v0.3.0: what it does, how to point Claude Code
-at it, what it stores and serves, its settings, and what to check when something goes
-wrong. [stack.md](stack.md) covers the compose stack it runs in; the decisions behind
-the app are ADRs 0023 to 0030 in [`adr/`](adr/README.md), and this page links to them
-instead of repeating their reasons.
+A reference for operating the app, from v0.3.0 (its web UI from v0.4.0): what it does,
+what its pages show, how to point Claude Code at it, what it stores and serves, its
+settings, and what to check when something goes wrong. [stack.md](stack.md) covers the
+compose stack it runs in; the decisions behind the app are ADRs 0023 to 0035 in
+[`adr/`](adr/README.md), and this page links to them instead of repeating their reasons.
 
 Commands run from the repository root, where `compose.yaml` is, in bash (Git Bash on
 Windows).
@@ -29,19 +29,204 @@ The app is the `app` service of the compose stack, a FastAPI process
 - closes permission prompts denied with Esc, which fire no hook, from Claude Code's
   `tool_decision` events in Loki
   ([ADR 0029](adr/0029-closing-esc-denials-from-loki.md));
-- serves the stored metadata as a read-only JSON API under `/api/v1`, and its live state
-  as Prometheus metrics on a separate listener that Prometheus scrapes
-  ([ADR 0028](adr/0028-app-metrics-and-their-listener.md)).
+- serves the stored metadata as a read-only web UI at <http://127.0.0.1:4300>, which
+  follows your sessions live ([The web UI](#the-web-ui),
+  [ADR 0031](adr/0031-server-rendered-pages-with-htmx-and-vendored-assets.md),
+  [ADR 0032](adr/0032-live-updates-change-hub-sse-pings-and-refetch.md)), and as a
+  read-only JSON API under `/api/v1`
+  ([ADR 0033](adr/0033-separate-writer-and-reader-engines-and-capped-reads.md));
+- reads each session's tokens and cost from Claude Code's metrics in Prometheus, for the
+  session page, and links each session to its logs, tokens and cost in Grafana
+  ([ADR 0035](adr/0035-per-session-tokens-and-cost-from-prometheus-and-grafana-links.md));
+- exports its live state as Prometheus metrics on a separate listener that Prometheus
+  scrapes ([ADR 0028](adr/0028-app-metrics-and-their-listener.md)).
 
-It also serves a web UI at <http://127.0.0.1:4300> (see [The web UI](#the-web-ui)),
-which is being built for v0.4.0; `ccobs setup`, which writes the hooks into Claude
-Code's settings for you, comes in v0.5.0.
+`ccobs setup`, which writes the hooks into Claude Code's settings for you, comes in
+v0.5.0; until then, see [Point Claude Code at the app](#point-claude-code-at-the-app).
 
 `docker compose up -d` builds the app's image on the first start and whenever the source
 changes, then starts it at <http://127.0.0.1:4300> (the port is `CCOBS_APP_PORT`).
 `docker compose ps` shows it healthy once `GET /healthz` answers, which it checks every
 30 seconds. After `git pull`, `docker compose up -d` rebuilds it; `docker compose pull`
 does not update it, since no registry has the image.
+
+## The web UI
+
+Open <http://127.0.0.1:4300> in a browser (the port is `CCOBS_APP_PORT`). The UI is
+server-rendered HTML with htmx and files that ship with the app: it loads nothing from
+another origin, works offline and, like the rest of the app, has no login
+([ADR 0031](adr/0031-server-rendered-pages-with-htmx-and-vendored-assets.md)). It is
+read-only: it shows what the app stored and changes nothing, in the app or in Claude
+Code. Until Claude Code sends hooks to the app, the overview shows the hook settings to
+save (see [Point Claude Code at the app](#point-claude-code-at-the-app)).
+
+### Pages
+
+- **Overview** (`GET /`): a board of sessions in bays by state, each session a strip.
+  "Waiting on you" comes first, the longest wait first, with its time since the oldest
+  open block; then "Working" and "Idle", the latest activity first. "Ended in the last
+  24 hours" and "Stale" are collapsed and show at most 20 sessions each, with a link to
+  the rest. A strip shows the project name (the last part of the session's working
+  directory, never the whole path), what the session does or waits on, its running
+  subagents and its last error code. The page title counts the sessions waiting on you,
+  such as `(2) cc-observatory`. With no session stored yet, the board shows the hook
+  settings for the port you opened it on, ready to save for `claude --settings`.
+- **All sessions** (`GET /sessions`): every stored session as a strip, the latest
+  activity first, 50 per page; "Older sessions" pages on with a cursor. It has no live
+  updates; reload it.
+- **Session** (`GET /sessions/{session_id}`, the link of each strip): a header with the
+  project name, the working directory with your home directory shown as `~`, the state
+  in words, how long the session has waited on you, its last error code, when it
+  started, last had an event and ended (and why), and the full session ID. Under the
+  header, **Open in Grafana** (see [Links to Grafana](#links-to-grafana)). Below it:
+  - **Blocks**: the ones waiting on you now, then the closed ones, newest first, with
+    how long each waited and how it closed (allowed, denied, answered, closed by later
+    activity, ...);
+  - **Agents**: the subagents as a tree, each under the agent that launched it, newest
+    first, with their type, state and how long they ran;
+  - **Tokens and cost**: the session's total cost and tokens, its tokens by type
+    (input, output, cache read, cache creation) and its tokens and cost by model, from
+    Prometheus (see [Tokens and cost](#tokens-and-cost));
+  - **Hook timeline**: the session's hook events, newest first, with their metadata only
+    (tool, MCP server, agent, notification type, error code, duration, sizes).
+
+  The page shows every open block and running agent, the latest 50 closed blocks and
+  stopped agents, and the latest 50 hook events; "Show older ..." appends the next 50
+  in place. An unknown session ID gets a "Session not found" page (404).
+- **Times** are elapsed times ticking in the browser; hover one for the moment in your
+  time zone.
+- **Theme**: system, light or dark, from the toggle in the header; the choice is kept in
+  the browser's local storage for the app's origin, and nothing else is.
+- **Errors**: when a read waits more than 5 seconds for one of the app's 4 database
+  readers, the page or the part of it says "The database is busy", with a 503; reload it
+  a few seconds later. "The app could not read its database" (also a 503) means a read
+  failed: the app's log (`docker compose logs app`) says why. Neither page shows the
+  error itself.
+
+The pages fetch their parts from routes under `/ui/` and `/static/`. They serve the
+pages and may change in any release; scripts should use the
+[JSON API](#the-json-api) instead.
+
+| Route                                                | Serves                                                               |
+| ---------------------------------------------------- | -------------------------------------------------------------------- |
+| `GET /ui/board`                                      | The overview's board alone, for the live updates.                    |
+| `GET /ui/sessions/{session_id}/live`                 | A session's header, blocks and agents, for the live updates.         |
+| `GET /ui/sessions/{session_id}/blocks`, `.../agents` | The next page of closed blocks or stopped agents ("Show older ..."). |
+| `GET /ui/sessions/{session_id}/events`               | Older hook events (`before`), or the new ones (`after`).             |
+| `GET /ui/sessions/{session_id}/usage`                | The "Tokens and cost" section.                                       |
+| `GET /ui/stream`                                     | The live updates stream (below).                                     |
+| `GET /static/...`                                    | The stylesheet, scripts, fonts and icon, with their licenses.        |
+
+Static files are cached by the browser: the versioned htmx file for a year, everything
+else revalidated with its `ETag` on each load, so an upgrade never leaves an old
+stylesheet behind. Pages and their parts are never cached (`Cache-Control: no-store`).
+
+### What the UI never shows
+
+- **The full working directory.** The overview and All sessions show only the project
+  name; the session page shows the path with your home directory as `~` (on a network
+  path, without its server and share). Homes are recognised by the shape of the path,
+  so your username can still show: a home in an unusual place (such as `/home2/<user>`
+  or `/export/home/<user>`) shows as it is, and the project name of a session started
+  in such a home directory itself is your username; a `/home/<group>/<user>` layout
+  hides the group, not the user (`/home/staff/<user>/x` shows as `~/<user>/x`); and an
+  MSYS or Cygwin home mounted outside `/home` or `Users` is not recognised. The JSON API still serves the full `cwd`, to localhost only (see
+  [Privacy](#privacy)).
+- **Content.** No prompt, tool input or output, assistant message or error text: the
+  app never stores them, so no page can show them. Errors show as Claude Code's error
+  codes.
+- **Anything from another origin.** The pages load no script, style, font or image from
+  elsewhere, and send no referrer when you follow a link out, to Grafana included.
+
+### Links to Grafana
+
+- The header's **Grafana** link opens the Claude Code overview dashboard for the app's
+  host label in a new tab.
+- A session's **Open in Grafana** has three links, each opening a new tab:
+  - **Logs**: Explore on Loki with the session's Claude Code events,
+    `{service_name="claude-code", host="<host>"} | session_id="<id>"`;
+  - **Tokens and cost**: Explore on Prometheus, split in two: the session's tokens by
+    type and its cost by model, per interval, as the dashboard draws them;
+  - **Dashboard**: the Claude Code overview for the app's host label.
+
+  Each covers the session from a minute before it started to two minutes after it
+  ended (or after its last event, once stale); for a live session it runs up to now.
+- Grafana answers only at `http://localhost:<port>`
+  ([ADR 0017](adr/0017-grafana-access-and-dns-rebinding.md)), so every link starts
+  there, on the port of `CCOBS_GRAFANA_PORT` (see `CCOBS_GRAFANA_URL` under
+  [Configuration](#configuration)). Grafana opens with no login; its *Sign in* button
+  has nothing to sign in to ([stack.md](stack.md#messages-that-are-not-faults)).
+- Loki logs every query it runs, so the session ID of a Logs link you open ends up in
+  Loki's log, like any query you type in Grafana.
+
+### Tokens and cost
+
+The session page's "Tokens and cost" section reads the session's totals from Claude
+Code's own metrics in Prometheus
+([ADR 0035](adr/0035-per-session-tokens-and-cost-from-prometheus-and-grafana-links.md)),
+the same totals as the dashboard
+([ADR 0013](adr/0013-metrics-through-the-prometheus-otlp-receiver.md)): the total cost
+in USD (four decimals under a dollar, two from a dollar up), the total tokens, the
+tokens by type, and the tokens and cost by model. The cost is Claude Code's estimate,
+not the amount you are billed.
+
+The totals are exact within ADR 0013's limits, and can come out low in three cases:
+
+- Claude Code sends delta temporality (set outside `ccobs setup`, which sets
+  cumulative) and the collector restarted while the session ran;
+- the clock that stamps the telemetry runs more than about a minute ahead of the app's
+  (an ended session then misses its last export);
+- the app missed the session's first hooks (it was down, or dropped them) while the
+  collector received the metrics, so the session's start time in the app is later than
+  its real start and the earliest usage falls outside the window.
+
+The **Tokens and cost** link to Grafana shows the session's series over time, to compare.
+
+- The section loads after the page, then refreshes every minute; it does not follow the
+  live updates, since the hooks carry no token data. Claude Code exports its metrics
+  about once a minute, so the numbers can lag up to a minute (plus up to 30 seconds of
+  the app's cache).
+- It covers the whole session, from 5 minutes before it started to 2 minutes after it
+  ended (or after its last event, once stale); for a live session, up to now.
+- The app sends three small queries to `CCOBS_PROMETHEUS_URL` per session and keeps the
+  answer for 30 seconds while the session is live, 5 minutes once it is over; every tab
+  showing the session shares it. Each query gives up after 3 seconds.
+- **No usage recorded for this session yet**: Prometheus has no tokens or cost for the
+  session (see [Troubleshooting](#tokens-and-cost-are-missing-or-unavailable)).
+- **Prometheus is unavailable, so tokens and cost can't be shown right now**: the app
+  could not reach Prometheus, or it did not answer in time. The rest of the page works
+  as usual, and the section tries again a minute later.
+- The queries filter on the session ID; Prometheus logs no query unless its query log is
+  turned on, which the stack does not do.
+
+### Live updates
+
+The overview and the session page follow your sessions without a reload
+([ADR 0032](adr/0032-live-updates-change-hub-sse-pings-and-refetch.md)):
+
+- Each of these pages opens one server-sent events stream, `GET /ui/stream` (the session
+  page adds `?session=<id>`). The stream carries no session data, only "these sessions
+  changed", at most once every quarter of a second, and a keep-alive comment every 15
+  seconds. The page then refetches its own parts: the overview its board, the session
+  page its header, blocks and agents, and the new rows of its timeline. A change shows
+  up once the writer commits it, normally within tens of milliseconds of the hook.
+- Older pages you loaded with "Show older ..." stay as they are; new and newly closed
+  rows appear above them, and a block or agent the page showed open or running stays
+  on it once it closes (up to 8 of each that sit below the older pages). After 200 such
+  rows in one visit, that list starts over at the latest page, with a fresh
+  "Show older ..." button.
+- On the overview, a collapsed bay you opened stays open, and the focus stays on the
+  strip you were on.
+- Each time the stream connects, the first time included, the page refetches once, so
+  whatever changed while it was not listening shows up.
+- If the stream drops (the app restarts, the laptop sleeps), the page says
+  "Live updates paused. Reconnecting…" and tries again after 5 seconds, then 10, 20 and
+  so on up to a minute, until it connects; then the message goes away (see
+  [Troubleshooting](#live-updates-paused-reconnecting)).
+- The app serves at most 16 streams at once, for all tabs and browsers together; the
+  17th gets a 503, and that tab shows the paused message and retries.
+- The stream is read-only, never reads the database, and answers only the app's own
+  pages: another site, Grafana included, gets a 403 (see [Browser defences](#browser-defences)).
 
 ## Point Claude Code at the app
 
@@ -152,7 +337,8 @@ next to these, in the sessions you start with the flag only
    "Run the observability stack" section shows; the Esc-denial close below needs those
    events.
 
-3. Check that the app received the session:
+3. Check that the app received the session: open <http://127.0.0.1:4300>, where it shows
+   on the overview, or ask the API:
 
    ~~~bash
    curl -s 'http://127.0.0.1:4300/api/v1/sessions?limit=5'
@@ -241,141 +427,6 @@ it sends no query.
   at the stale sweep, and its duration includes the time until then.
 - A reject exported more than 15 minutes after its block opened is ignored.
 
-## The web UI
-
-The UI is server-rendered HTML with htmx and files that ship with the app; it loads
-nothing from another origin and works offline
-([ADR 0031](adr/0031-server-rendered-pages-with-htmx-and-vendored-assets.md)). It is
-still being built for v0.4.0; this section lists what is there so far.
-
-- **Overview** (`GET /`): a board of sessions in bays by state, each session a strip.
-  "Waiting on you" comes first, the longest wait first, with its time since the oldest
-  open block; then "Working" and "Idle", the latest activity first. "Ended in the last
-  24 hours" and "Stale" are collapsed and show at most 20 sessions each, with a link to
-  the rest. A strip shows the project name (the last part of the session's working
-  directory, never the whole path), what the session does or waits on, its running
-  subagents and its last error code. The page title counts the sessions waiting on you,
-  such as `(2) cc-observatory`. With no session stored yet, the board shows the hook
-  settings for the port you opened it on, ready to save for `claude --settings`.
-- **All sessions** (`GET /sessions`): every stored session as a strip, the latest
-  activity first, 50 per page; "Older sessions" pages on with a cursor.
-- **Session** (`GET /sessions/{session_id}`, the link of each strip): a header with the
-  project name, the working directory with your home directory shown as `~`, the state
-  in words, how long the session has waited on you, its last error code, when it
-  started, last had an event and ended (and why), and the full session ID. Below it:
-  - **Blocks**: the ones waiting on you now, then the closed ones, newest first, with
-    how long each waited and how it closed (allowed, denied, answered, closed by later
-    activity, ...);
-  - **Agents**: the subagents as a tree, each under the agent that launched it, newest
-    first, with their type, state and how long they ran;
-  - **Tokens and cost**: the session's total cost and tokens, its tokens by type
-    (input, output, cache read, cache creation) and its tokens and cost by model, from
-    Prometheus (see [Tokens and cost](#tokens-and-cost));
-  - **Hook timeline**: the session's hook events, newest first, with their metadata only
-    (tool, MCP server, agent, notification type, error code, duration, sizes), never
-    prompts, tool inputs or outputs.
-
-  Under the header, **Open in Grafana** has three links, each opening a new tab:
-  - **Logs**: Explore on Loki with the session's Claude Code events,
-    `{service_name="claude-code", host="<host>"} | session_id="<id>"`;
-  - **Tokens and cost**: Explore on Prometheus, split in two: the session's tokens by
-    type and its cost by model, per interval, as the dashboard draws them;
-  - **Dashboard**: the Claude Code overview for the app's host label.
-
-  Each covers the session from a minute before it started to two minutes after it
-  ended (or after its last event, once stale); for a live session it runs up to now.
-  Loki logs every query it runs, so the session ID of a Logs link you open ends up in
-  Loki's log, like any query you type in Grafana.
-
-  The page shows every open block and running agent, the latest 50 closed blocks and
-  stopped agents, and the latest 50 hook events; "Show older ..." appends the next 50
-  in place (from `/ui/sessions/{session_id}/blocks`, `.../agents` and `.../events`). An
-  unknown session ID gets a "Session not found" page (404).
-- `GET /ui/board` returns the overview's board alone, and
-  `GET /ui/sessions/{session_id}/live` a session's header, blocks and agents, for the
-  live updates below. `GET /ui/sessions/{session_id}/usage` returns its "Tokens and
-  cost" section.
-- **Times** are elapsed times ticking in the browser; hover one for the moment in your
-  time zone.
-- **Theme**: system, light or dark, from the toggle in the header; the choice is kept in
-  the browser's local storage for the app's origin.
-- **Grafana**: the header's link opens the Claude Code overview dashboard for the app's
-  host label in a new tab. Grafana answers only at `http://localhost:<port>`
-  ([ADR 0017](adr/0017-grafana-access-and-dns-rebinding.md)), and every link the app
-  draws starts there (see `CCOBS_GRAFANA_URL` under [Configuration](#configuration)).
-- If the app cannot read its database, the page says so with a 503 and a short reason.
-
-### Tokens and cost
-
-The session page's "Tokens and cost" section reads the session's totals from Claude
-Code's own metrics in Prometheus
-([ADR 0035](adr/0035-per-session-tokens-and-cost-from-prometheus-and-grafana-links.md)),
-the same totals as the dashboard
-([ADR 0013](adr/0013-metrics-through-the-prometheus-otlp-receiver.md)): the total cost
-in USD (four decimals under a dollar, two from a dollar up), the total tokens, the
-tokens by type, and the tokens and cost by model.
-
-The totals are exact within ADR 0013's limits, and can come out low in three cases:
-
-- Claude Code sends delta temporality (set outside `ccobs setup`, which sets
-  cumulative) and the collector restarted while the session ran;
-- the clock that stamps the telemetry runs more than about a minute ahead of the app's
-  (an ended session then misses its last export);
-- the app missed the session's first hooks (it was down, or dropped them) while the
-  collector received the metrics, so the session's start time in the app is later than
-  its real start and the earliest usage falls outside the window.
-
-The **Tokens and cost** link to Grafana shows the session's series over time, to compare.
-
-- The section loads after the page, then refreshes every minute; it does not follow the
-  live updates, since the hooks carry no token data. Claude Code exports its metrics
-  about once a minute, so the numbers can lag up to a minute (plus up to 30 seconds of
-  the app's cache).
-- It covers the whole session, from 5 minutes before it started to 2 minutes after it
-  ended (or after its last event, once stale); for a live session, up to now.
-- The app sends three small queries to `CCOBS_PROMETHEUS_URL` per session and keeps the
-  answer for 30 seconds while the session is live, 5 minutes once it is over; every tab
-  showing the session shares it. Each query gives up after 3 seconds.
-- **No usage recorded for this session yet**: Prometheus has no tokens or cost for the
-  session (see [Troubleshooting](#tokens-and-cost-are-missing-or-unavailable)).
-- **Prometheus is unavailable, so tokens and cost can't be shown right now**: the app
-  could not reach Prometheus, or it did not answer in time. The rest of the page works
-  as usual, and the section tries again a minute later.
-- The queries filter on the session ID; Prometheus logs no query unless its query log is
-  turned on, which the stack does not do.
-
-### Live updates
-
-The overview and the session page follow your sessions without a reload
-([ADR 0032](adr/0032-live-updates-change-hub-sse-pings-and-refetch.md)):
-
-- Each of these pages opens one server-sent events stream, `GET /ui/stream` (the session
-  page adds `?session=<id>`). The stream carries no session data, only "these sessions
-  changed", at most once every quarter of a second, and a keep-alive comment every 15
-  seconds. The page then refetches its own parts: the overview its board, the session
-  page its header, blocks and agents, and the new rows of its timeline. All sessions
-  has no live updates; reload it.
-- Older pages you loaded with "Show older ..." stay as they are; new and newly closed
-  rows appear above them, and a block or agent the page showed open or running stays
-  on it once it closes (up to 8 of each that sit below the older pages). After 200 such
-  rows in one visit, that list starts over at the latest page, with a fresh
-  "Show older ..." button.
-- On the overview, a collapsed bay you opened stays open, and the focus stays on the
-  strip you were on.
-- Each time the stream connects, the first time included, the page refetches once, so
-  whatever changed while it was not listening shows up.
-- If the stream drops (the app restarts, the laptop sleeps), the page says
-  "Live updates paused. Reconnecting…" and tries again after 5 seconds, then 10, 20 and
-  so on up to a minute, until it connects; then the message goes away.
-- The app serves at most 16 streams at once, for all tabs and browsers together; the
-  17th gets a 503, and that tab shows the paused message and retries.
-- The stream is read-only, never reads the database, and answers only the app's own
-  pages: another site, Grafana included, gets a 403 (see [Browser defences](#browser-defences)).
-
-Static files under `/static/` are cached by the browser: the versioned htmx file for a
-year, everything else revalidated with its `ETag` on each load, so an upgrade never
-leaves an old stylesheet behind. Pages are never cached (`Cache-Control: no-store`).
-
 ## The JSON API
 
 The app serves a read-only JSON API under `/api/v1`. `GET /api/v1/sessions` lists
@@ -424,12 +475,14 @@ so a hook shows up once the writer commits its batch: normally within tens of
 milliseconds of being received (a batch waits up to 50 ms), and longer only when writes
 are backing off after an error. An unknown or malformed session ID gets a 404 with
 `{"detail": "session not found"}`, and a validation error (422) names the parameter and
-the rule without echoing the value sent. The API reads through query-only connections of
-their own, at most 4 reads at once, so readers never hold up the writer
-([ADR 0033](adr/0033-separate-writer-and-reader-engines-and-capped-reads.md)); a read
-that waits more than 5 s for a free connection gets a 503 with
-`{"detail": "database busy"}`, and can simply be retried. The OpenAPI schema and the
-interactive docs are not served.
+the rule without echoing the value sent. The OpenAPI schema and the interactive docs are
+not served.
+
+The API and the web UI read through query-only connections of their own, at most 4
+reads at once, so readers never hold up the writer
+([ADR 0033](adr/0033-separate-writer-and-reader-engines-and-capped-reads.md)); an API
+read that waits more than 5 seconds for a free connection gets a 503 with
+`{"detail": "database busy"}`, and can simply be retried.
 
 ~~~bash
 curl -s 'http://127.0.0.1:4300/api/v1/sessions?status=waiting_user'
@@ -440,6 +493,18 @@ curl -s 'http://127.0.0.1:4300/api/v1/sessions/<session_id>/blocks?before=<block
 curl -s 'http://127.0.0.1:4300/api/v1/sessions/<session_id>/agents?before=<agent_id>'
 curl -s 'http://127.0.0.1:4300/healthz'      # {"status":"ok"}
 ~~~
+
+**Changed in v0.4.0.** In v0.3.0 the session detail held every agent and block the
+session ever had, and `/events` returned only the latest `limit` events. From v0.4.0:
+
+- the detail is bounded as above and adds `agents_total` and `blocks_total`; a client
+  that read every agent or block from it now pages through `/agents` and `/blocks` when
+  a total is larger than its list;
+- `/agents` and `/blocks` are new, and `/events` takes the `before_seq` and `after_seq`
+  cursors;
+- each agent carries `parent_agent_id`;
+- a read can get the 503 `database busy` above;
+- cross-site browser requests get a 403 (see [Browser defences](#browser-defences)).
 
 ## Metrics
 
@@ -528,33 +593,41 @@ you; going back to an older app image after a migration is not supported
   database file, which a backup of the volume copies, and the API serves them to
   localhost only. The app's logs never hold a hook body, `cwd` or another path, or a
   session ID, at any log level.
+- **The web UI** never puts the full `cwd` in a page: it shows the project name, or the
+  path with your home directory as `~` (see
+  [What the UI never shows](#what-the-ui-never-shows)). Pages are sent with
+  `Cache-Control: no-store`, so the browser keeps no copy of them on disk.
 - The app's only query to Loki holds no session or call ID, so nothing personal reaches
-  Loki's query log.
+  Loki's query log. Its queries to Prometheus hold a session ID, and Prometheus logs no
+  query in the stack.
 
 ## Browser defences
 
 Any web page you open can make your browser send requests to localhost, so the app,
 which has no login, defends itself
-([ADR 0027](adr/0027-the-app-http-surface-and-hook-queue.md)):
+([ADR 0027](adr/0027-the-app-http-surface-and-hook-queue.md), and from v0.4.0
+[ADR 0034](adr/0034-browser-hardening-csp-fetch-metadata-and-response-headers.md)):
 
 - **`Host` allowlist.** Every route answers only a `Host` header of `localhost`,
   `127.0.0.1` or `[::1]`, with or without a port. A page that uses DNS rebinding sends
-  its own host name and gets a 400 on the API (the hook route gives its usual empty 204
-  and drops the request).
+  its own host name and gets a 400 on the pages and the API (the hook route gives its
+  usual empty 204 and drops the request).
 - **JSON only on the hook route.** A request whose `Content-Type` is not
   `application/json` is dropped, still with an empty 204. A cross-site page can send
   JSON only after a CORS preflight, which fails.
 - **No CORS.** No response carries an `Access-Control-Allow-*` header.
-- **Fetch Metadata** ([ADR 0034](adr/0034-browser-hardening-csp-fetch-metadata-and-response-headers.md)).
-  A browser request whose `Sec-Fetch-Site` is `cross-site` or `same-site` (any other
-  `localhost` port, Grafana's included) gets a 403 with the body `forbidden`, unless it
-  is a top-level `GET` navigation, such as a link or a typed URL; a websocket gets close
-  code 1008. Requests without `Sec-Fetch-Site` (curl, Prometheus) and from the app's own
-  pages pass.
+- **Fetch Metadata** (ADR 0034). A browser request whose `Sec-Fetch-Site` is
+  `cross-site` or `same-site` (any other `localhost` port, Grafana's included) gets a
+  403 with the body `forbidden`, unless it is a top-level `GET` navigation, such as a
+  link or a typed URL; a websocket gets close code 1008. Requests without
+  `Sec-Fetch-Site` (curl, Prometheus) and from the app's own pages pass. So another
+  page cannot load the app's responses as images or scripts, fetch from it, frame it
+  or hold its live updates stream, while a link to the app still opens it.
 - **Response headers** (ADR 0034). Every response that the app's routes and guards
   produce, but the hook route's, carries a strict `Content-Security-Policy` (only the
-  app's own scripts, styles, fonts and images, no inline or eval'd code, no framing, no
-  form submission), `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`,
+  app's own scripts, styles, fonts and images, plus `data:` images, nothing from another
+  origin, no inline or eval'd code, no framing, no form submission),
+  `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`,
   `Cross-Origin-Resource-Policy: same-origin` and
   `Cross-Origin-Opener-Policy: same-origin`, plus `Cache-Control: no-store` outside
   `/static/`. A header a route sets itself is kept. An unhandled 500 from Starlette's
@@ -580,7 +653,7 @@ in `.env` and run `docker compose up -d`.
 
 | Variable                     | Default                  | Effect                                                                                                             |
 | ---------------------------- | ------------------------ | ------------------------------------------------------------------------------------------------------------------ |
-| `CCOBS_APP_PORT`             | `4300`                   | Host port of the app: the hook URL, the API and `/healthz`.                                                        |
+| `CCOBS_APP_PORT`             | `4300`                   | Host port of the app: the web UI, the hook URL, the API and `/healthz`.                                            |
 | `CCOBS_APP_METRICS_PORT`     | `4301`                   | Host port of the metrics listener; debug override only.                                                            |
 | `CCOBS_HOST_LABEL`           | `local`                  | The `host` label on the app's rows and series, the collector's value too ([ADR 0022](adr/0022-the-host-label.md)). |
 | `CCOBS_APP_RETENTION`        | `90d`                    | How long the app keeps sessions after their last event (see above).                                                |
@@ -625,7 +698,11 @@ CCOBS_DATA_DIR=.ccobs-dev CCOBS_TELEMETRY_RECONCILE=false uv run python -m ccobs
 
 It serves <http://127.0.0.1:4300> and its metrics on `127.0.0.1:9464`; Ctrl+C stops it,
 and `docker compose start app` brings the stack's app back. Git ignores the database
-files it creates in `.ccobs-dev`.
+files it creates in `.ccobs-dev`. The session page's tokens and cost then say Prometheus
+is unavailable, since Prometheus's compose name does not resolve on the host either:
+start the stack with the debug override and add
+`CCOBS_PROMETHEUS_URL=http://127.0.0.1:4390` to see them. The links to Grafana work as
+they are, while Grafana runs on its default port.
 
 ## Troubleshooting
 
@@ -641,6 +718,15 @@ files it creates in `.ccobs-dev`.
 
 `curl -s http://127.0.0.1:4300/healthz` answers `{"status":"ok"}` once the app serves
 requests.
+
+### The overview stays empty
+
+The overview shows the hook settings until the app stores its first session. Check that
+you started Claude Code with `claude --settings` and the hooks file (see
+[Point Claude Code at the app](#point-claude-code-at-the-app)), and that you opened the
+app on the port in that file. A session shows up with its first hook, normally its first
+prompt; `SessionStart` alone can arrive late. If Claude Code shows hook errors, see
+below.
 
 ### Claude Code shows hook errors
 
@@ -687,6 +773,36 @@ tool call of that session.
   by default). Running the app outside compose, set `CCOBS_PROMETHEUS_URL` to a
   Prometheus it can reach (the debug override publishes it on `127.0.0.1:4390`).
 
+### "Live updates paused. Reconnecting…"
+
+The page lost its live updates stream and retries on its own, from every 5 seconds up to
+once a minute; what it shows may be out of date until the message goes away. Reload the
+page to retry at once.
+
+- **The app is down or restarting**: `docker compose ps app` should say `healthy`; see
+  [The app is unhealthy](#the-app-is-unhealthy-or-keeps-restarting).
+- **Too many streams**: the app serves 16 at once, one per overview or session tab, for
+  every browser together. `ccobs_ui_streams` shows how many are open and
+  `ccobs_ui_streams_refused_total` how many were refused; the log says
+  `live stream refused`. Close tabs you do not need.
+- **Many tabs in one browser**: browsers open at most about 6 connections to one host
+  over HTTP/1.1, and each tab with live updates holds one. With six or more such tabs,
+  other requests to the app (pages, refetches) wait for a free connection and the pages
+  look frozen. Close some tabs, or open the extra ones as `127.0.0.1:4300` and
+  `localhost:4300`, which browsers count as two hosts.
+- **A proxy or extension buffering responses**: the stream must reach the page as it is
+  written. The app needs no proxy; open it directly at `http://127.0.0.1:4300`.
+
+### A page says "The database is busy"
+
+A read waited more than 5 seconds for one of the app's 4 database readers, so the page,
+or a part of it, gave up with a 503. The writer is not affected and no hook is lost;
+reload the page a few seconds later. The app's log says
+`UI read refused: database busy`. If it keeps happening, check whether
+`ccobs_database_wal` is 0 (below): without WAL, reads wait for the writer. "The app
+could not read its database" is a failed read, not a busy one: `docker compose logs app`
+names the error.
+
 ### WAL is off
 
 `ccobs_database_wal` is 0 and the log says `SQLite journal mode is ... not 'wal'`: the
@@ -707,26 +823,6 @@ curl -s http://127.0.0.1:4301/metrics | grep -E '^ccobs_hook_(events_dropped_tot
 over `CCOBS_HOOK_BODY_MAX_BYTES`, `invalid` a body that is not a hook payload, and
 `internal` an error in the app, which its log names by type. Dropped hooks still got an
 empty 204, so Claude Code showed nothing.
-
-### "Live updates paused. Reconnecting…"
-
-The page lost its live updates stream and retries on its own, from every 5 seconds up to
-once a minute; what it shows may be out of date until the message goes away. Reload the
-page to retry at once.
-
-- **The app is down or restarting**: `docker compose ps app` should say `healthy`; see
-  [The app is unhealthy](#the-app-is-unhealthy-or-keeps-restarting).
-- **Too many streams**: the app serves 16 at once, one per overview or session tab, for
-  every browser together. `ccobs_ui_streams` shows how many are open and
-  `ccobs_ui_streams_refused_total` how many were refused; the log says
-  `live stream refused`. Close tabs you do not need.
-- **Many tabs in one browser**: browsers open at most about 6 connections to one host
-  over HTTP/1.1, and each tab with live updates holds one. With six or more such tabs,
-  other requests to the app (pages, refetches) wait for a free connection and the pages
-  look frozen. Close some tabs, or open the extra ones as `127.0.0.1:4300` and
-  `localhost:4300`, which browsers count as two hosts.
-- **A proxy or extension buffering responses**: the stream must reach the page as it is
-  written. The app needs no proxy; open it directly at `http://127.0.0.1:4300`.
 
 ### Reading the app's logs
 
@@ -773,6 +869,16 @@ measurement, or unverified.
   authentication ([SECURITY.md](../SECURITY.md)).
 - **Live updates** (by design): at most 16 streams at once; each change costs every open
   overview tab one read and every session tab two, coalesced over a quarter of a second.
-  A strip that changes bay moves without an animation.
-- **Memory** (measured on Docker Desktop 29.8, WSL 2): 63.8 MiB idle, 70.1 MiB after
-  about 2,750 hooks, against a 256m limit ([stack.md](stack.md#memory-and-disk)).
+  A strip that changes bay moves without an animation. A browser holds about 6
+  connections to one host, so six or more live tabs in one browser stall each other.
+- **Tokens and cost** (by design,
+  [ADR 0035](adr/0035-per-session-tokens-and-cost-from-prometheus-and-grafana-links.md)):
+  per session only, on the session page; totals across sessions are on Grafana's
+  dashboard. They lag Claude Code's export by up to a minute, and can come out low in
+  the three cases under [Tokens and cost](#tokens-and-cost).
+- **Home directories** (by design): recognised by the shape of the path, so a home in
+  an unusual place shows as it is (see
+  [What the UI never shows](#what-the-ui-never-shows)).
+- **Memory** (measured on Docker Desktop 29.8, WSL 2, in v0.3.0, before the web UI):
+  63.8 MiB idle, 70.1 MiB after about 2,750 hooks, against a 256m limit
+  ([stack.md](stack.md#memory-and-disk)).

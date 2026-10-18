@@ -5,7 +5,7 @@ update it, its settings, where its data lives and for how long, how much memory 
 it uses, and what to check when something goes wrong. The decisions behind it are
 recorded as ADRs in [`adr/`](adr/README.md); this page links to them instead of
 repeating their reasons. [app.md](app.md) is the reference for the app itself: pointing
-Claude Code at it, its API, metrics, data and troubleshooting.
+Claude Code at it, its web UI, API, metrics, data and troubleshooting.
 
 Commands run from the repository root, where `compose.yaml` is, in bash (Git Bash on
 Windows).
@@ -47,9 +47,10 @@ Windows).
   scrapes its own metrics and the collector's (`otelcol_*`, on port 8888 inside the
   stack's networks). Grafana queries the three stores. Claude Code's hooks go to the
   app, which keeps sessions, agents and blocks in SQLite, reads Claude Code's
-  `tool_decision` events back from Loki, and serves its live state on a metrics listener
+  `tool_decision` events back from Loki, serves its live state on a metrics listener
   (port 9464 inside the stack, never published) that Prometheus scrapes as the job
-  `ccobs-app` ([app.md](app.md)).
+  `ccobs-app`, and serves the web UI, whose session pages read each session's tokens and
+  cost from Prometheus and link to Grafana ([app.md](app.md)).
 - **Networks** ([ADR 0018](adr/0018-ports-networks-and-exposure.md)). `backend` is an
   internal network with no route out, so Prometheus, Loki and Tempo, which join only
   `backend`, cannot reach the internet. `edge` is a normal bridge network for the
@@ -98,10 +99,12 @@ changes, API errors and recent events, for the last 24 hours by default, refresh
 minute, with Host and Model filters. Traces are in Explore, with the Tempo datasource;
 without Tempo, that datasource shows an error and nothing else is affected.
 
-The app answers at <http://127.0.0.1:4300> (the port is `CCOBS_APP_PORT`): its hook
-endpoint, `/healthz` and its JSON API, such as `/api/v1/sessions`; its web UI comes in
-v0.4.0. Claude Code sends it hooks only once you point Claude Code at it
-([app.md](app.md#point-claude-code-at-the-app)).
+The app answers at <http://127.0.0.1:4300> (the port is `CCOBS_APP_PORT`): its web UI
+at the root, its hook endpoint, `/healthz` and its JSON API, such as
+`/api/v1/sessions`. Claude Code sends it hooks only once you point Claude Code at it
+([app.md](app.md#point-claude-code-at-the-app)); until then the overview shows the hook
+settings to use. The app's links to Grafana open `http://localhost:<CCOBS_GRAFANA_PORT>`,
+as above.
 
 | Command                            | Effect                                                                                                                                |
 | ---------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
@@ -157,7 +160,7 @@ recreates the services whose settings changed. Git ignores `.env`.
 | `CCOBS_PROMETHEUS_PORT`      | `4390`                   | Host port of Prometheus's HTTP API; debug override only.                                                                                 |
 | `CCOBS_LOKI_PORT`            | `4310`                   | Host port of Loki's HTTP API; debug override only.                                                                                       |
 | `CCOBS_TEMPO_PORT`           | `4320`                   | Host port of Tempo's HTTP API; debug override only, with the `traces` profile.                                                           |
-| `CCOBS_APP_PORT`             | `4300`                   | Host port of the app: the hook URL that Claude Code posts to, the API and `/healthz`.                                                    |
+| `CCOBS_APP_PORT`             | `4300`                   | Host port of the app: the web UI, the hook URL that Claude Code posts to, the API and `/healthz`.                                        |
 | `CCOBS_APP_METRICS_PORT`     | `4301`                   | Host port of the app's metrics listener; debug override only.                                                                            |
 | `CCOBS_APP_RETENTION`        | `90d`                    | How long the app keeps a session after its last event, in Prometheus's units; at least `1d` and never below `CCOBS_SESSION_STALE_AFTER`. |
 | `CCOBS_SESSION_STALE_AFTER`  | `12h`                    | How long a session or agent can stay silent before the app marks it stale, in the same units; at least `1h`.                             |
@@ -179,8 +182,9 @@ is dropped, still answered with an empty 2xx, and counted in
 
 The app checks its own settings at start-up and stops with a message that names each
 invalid variable; [app.md](app.md#configuration) has the details, including
-`CCOBS_LISTEN_HOST`, which the image sets, and the three other settings that compose
-never passes.
+`CCOBS_GRAFANA_URL`, which compose derives from `CCOBS_GRAFANA_PORT` for the app's links
+to Grafana, `CCOBS_LISTEN_HOST`, which the image sets, and the three other settings that
+compose never passes.
 
 `CCOBS_HOST_LABEL` takes letters, digits, `.`, `_` and `-`. The stack does not check the
 value: a double quote or a backslash can stop the collector at start-up or change the
@@ -328,7 +332,8 @@ With Tempo (`docker compose --profile traces up -d`):
   where Prometheus and Loki hold and query much more data, has not been measured.
 
 The app was measured on its own, with the same Docker Desktop 29.8 (Windows 11, WSL 2)
-and `tools/stack/memory.py`, when it joined the stack, in MiB:
+and `tools/stack/memory.py`, when it joined the stack in v0.3.0, before its web UI, in
+MiB:
 
 | Phase                                   | Usage | `memory.peak` |
 | --------------------------------------- | ----- | ------------- |
@@ -549,8 +554,9 @@ limit, which `uv run python -m tools.stack.memory --samples 12` shows as a peak 
 failed: most often an invalid setting, which it names, or port 4300 taken by another
 program. A hook-error notice in Claude Code's transcript means a hook could not reach
 the app: the stack is down or starting, or the hook URL is wrong (it must use
-`127.0.0.1`). [app.md](app.md#troubleshooting) covers these, a session stuck in
-`working` or `waiting_user`, WAL being off and dropped hooks.
+`127.0.0.1`). [app.md](app.md#troubleshooting) covers these, an empty overview, a
+session stuck in `working` or `waiting_user`, missing tokens and cost, "Live updates
+paused", a busy database, WAL being off and dropped hooks.
 
 ### An edited dashboard does not show on the home page
 

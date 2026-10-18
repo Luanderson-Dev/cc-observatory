@@ -43,26 +43,34 @@ events. The full plan is in the roadmap below.
 
 Unless a section says otherwise, the rest of this README describes the planned design.
 
-## What it will show
+## What it shows
 
-The release that brings each part is in parentheses. Only the Grafana part comes with
-v0.2.0 (see "Run the observability stack" below); the rest is planned.
+The release that brings each part is in parentheses. The parts up to v0.4.0 run from a
+clone of this repository (see "Run the observability stack" and "Try the app" below);
+the rest is planned.
 
-- **Live overview** of the Claude Code sessions on your machine: which ones are working,
-  waiting on you, idle or ended (v0.4.0).
-- **Agent tree**: each session's main agent and the subagents it started (v0.4.0).
+- **Live overview** of the Claude Code sessions on your machine, in a web UI at
+  <http://127.0.0.1:4300>: the sessions waiting on you first, with how long each has
+  waited, then the ones working, idle, recently ended or stale. It updates as Claude
+  Code works, without a reload (v0.4.0).
 - **Blocks**: sessions waiting on you, such as a permission prompt or an MCP
-  elicitation, with how long each one has been waiting (tracked from v0.3.0, shown in
-  the web UI from v0.4.0).
-- **Events and logs** for each session (v0.4.0).
-- **Tokens and cost** (v0.4.0) by day, model and agent type (built-in agent names; your
-  own agents show as `custom` unless you opt in to tool details) and by project (joined
-  from the working directory that hooks report). Cost is an estimate that comes from
-  Claude Code's telemetry, not the amount you are billed.
-- **Health page**: whether each part of the stack is up and receiving data (v0.4.0).
+  elicitation, with how long each one has been waiting and how it ended (tracked from
+  v0.3.0, shown in the web UI from v0.4.0).
+- **A page per session** (v0.4.0) with its blocks, its **agent tree** (the subagents,
+  each under the agent that started it), its **tokens and cost** (tokens by type, tokens
+  and cost by model) and its **hook timeline**, metadata only.
+- **Events and logs** for each session: the hook timeline on its page, and a link to its
+  Claude Code events in Grafana (v0.4.0).
+- **Tokens and cost**: per session on its page (v0.4.0), and across sessions by day and
+  model in Grafana's overview dashboard (v0.2.0); by agent type (built-in agent names;
+  your own agents show as `custom` unless you opt in to tool details) and by project
+  (joined from the working directory that hooks report) are planned. Cost is an
+  estimate that comes from Claude Code's telemetry, not the amount you are billed.
+- **Health page**: whether each part of the stack is up and receiving data (planned).
 - **Grafana** for deeper analysis, provisioned with its datasources and a Claude Code
-  overview dashboard (v0.2.0), and later with dashboards that the app links to, already
-  filtered to the session, agent or project you were looking at (v0.7.0).
+  overview dashboard (v0.2.0); each session's page links to its logs, tokens and cost
+  there (v0.4.0), and later dashboards will open already filtered to the agent or
+  project you were looking at (v0.7.0).
 - **Alerts** (v0.6.0): browser notifications and, optionally, a Discord webhook when a
   session has been waiting on you for longer than a threshold, when API errors keep
   repeating, or when the estimated cost of a session or of a day goes over a limit. You
@@ -91,8 +99,9 @@ Grafana ◄── Prometheus, Loki, Tempo (provisioned datasources and dashboard
   in SQLite.
 - **Live state as metrics.** The app exposes that live state on `/metrics`, which
   Prometheus scrapes, so it can be charted next to the telemetry.
-- **The app** also queries Prometheus and Loki over HTTP for its token, cost and event
-  views.
+- **The web UI.** The app serves its own pages, which follow the sessions live over
+  server-sent events, and reads each session's tokens and cost from Prometheus. It also
+  closes permission prompts denied with Esc from Claude Code's events in Loki.
 - **Grafana** comes provisioned with the Prometheus, Loki and Tempo datasources and with
   the dashboards.
 - **Why both sources:** telemetry tells you what a session consumed (tokens, cost, API
@@ -106,8 +115,8 @@ The decisions behind this design, and their reasons, are recorded as architectur
 
 From v0.2.0 you can run the observability stack from a clone of this repository and see
 Claude Code's metrics and events in Grafana. From v0.3.0 the stack also runs the app
-(hooks, sessions and blocks; see "Try the app" below). Its web UI comes in v0.4.0 and
-`ccobs setup` in v0.5.0, so until then you point Claude Code at the stack by hand.
+(hooks, sessions and blocks; see "Try the app" below), and from v0.4.0 the app's web UI.
+`ccobs setup` comes in v0.5.0, so until then you point Claude Code at the stack by hand.
 
 1. Start the stack:
 
@@ -181,12 +190,12 @@ Claude Code's metrics and events in Grafana. From v0.3.0 the stack also runs the
   covers stopping and updating the stack, its settings, data and retention, memory, and
   troubleshooting.
 
-## Try the app (from v0.3.0)
+## Try the app (from v0.3.0, web UI from v0.4.0)
 
 From v0.3.0, `docker compose up -d` also builds the app's image from your clone and
 starts it at <http://127.0.0.1:4300>. The app receives Claude Code's hooks and tracks
-sessions, agents and blocks in SQLite. Its web UI comes in v0.4.0; until then you can
-see what it tracks through its read-only JSON API.
+sessions, agents and blocks in SQLite. From v0.4.0 it shows them in a web UI at that
+address; it also serves them as a read-only JSON API.
 
 1. Start or update the stack as above. `docker compose ps` shows `app` as healthy once
    it serves requests.
@@ -204,7 +213,11 @@ see what it tracks through its read-only JSON API.
    Your `~/.claude/settings.json` stays as it is, and only the sessions you start this
    way send hooks. The hook URL uses `127.0.0.1`, not `localhost`.
 
-3. See the sessions:
+3. Open <http://127.0.0.1:4300> in your browser. The overview shows your sessions in
+   bays by state, the ones waiting on you first, and follows them live; click a session
+   for its blocks, agents, tokens and cost, and hook timeline, and for links to its logs
+   and usage in Grafana. Until the first session arrives, the overview shows the hook
+   settings from step 2. The same data is in the JSON API:
 
    ~~~bash
    curl -s http://127.0.0.1:4300/api/v1/sessions
@@ -216,12 +229,13 @@ see what it tracks through its read-only JSON API.
 - **Stack down.** While the stack is down, sessions started with these hooks show a
   hook-error notice in the transcript on most hook events; start Claude Code without
   `--settings` until the stack is back.
-- **Esc denials.** A permission prompt denied with Esc fires no hook; the app closes it
-  from Claude Code's events in Loki, so keep the telemetry settings from step 3 of the
-  previous section.
+- **Esc denials, tokens and cost.** A permission prompt denied with Esc fires no hook;
+  the app closes it from Claude Code's events in Loki. A session's tokens and cost come
+  from Claude Code's metrics in Prometheus. Both need the telemetry settings from step 3
+  of the previous section.
 - **More.** [docs/app.md](https://github.com/Luanderson-Dev/cc-observatory/blob/main/docs/app.md)
-  covers the API, the app's metrics in Grafana, its settings and retention, privacy and
-  troubleshooting.
+  covers the web UI, the API, the app's metrics in Grafana, its settings and retention,
+  privacy and troubleshooting.
 
 ## Quick start (planned, available from v0.5.0)
 
@@ -272,6 +286,10 @@ without installing it.
   machine except the optional Discord webhook, if you configure one, and DNS lookups of
   a store's name while that store is stopped (see
   [SECURITY.md](https://github.com/Luanderson-Dev/cc-observatory/blob/main/SECURITY.md)).
+- **The web UI** (from v0.4.0) has no login either, loads nothing from the internet and
+  changes nothing. It shows the working directory only as the project name, or with your
+  home directory as `~`, and refuses requests that other web pages make through your
+  browser (a link to it still just opens it).
 - **Grafana has no login.** Whoever opens it is an Editor, who can query the data and
   save dashboards but cannot change its datasources, plugins, users or settings. It
   answers only as `localhost`, which keeps other web pages from reading it through DNS

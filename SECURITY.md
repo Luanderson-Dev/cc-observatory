@@ -64,9 +64,10 @@ to each part from the release that ships it.
   so use Docker Engine 28.0 or later there.
 - **No authentication.** Anyone with access to your user account, and any process that
   can reach localhost on your machine (including other users of a shared machine), can
-  read the collected data, including the app's JSON API, and post events to the hook
-  endpoint. Any local process can inject fake hook events or telemetry, so what the app
-  and Grafana show is only as trustworthy as the software running on your machine.
+  read the collected data, including the app's web UI and JSON API, and post events to
+  the hook endpoint. Any local process can inject fake hook events or telemetry, so what
+  the app and Grafana show is only as trustworthy as the software running on your
+  machine.
 - **Grafana has no login** (from v0.2.0,
   [ADR 0017](docs/adr/0017-grafana-access-and-dns-rebinding.md)). Whoever opens it is an
   Editor of its only organization: they can read all the data, run queries and save
@@ -114,16 +115,41 @@ to each part from the release that ships it.
       The read-only JSON API serves the working directory (`cwd`), which contains your
       OS username, and it reaches only clients on localhost that send an allowed
       `Host`. The app serves no OpenAPI schema or interactive docs.
-    - From v0.4.0 the app also refuses, with a 403, any browser request from another
-      site, other `localhost` ports such as Grafana's included, unless it is a top-level
-      `GET` navigation (a link or a typed URL), using the browser's Fetch Metadata
-      headers; so a page cannot load the app's responses as images or scripts, fetch
-      from it, frame it or hold its live event stream. Its responses carry a strict
-      Content Security Policy, `Cross-Origin-Resource-Policy: same-origin`, no referrer
-      and, outside its static files, `Cache-Control: no-store`, and every route but the
-      hook endpoint is read-only
-      ([ADR 0034](docs/adr/0034-browser-hardening-csp-fetch-metadata-and-response-headers.md)).
-      The hook endpoint keeps its empty 204 whatever these headers say.
+    - The app's web UI (from v0.4.0,
+      [ADR 0034](docs/adr/0034-browser-hardening-csp-fetch-metadata-and-response-headers.md))
+      adds these defences:
+        - **Fetch Metadata.** The app refuses, with a 403, any browser request whose
+          `Sec-Fetch-Site` header says it comes from another site, other `localhost`
+          ports such as Grafana's included, unless it is a top-level `GET` navigation (a
+          link or a typed URL); a websocket gets close code 1008. So a page cannot load
+          the app's responses as images or scripts, fetch from it, frame it or hold its
+          live updates stream. A link from another site still opens an app page in a
+          tab of its own, which the linking page cannot read. Requests without the
+          header, such as `curl`'s, are not browser requests and pass.
+        - **Content Security Policy.** Every response but the hook endpoint's carries a
+          strict policy: only the app's own scripts, styles, fonts and images (plus
+          `data:` images), nothing from another origin, no inline or evaluated code, no
+          plugins, no `<base>`, no form submission and no framing
+          (`frame-ancestors 'none'`). htmx and the fonts are vendored files with recorded checksums
+          ([ADR 0031](docs/adr/0031-server-rendered-pages-with-htmx-and-vendored-assets.md)).
+        - **Other headers.** `Cross-Origin-Resource-Policy: same-origin`,
+          `Cross-Origin-Opener-Policy: same-origin`, `X-Content-Type-Options: nosniff`,
+          `Referrer-Policy: no-referrer` (a link to Grafana carries no address of the
+          app's) and, outside the static files, `Cache-Control: no-store`, so the
+          browser keeps no copy of a page on disk.
+        - **Read-only.** Every route but the hook endpoint serves only `GET`; the UI
+          has no form and changes nothing, in the app or in Claude Code. It keeps one
+          value in the browser's local storage, the theme.
+        - **Less personal data on screen.** The pages never show the full working
+          directory: the overview shows the project name, and a session's page the
+          path with the home directory as `~`. Homes are recognised by the shape of
+          the path, so the username can still show: a home in an unusual place (such
+          as `/home2/<user>`) shows as it is, a `/home/<group>/<user>` layout hides
+          the group but not the user (`/home/staff/<user>/x` shows as
+          `~/<user>/x`), and an MSYS or Cygwin home mounted outside `/home` or
+          `Users` is not recognised.
+        - The hook endpoint keeps its empty 204, with no added header, whatever these
+          headers say.
     - The app's `/metrics` is on a separate listener that compose never publishes, so
       a browser on your machine cannot reach it
       ([ADR 0028](docs/adr/0028-app-metrics-and-their-listener.md)). Two exceptions,
@@ -154,8 +180,9 @@ to each part from the release that ships it.
   the transcript path, that contain your OS username. The app stores only the working
   directory (`cwd`) and drops the others; on Amazon Bedrock the stored model name can be
   an ARN that contains your AWS account ID. Keep them in mind when you share
-  screenshots, API output, backups of the volumes or bug reports. The app's logs never
-  contain them.
+  screenshots, API output, backups of the volumes or bug reports: a screenshot of the
+  web UI shows project names and the paths below your home directory. The app's logs
+  never contain them.
 - **Content capture is opt-in.** By default, prompt text, tool inputs and outputs,
   assistant messages and error text are dropped before anything is stored.
   `ccobs setup --capture-content` (from v0.5.0) turns content capture on in Claude Code,
