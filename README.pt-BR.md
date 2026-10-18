@@ -12,34 +12,35 @@ tokens e custo na sua própria máquina.
 
 ## Status
 
-**Pré-alfa.** A v0.3.0 fecha o milestone 2 de 8: o app que recebe os hooks do Claude
-Code. O pacote `cc-observatory` no PyPI ainda só mostra a própria versão; a stack e o app
-rodam a partir de um clone deste repositório.
+**Pré-alfa.** A v0.4.0 fecha o milestone 3 de 8: a interface web. O pacote
+`cc-observatory` no PyPI ainda só mostra a própria versão; a stack e o app rodam a partir
+de um clone deste repositório.
 
-O que a v0.3.0 traz:
+O que a v0.4.0 traz:
 
-- o app, construído e iniciado pelo `docker compose up -d` e publicado em
-  `127.0.0.1:4300` (veja "Experimente o app" mais abaixo e o
-  [docs/app.md](docs/app.md), em inglês);
-- um endpoint de hooks que sempre responde com um 204 vazio e faz o trabalho em segundo
-  plano, para nunca deixar o Claude Code mais lento;
-- uma máquina de estados de sessões, agentes e bloqueios (sessões esperando por você);
-  um pedido de permissão negado com Esc não dispara hook, então o app o fecha a partir
-  da telemetria do Claude Code no Loki;
-- armazenamento só de metadados em SQLite, com retenção, e uma API JSON somente leitura
-  em `/api/v1/sessions`;
-- o estado ao vivo em `/metrics`, coletado pelo Prometheus;
-- as defesas do navegador: lista de `Host` permitidos, sem CORS, e requisições ao
-  endpoint de hooks que não são JSON ignoradas;
-- os ADRs 0023 a 0030, com as decisões do app.
+- uma interface web em `http://127.0.0.1:4300` (veja "Experimente o app" mais abaixo e
+  o [docs/app.md](docs/app.md), em inglês): uma visão geral das sessões agrupadas por
+  estado, com há quanto tempo cada uma espera por você, e uma página por sessão com os
+  bloqueios dela, a árvore de agentes e a linha do tempo dos hooks;
+- atualizações ao vivo por server-sent events, sem recarregar a página;
+- tokens e custo por sessão, lidos do Prometheus, e links de cada sessão para os logs,
+  tokens e custo dela no Grafana;
+- htmx e fontes embutidos no pacote, com checksums e licenças, para a interface
+  funcionar offline;
+- endurecimento contra o navegador: content security policy estrita, verificação de
+  Fetch Metadata e cabeçalhos de resposta defensivos;
+- engines de banco separados para o writer e para as leituras, com leituras
+  concorrentes limitadas, e páginas limitadas de bloqueios, agentes e eventos na API;
+- os ADRs 0031 a 0035, com as decisões da interface.
 
 Até o `ccobs setup` chegar na v0.5.0, você aponta o Claude Code para o app com um arquivo
-de settings passado ao `claude --settings`. Releases anteriores: a v0.2.0 (milestone 1)
-trouxe a stack de observabilidade no Docker Compose com um Grafana provisionado, e a
-v0.1.0 (milestone 0) montou a fundação.
+de settings passado ao `claude --settings`. Releases anteriores: a v0.3.0 (milestone 2)
+trouxe o app que recebe os hooks do Claude Code, a v0.2.0 (milestone 1) a stack de
+observabilidade no Docker Compose com um Grafana provisionado, e a v0.1.0 (milestone 0)
+montou a fundação.
 
-O que vem a seguir: o milestone 3 (v0.4.0), a interface web com sessões, agentes,
-bloqueios e eventos ao vivo. O plano completo está no roteiro mais abaixo.
+O que vem a seguir: o milestone 4 (v0.5.0), os comandos `ccobs setup`, `uninstall`,
+`doctor` e `status`. O plano completo está no roteiro mais abaixo.
 
 Salvo indicação em contrário, o restante deste README descreve o projeto planejado.
 
@@ -357,7 +358,7 @@ uma página web ainda consegue fazer, e para saber como relatar uma vulnerabilid
 | 0         | v0.1.0  | Fundação, ferramental, CI, ADRs, spike de telemetria e hooks, fixtures, primeira release no PyPI | Lançado      |
 | 1         | v0.2.0  | Stack de observabilidade no compose, Grafana provisionado                                        | Lançado      |
 | 2         | v0.3.0  | Ingestão de hooks, máquina de estados da sessão, SQLite, bloqueios, `/metrics`                   | Lançado      |
-| 3         | v0.4.0  | Interface web (HTMX + SSE)                                                                       | Planejado    |
+| 3         | v0.4.0  | Interface web (HTMX + SSE)                                                                       | Lançado      |
 | 4         | v0.5.0  | `ccobs setup`, `uninstall`, `doctor`, `status`                                                   | Planejado    |
 | 5         | v0.6.0  | Alertas (navegador e Discord)                                                                    | Planejado    |
 | 6         | v0.7.0  | Dashboards do Grafana e acabamento                                                               | Planejado    |
