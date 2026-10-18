@@ -463,6 +463,19 @@ class Repository:
             statement = select(SessionModel.session_id).where(SessionModel.session_id == session_id)
             return connection.execute(statement).first() is not None
 
+    def find_session(self, session_id: str) -> Session | None:
+        """The session's row alone, without its agents, blocks or counts; ``None`` if it
+        is not stored (the session page's tokens and cost need only its times)."""
+        with self.engine.connect() as connection:
+            row = (
+                connection.execute(
+                    select(SessionModel.__table__).where(SessionModel.session_id == session_id)
+                )
+                .mappings()
+                .one_or_none()
+            )
+            return None if row is None else _session(row)
+
     def get_session(
         self,
         session_id: str,

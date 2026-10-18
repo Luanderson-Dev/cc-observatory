@@ -42,6 +42,8 @@ __all__ = [
     "LOKI_RESULTS",
     "METRICS_PATH",
     "OTHER_EVENT",
+    "PROMETHEUS_QUERIES",
+    "PROMETHEUS_RESULTS",
     "REASON_LABEL",
     "RECEIVED_EVENTS",
     "RESULT_LABEL",
@@ -56,6 +58,7 @@ __all__ = [
     "AppMetric",
     "LokiQueryResult",
     "MetricType",
+    "PrometheusQueryResult",
     "event_label",
 ]
 
@@ -108,6 +111,16 @@ BLOCK_DURATION_BUCKETS: Final[tuple[float, ...]] = (
 # nothing.
 type LokiQueryResult = Literal["ok", "error"]
 LOKI_RESULTS: Final[tuple[LokiQueryResult, ...]] = get_args(LokiQueryResult.__value__)
+
+# The result of a query the app sends to Prometheus for a session's tokens and cost (ADR
+# 0035): a valid vector (ok); no connection, a non-2xx status or an error status (error);
+# no complete answer within the timeout (timeout); or an answer that is too large, not
+# JSON or not a vector of finite, non-negative values (invalid). A session page whose
+# totals come from the cache sends no query and counts nothing.
+type PrometheusQueryResult = Literal["ok", "error", "timeout", "invalid"]
+PROMETHEUS_RESULTS: Final[tuple[PrometheusQueryResult, ...]] = get_args(
+    PrometheusQueryResult.__value__
+)
 
 type MetricType = Literal["gauge", "counter", "histogram"]
 
@@ -206,6 +219,14 @@ LOKI_QUERIES: Final = AppMetric(
     (HOST_LABEL, RESULT_LABEL),
 )
 
+PROMETHEUS_QUERIES: Final = AppMetric(
+    "ccobs_prometheus_queries_total",
+    "counter",
+    "Queries sent to Prometheus for the tokens and cost of a session page since the app"
+    " started, by result.",
+    (HOST_LABEL, RESULT_LABEL),
+)
+
 # The web UI's live update streams (ADR 0032): how many are open, and how many were
 # refused because the cap of open streams was reached.
 UI_STREAMS: Final = AppMetric(
@@ -236,6 +257,7 @@ APP_METRICS: Final = (
     BUILD_INFO,
     DATABASE_WAL,
     LOKI_QUERIES,
+    PROMETHEUS_QUERIES,
     UI_STREAMS,
     UI_STREAMS_REFUSED,
 )

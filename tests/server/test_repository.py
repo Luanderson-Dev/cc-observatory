@@ -576,6 +576,17 @@ def test_session_exists(repo: Repository) -> None:
     assert not repo.session_exists(OTHER)
 
 
+def test_find_session_returns_the_session_alone(repo: Repository) -> None:
+    Writer(repo)(event("UserPromptSubmit"), BASE)
+
+    found = repo.find_session(SESSION)
+    detail = repo.get_session(SESSION)
+
+    assert detail is not None
+    assert found == detail.session
+    assert repo.find_session(OTHER) is None
+
+
 def test_unknown_sessions(repo: Repository) -> None:
     assert repo.get_session(SESSION) is None
     assert repo.load_state(SESSION) is None

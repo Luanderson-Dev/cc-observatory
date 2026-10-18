@@ -268,6 +268,9 @@ still being built for v0.4.0; this section lists what is there so far.
     activity, ...);
   - **Agents**: the subagents as a tree, each under the agent that launched it, newest
     first, with their type, state and how long they ran;
+  - **Tokens and cost**: the session's total cost and tokens, its tokens by type
+    (input, output, cache read, cache creation) and its tokens and cost by model, from
+    Prometheus (see [Tokens and cost](#tokens-and-cost));
   - **Hook timeline**: the session's hook events, newest first, with their metadata only
     (tool, MCP server, agent, notification type, error code, duration, sizes), never
     prompts, tool inputs or outputs.
@@ -290,7 +293,8 @@ still being built for v0.4.0; this section lists what is there so far.
   unknown session ID gets a "Session not found" page (404).
 - `GET /ui/board` returns the overview's board alone, and
   `GET /ui/sessions/{session_id}/live` a session's header, blocks and agents, for the
-  live updates below.
+  live updates below. `GET /ui/sessions/{session_id}/usage` returns its "Tokens and
+  cost" section.
 - **Times** are elapsed times ticking in the browser; hover one for the moment in your
   time zone.
 - **Theme**: system, light or dark, from the toggle in the header; the choice is kept in
@@ -300,6 +304,45 @@ still being built for v0.4.0; this section lists what is there so far.
   ([ADR 0017](adr/0017-grafana-access-and-dns-rebinding.md)), and every link the app
   draws starts there (see `CCOBS_GRAFANA_URL` under [Configuration](#configuration)).
 - If the app cannot read its database, the page says so with a 503 and a short reason.
+
+### Tokens and cost
+
+The session page's "Tokens and cost" section reads the session's totals from Claude
+Code's own metrics in Prometheus
+([ADR 0035](adr/0035-per-session-tokens-and-cost-from-prometheus-and-grafana-links.md)),
+the same totals as the dashboard
+([ADR 0013](adr/0013-metrics-through-the-prometheus-otlp-receiver.md)): the total cost
+in USD (four decimals under a dollar, two from a dollar up), the total tokens, the
+tokens by type, and the tokens and cost by model.
+
+The totals are exact within ADR 0013's limits, and can come out low in three cases:
+
+- Claude Code sends delta temporality (set outside `ccobs setup`, which sets
+  cumulative) and the collector restarted while the session ran;
+- the clock that stamps the telemetry runs more than about a minute ahead of the app's
+  (an ended session then misses its last export);
+- the app missed the session's first hooks (it was down, or dropped them) while the
+  collector received the metrics, so the session's start time in the app is later than
+  its real start and the earliest usage falls outside the window.
+
+The **Tokens and cost** link to Grafana shows the session's series over time, to compare.
+
+- The section loads after the page, then refreshes every minute; it does not follow the
+  live updates, since the hooks carry no token data. Claude Code exports its metrics
+  about once a minute, so the numbers can lag up to a minute (plus up to 30 seconds of
+  the app's cache).
+- It covers the whole session, from 5 minutes before it started to 2 minutes after it
+  ended (or after its last event, once stale); for a live session, up to now.
+- The app sends three small queries to `CCOBS_PROMETHEUS_URL` per session and keeps the
+  answer for 30 seconds while the session is live, 5 minutes once it is over; every tab
+  showing the session shares it. Each query gives up after 3 seconds.
+- **No usage recorded for this session yet**: Prometheus has no tokens or cost for the
+  session (see [Troubleshooting](#tokens-and-cost-are-missing-or-unavailable)).
+- **Prometheus is unavailable, so tokens and cost can't be shown right now**: the app
+  could not reach Prometheus, or it did not answer in time. The rest of the page works
+  as usual, and the section tries again a minute later.
+- The queries filter on the session ID; Prometheus logs no query unless its query log is
+  turned on, which the stack does not do.
 
 ### Live updates
 
@@ -407,7 +450,9 @@ seconds as the job `ccobs-app`, so the series are in Grafana's Prometheus dataso
 (`CCOBS_APP_METRICS_PORT`) for debugging. Names, labels and the reasons behind them are
 in [ADR 0028](adr/0028-app-metrics-and-their-listener.md); the Loki counter is in
 [ADR 0029](adr/0029-closing-esc-denials-from-loki.md), the live stream series in
-[ADR 0032](adr/0032-live-updates-change-hub-sse-pings-and-refetch.md).
+[ADR 0032](adr/0032-live-updates-change-hub-sse-pings-and-refetch.md), the Prometheus
+counter in
+[ADR 0035](adr/0035-per-session-tokens-and-cost-from-prometheus-and-grafana-links.md).
 
 | Series                              | Type      | Labels            | Meaning                                                                              |
 | ----------------------------------- | --------- | ----------------- | ------------------------------------------------------------------------------------ |
@@ -424,12 +469,17 @@ in [ADR 0028](adr/0028-app-metrics-and-their-listener.md); the Loki counter is i
 | `ccobs_build_info`                  | gauge     | `host`, `version` | Always 1; `version` is the running cc-observatory version.                           |
 | `ccobs_database_wal`                | gauge     | `host`            | 1 if the database runs in WAL mode, 0 if its filesystem refused WAL.                 |
 | `ccobs_loki_queries_total`          | counter   | `host`, `result`  | Queries sent to Loki for Esc denials, by result (`ok`, `error`).                     |
+| `ccobs_prometheus_queries_total`    | counter   | `host`, `result`  | Queries sent to Prometheus for tokens and cost, by result (see below).               |
 | `ccobs_ui_streams`                  | gauge     | `host`            | Live update streams open to the web UI.                                              |
 | `ccobs_ui_streams_refused_total`    | counter   | `host`            | Live update streams refused because 16 were already open.                            |
 
 - Every label takes its values from a closed list, and every value is exported, with 0
-  when empty: 67 series per host, however many sessions there are. No series has a
+  when empty: 71 series per host, however many sessions there are. No series has a
   session ID.
+- The Prometheus query results are `ok`, `error` (no connection, a non-2xx status),
+  `timeout` (no answer within 3 seconds) and `invalid` (an answer too large, not JSON,
+  or with values that are not finite, non-negative numbers). Totals from the app's
+  cache send no query and count nothing.
 - The drop reasons are `full` (the queue is full), `too_large` (a body over
   `CCOBS_HOOK_BODY_MAX_BYTES`), `bad_content_type`, `bad_host`, `bad_request` (not a
   hook: another method, a malformed length, a client gone mid-body), `invalid` (a body
@@ -528,19 +578,20 @@ Compose passes these variables to the app, each with the default below, so `.env
 optional ([`.env.example`](../.env.example) lists them with the same values). Change one
 in `.env` and run `docker compose up -d`.
 
-| Variable                     | Default            | Effect                                                                                                             |
-| ---------------------------- | ------------------ | ------------------------------------------------------------------------------------------------------------------ |
-| `CCOBS_APP_PORT`             | `4300`             | Host port of the app: the hook URL, the API and `/healthz`.                                                        |
-| `CCOBS_APP_METRICS_PORT`     | `4301`             | Host port of the metrics listener; debug override only.                                                            |
-| `CCOBS_HOST_LABEL`           | `local`            | The `host` label on the app's rows and series, the collector's value too ([ADR 0022](adr/0022-the-host-label.md)). |
-| `CCOBS_APP_RETENTION`        | `90d`              | How long the app keeps sessions after their last event (see above).                                                |
-| `CCOBS_SESSION_STALE_AFTER`  | `12h`              | Silence before a session or agent is stale (see above).                                                            |
-| `CCOBS_TELEMETRY_RECONCILE`  | `true`             | Read `tool_decision` rejects from Loki to close Esc denials: `true` or `false`.                                    |
-| `CCOBS_LOKI_URL`             | `http://loki:3100` | Loki's HTTP API as the app reaches it: `http` or `https`, with no user, query or fragment.                         |
-| `CCOBS_LOG_LEVEL`            | `info`             | `debug`, `info`, `warning` or `error`.                                                                             |
-| `CCOBS_HOOK_QUEUE_MAX_ITEMS` | `10000`            | Advanced: most hooks the queue holds at once, 1 to 1000000.                                                        |
-| `CCOBS_HOOK_QUEUE_MAX_BYTES` | `67108864`         | Advanced: most body bytes the queue holds at once (64 MiB), 1 MiB to 1 GiB.                                        |
-| `CCOBS_HOOK_BODY_MAX_BYTES`  | `8388608`          | Advanced: largest hook body read (8 MiB), 64 KiB to 64 MiB and at most the queue's bytes.                          |
+| Variable                     | Default                  | Effect                                                                                                             |
+| ---------------------------- | ------------------------ | ------------------------------------------------------------------------------------------------------------------ |
+| `CCOBS_APP_PORT`             | `4300`                   | Host port of the app: the hook URL, the API and `/healthz`.                                                        |
+| `CCOBS_APP_METRICS_PORT`     | `4301`                   | Host port of the metrics listener; debug override only.                                                            |
+| `CCOBS_HOST_LABEL`           | `local`                  | The `host` label on the app's rows and series, the collector's value too ([ADR 0022](adr/0022-the-host-label.md)). |
+| `CCOBS_APP_RETENTION`        | `90d`                    | How long the app keeps sessions after their last event (see above).                                                |
+| `CCOBS_SESSION_STALE_AFTER`  | `12h`                    | Silence before a session or agent is stale (see above).                                                            |
+| `CCOBS_TELEMETRY_RECONCILE`  | `true`                   | Read `tool_decision` rejects from Loki to close Esc denials: `true` or `false`.                                    |
+| `CCOBS_LOKI_URL`             | `http://loki:3100`       | Loki's HTTP API as the app reaches it: `http` or `https`, with no user, query or fragment.                         |
+| `CCOBS_PROMETHEUS_URL`       | `http://prometheus:9090` | Prometheus's HTTP API as the app reaches it, for tokens and cost: the same rules as `CCOBS_LOKI_URL`.              |
+| `CCOBS_LOG_LEVEL`            | `info`                   | `debug`, `info`, `warning` or `error`.                                                                             |
+| `CCOBS_HOOK_QUEUE_MAX_ITEMS` | `10000`                  | Advanced: most hooks the queue holds at once, 1 to 1000000.                                                        |
+| `CCOBS_HOOK_QUEUE_MAX_BYTES` | `67108864`               | Advanced: most body bytes the queue holds at once (64 MiB), 1 MiB to 1 GiB.                                        |
+| `CCOBS_HOOK_BODY_MAX_BYTES`  | `8388608`                | Advanced: largest hook body read (8 MiB), 64 KiB to 64 MiB and at most the queue's bytes.                          |
 
 Compose also passes `CCOBS_GRAFANA_URL`, Grafana as the browser opens it, for the UI's
 links. It is not offered in `.env`: compose sets it to Grafana's root URL,
@@ -618,6 +669,23 @@ The Esc-denial close needs Claude Code's events in Loki. Check that telemetry is
 in Grafana's Explore: a rising count means the app cannot reach Loki
 (`docker compose ps loki`). Without telemetry, the block closes at the next prompt or
 tool call of that session.
+
+### Tokens and cost are missing or unavailable
+
+- **"Prometheus is unavailable"**: check `docker compose ps prometheus` (it should be
+  `healthy`) and `ccobs_prometheus_queries_total` in Grafana's Explore: `error` means
+  the app cannot reach `CCOBS_PROMETHEUS_URL` or got an error status, `timeout` that
+  Prometheus did not answer within 3 seconds (a busy or starting Prometheus), and
+  `invalid` an answer the app could not read. The app's log says
+  `prometheus query failed (<reason>)`, with no URL or session ID.
+- **"No usage recorded for this session yet"**: Prometheus has nothing for the session.
+  A session that just started shows this until Claude Code's first export, about a
+  minute in. Otherwise Claude Code's metrics are not reaching the stack (see
+  [No data in the dashboard](stack.md#no-data-in-the-dashboard)), or they carry no
+  session ID because `OTEL_METRICS_INCLUDE_SESSION_ID=false` is set somewhere, or the
+  session is older than Prometheus's retention (`CCOBS_PROMETHEUS_RETENTION`, 90 days
+  by default). Running the app outside compose, set `CCOBS_PROMETHEUS_URL` to a
+  Prometheus it can reach (the debug override publishes it on `127.0.0.1:4390`).
 
 ### WAL is off
 

@@ -17,6 +17,14 @@
       {{ older_list("closed-blocks-older", "blocks") }}
       {{ more_control("blocks-more", blocks_more, "#closed-blocks-older", "Show older blocks") }}
     </section>
+    {#- From Prometheus, on load and every minute (ui.py, "Tokens and cost"): not live. -#}
+    <section class="session-section" aria-labelledby="usage-heading">
+      <h2 class="session-section__title" id="usage-heading">Tokens and cost</h2>
+      <div id="usage" class="usage" hx-get="{{ usage_href }}" hx-trigger="load, every 60s" hx-swap="innerHTML">
+        <p class="session-section__empty">Loading tokens and cost…</p>
+      </div>
+      <p class="session-section__lede">From Claude Code's metrics in Prometheus, which can lag up to a minute behind the session.</p>
+    </section>
     <section class="session-section" aria-labelledby="agents-heading">
       {{ agents_region(agents) }}
       {{ older_list("agents-older", "agents") }}

@@ -87,9 +87,12 @@ UNIT_SUFFIXES: Final = {"": "", "s": "seconds", "tokens": "tokens", "USD": "USD"
 ALLOWED_IMPORTS: Final = frozenset(
     {"__future__", "collections.abc", "dataclasses", "datetime", "enum", "json", "re", "typing"}
     | {"urllib.parse"}
+    # Pure arithmetic: math.isfinite and math.fsum (ccobs.domain.usage).
+    | {"math"}
     # Domain modules, each one checked by the same test.
     | {
         "ccobs.domain.durations",
+        "ccobs.domain.grafana_links",
         "ccobs.domain.hook_config",
         "ccobs.domain.hooks",
         "ccobs.domain.sessions",

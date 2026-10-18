@@ -97,6 +97,10 @@ class Settings(BaseSettings):
     # https, with a host and no credentials, query or fragment. Trailing slashes are
     # stripped, so that API paths are appended as f"{loki_url}/loki/api/v1/...".
     loki_url: str = "http://loki:3100"
+    # Prometheus's HTTP API on the compose network, for the session page's tokens and
+    # cost (ADR 0035): checked and stripped like loki_url, so that API paths are appended
+    # as f"{prometheus_url}/api/v1/...".
+    prometheus_url: str = "http://prometheus:9090"
     # Grafana as the browser opens it, for the UI's links (ADR 0017): http or https on
     # the host name localhost, since Grafana redirects every other one (127.0.0.1
     # included) to its root URL, with an optional port and path and no user, query or
@@ -153,9 +157,9 @@ class Settings(BaseSettings):
             )
         return value
 
-    @field_validator("loki_url")
+    @field_validator("loki_url", "prometheus_url")
     @classmethod
-    def _check_loki_url(cls, value: str) -> str:
+    def _check_service_url(cls, value: str) -> str:
         # The value is never echoed: it may hold a password, and the error is logged.
         # Whitespace is checked first: urlsplit silently drops tabs and newlines.
         error = "must be an http or https URL with a host and no user, query or fragment"

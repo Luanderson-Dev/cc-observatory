@@ -825,6 +825,72 @@ details[open] > .bay__summary .bay__title::before {
   font-size: var(--text-sm);
 }
 
+/* Tokens and cost: the two totals large, then plain tables with hairline rules and
+   right-aligned tabular figures. No boxes. */
+.usage {
+  margin-bottom: var(--space-2);
+}
+
+.usage__totals {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2) var(--space-6);
+  margin: 0 0 var(--space-3);
+}
+
+.usage__totals dt {
+  color: var(--ink-muted);
+  font-size: var(--text-sm);
+}
+
+.usage__totals dd {
+  margin: 0;
+  font-size: var(--text-lg);
+  font-weight: var(--weight-semibold);
+  font-variant-numeric: tabular-nums;
+}
+
+.usage__table {
+  width: 100%;
+  margin-bottom: var(--space-3);
+  border-collapse: collapse;
+  font-size: var(--text-sm);
+}
+
+.usage__table caption {
+  text-align: left;
+}
+
+.usage__table th,
+.usage__table td {
+  padding: var(--space-1) var(--space-3) var(--space-1) 0;
+  border-top: 1px solid color-mix(in srgb, var(--ink-muted) 25%, transparent);
+  text-align: left;
+  vertical-align: baseline;
+}
+
+.usage__table thead th {
+  border-top: 0;
+  color: var(--ink-muted);
+  font-weight: var(--weight-regular);
+}
+
+.usage__table tbody th {
+  font-weight: var(--weight-regular);
+  overflow-wrap: anywhere;
+}
+
+.usage__table .usage__number {
+  padding-right: 0;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.usage__error {
+  color: var(--error);
+}
+
 .blocks,
 .agents,
 .timeline {

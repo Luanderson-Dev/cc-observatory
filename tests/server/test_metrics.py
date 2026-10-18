@@ -50,6 +50,8 @@ from ccobs.domain.app_metrics import (
     LOKI_RESULTS,
     METRICS_PATH,
     OTHER_EVENT,
+    PROMETHEUS_QUERIES,
+    PROMETHEUS_RESULTS,
     RECEIVED_EVENTS,
     SESSION_STATES,
     SESSIONS,
@@ -253,9 +255,9 @@ def test_the_exposition_has_exactly_the_documented_series(client: TestClient) ->
 
     assert types == {metric.name: metric.type for metric in APP_METRICS}
     assert "_created" not in text
-    # The fixed total of ADR 0028, plus the two Loki query series of ADR 0029 and the two
-    # live stream series of ADR 0032.
-    assert sum(len(found) for found in samples.values()) == 67
+    # The fixed total of ADR 0028, plus the two Loki query series of ADR 0029, the two
+    # live stream series of ADR 0032 and the four Prometheus query series of ADR 0035.
+    assert sum(len(found) for found in samples.values()) == 71
     for metric in APP_METRICS:
         assert samples[metric.name], metric.name
         for sample in samples[metric.name]:
@@ -273,6 +275,7 @@ def test_states_kinds_reasons_and_events_are_exported_with_zeros(client: TestCli
     assert by_label(samples, HOOK_EVENTS_DROPPED, "reason") == dict.fromkeys(DROP_REASONS, 0)
     assert by_label(samples, HOOK_EVENTS_RECEIVED, "event") == dict.fromkeys(EVENT_LABELS, 0)
     assert by_label(samples, LOKI_QUERIES, "result") == dict.fromkeys(LOKI_RESULTS, 0)
+    assert by_label(samples, PROMETHEUS_QUERIES, "result") == dict.fromkeys(PROMETHEUS_RESULTS, 0)
     for metric in (
         AGENTS_RUNNING,
         SESSIONS_ENDED,
@@ -757,3 +760,19 @@ def test_app_metrics_turn_created_series_off() -> None:
     text = generate_latest(metrics.registry).decode()
     assert "_created" not in text
     assert f'{BLOCK_DURATION.name}_count{{host="{HOST}",kind="permission"}} 1.0' in text
+
+
+def test_prometheus_queries_are_counted_by_result() -> None:
+    # The usage reader's on_query (ADR 0035); every result exported, with zeros.
+    metrics = AppMetrics(HOST, HookQueue(1, 1))
+    for result in ("ok", "ok", "timeout", "invalid"):
+        metrics.count_prometheus_query(result)
+
+    _, samples = parse(generate_latest(metrics.registry).decode())
+
+    assert by_label(samples, PROMETHEUS_QUERIES, "result") == {
+        "ok": 2,
+        "error": 0,
+        "timeout": 1,
+        "invalid": 1,
+    }

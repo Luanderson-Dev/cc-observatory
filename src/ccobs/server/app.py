@@ -9,7 +9,9 @@ metrics listener (``ccobs.server.metrics``, ADR 0028), which serves ``/metrics``
 port of its own (this app has no ``/metrics`` route), then the sweeper
 (``ccobs.server.sweeps``), which submits the stale sweep and retention to the writer,
 then the reconciler (``ccobs.server.reconcile``, ADR 0029), which closes permission
-blocks denied with Esc from Loki. The live updates hub (``ccobs.server.live``, ADR 0032)
+blocks denied with Esc from Loki. The usage reader (``ccobs.server.usage``, ADR 0035),
+which reads a session's tokens and cost from Prometheus for the session page, opens with
+the metrics and closes last. The live updates hub (``ccobs.server.live``, ADR 0032)
 opens on the event loop before the writer starts, and the writer tells it what each
 commit changed. At shutdown it closes the hub, which ends the UI's streams, then stops
 the listener, then the reconciler, then the sweeper, then the writer, draining the
@@ -56,6 +58,7 @@ from ccobs.server.migrations import upgrade_to_head
 from ccobs.server.reads import READ_WAIT_TIMEOUT_S, ReadGate
 from ccobs.server.reconcile import POLL_INTERVAL_S, Reconciler, ReconcileTarget
 from ccobs.server.sweeps import RETENTION_INTERVAL_S, TICK_INTERVAL_S, Sweeper, SweepTarget
+from ccobs.server.usage import UsageReader
 from ccobs.server.writer import Writer, WriterCounts, WriterObservers
 
 __all__ = ["BackgroundWriter", "HookEndpoint", "WriterFactory", "create_app"]
@@ -168,6 +171,7 @@ def create_app(
     reconcile: bool = True,
     reconcile_interval_s: float | None = None,
     loki_transport: httpx.BaseTransport | None = None,
+    prometheus_transport: httpx.AsyncBaseTransport | None = None,
     read_wait_timeout_s: float = READ_WAIT_TIMEOUT_S,
     stream_timing: StreamTiming | None = None,
 ) -> FastAPI:
@@ -187,9 +191,11 @@ def create_app(
     0029) polls ``settings.loki_url`` every ``reconcile_interval_s`` (2 s by default)
     while permission blocks are open, with the same clock, through ``loki_transport``
     (httpx's by default; tests pass an ``httpx.MockTransport``); it runs only when both
-    ``reconcile`` and ``settings.telemetry_reconcile`` are true. The API reads through
-    an engine of its own, query-only, on the same database file, which the app always
-    creates and disposes (ADR 0033); a read that waits ``read_wait_timeout_s`` for a free
+    ``reconcile`` and ``settings.telemetry_reconcile`` are true. The usage reader
+    (``app.state.usage``) asks ``settings.prometheus_url`` through
+    ``prometheus_transport`` (httpx's by default). The API reads through an engine of
+    its own, query-only, on the same database file, which the app always creates and
+    disposes (ADR 0033); a read that waits ``read_wait_timeout_s`` for a free
     connection answers 503. The live updates hub is ``app.state.live``, built here so
     that the server can close it before uvicorn waits for open connections
     (``ccobs.server.__main__``); ``stream_timing`` sets its streams' intervals (tests).
@@ -242,6 +248,7 @@ def create_app(
         else:
             repo = repository
         reader: Repository | None = None
+        usage: UsageReader | None = None
         try:
             # Before the first request: a failed migration stops the app (ADR 0026).
             upgrade_to_head(repo.engine)
@@ -260,6 +267,14 @@ def create_app(
             # Before the writer: the histogram must exist for the first closed block, and
             # the hub must be open for the first commit.
             metrics = AppMetrics(settings.host_label, hook_queue, streams=hub)
+            # On the loop that serves the requests: its client belongs to it.
+            usage = UsageReader(
+                prometheus_url=settings.prometheus_url,
+                host=settings.host_label,
+                transport=prometheus_transport,
+                on_query=metrics.count_prometheus_query,
+            )
+            app.state.usage = usage
             hub.open(asyncio.get_running_loop())
             observers = WriterObservers(
                 on_block_closed=metrics.observe_block_closed,
@@ -329,6 +344,8 @@ def create_app(
             # checked-out connection alone, and it closes when the read returns it.
             if reader is not None:
                 reader.engine.dispose()
+            if usage is not None:
+                await usage.aclose()
             # After the writer has stopped: it writes until then.
             if owned:
                 repo.engine.dispose()

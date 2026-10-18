@@ -145,25 +145,26 @@ is optional. To change one, copy [`.env.example`](../.env.example) to `.env`, ed
 value and run `docker compose up -d` (with `--profile traces` if you run Tempo): Compose
 recreates the services whose settings changed. Git ignores `.env`.
 
-| Variable                     | Default            | Effect                                                                                                                                   |
-| ---------------------------- | ------------------ | ---------------------------------------------------------------------------------------------------------------------------------------- |
-| `CCOBS_OTLP_GRPC_PORT`       | `4317`             | Host port of the collector's OTLP/gRPC receiver, for Claude Code's `grpc` protocol.                                                      |
-| `CCOBS_OTLP_HTTP_PORT`       | `4318`             | Host port of the collector's OTLP/HTTP receiver, for Claude Code's `http/protobuf` and `http/json` protocols.                            |
-| `CCOBS_GRAFANA_PORT`         | `4330`             | Host port of Grafana, and the port of its root URL, which Grafana redirects to; the app's links to Grafana follow it.                    |
-| `CCOBS_HOST_LABEL`           | `local`            | The `host` label on every metric, event and trace, and on the app's rows and series ([ADR 0022](adr/0022-the-host-label.md)); see below. |
-| `CCOBS_PROMETHEUS_RETENTION` | `90d`              | How long Prometheus keeps metrics, in Prometheus's units: `y`, `w`, `d`, `h`, `m`, `s` or `ms`.                                          |
-| `CCOBS_LOKI_RETENTION`       | `720h`             | How long Loki keeps events, as a multiple of `24h`. It is also how far back a Loki query reaches.                                        |
-| `CCOBS_TEMPO_RETENTION`      | `168h`             | How long Tempo keeps traces, as a Go duration in hours at most. Tempo refuses days, such as `7d`, and does not start.                    |
-| `CCOBS_PROMETHEUS_PORT`      | `4390`             | Host port of Prometheus's HTTP API; debug override only.                                                                                 |
-| `CCOBS_LOKI_PORT`            | `4310`             | Host port of Loki's HTTP API; debug override only.                                                                                       |
-| `CCOBS_TEMPO_PORT`           | `4320`             | Host port of Tempo's HTTP API; debug override only, with the `traces` profile.                                                           |
-| `CCOBS_APP_PORT`             | `4300`             | Host port of the app: the hook URL that Claude Code posts to, the API and `/healthz`.                                                    |
-| `CCOBS_APP_METRICS_PORT`     | `4301`             | Host port of the app's metrics listener; debug override only.                                                                            |
-| `CCOBS_APP_RETENTION`        | `90d`              | How long the app keeps a session after its last event, in Prometheus's units; at least `1d` and never below `CCOBS_SESSION_STALE_AFTER`. |
-| `CCOBS_SESSION_STALE_AFTER`  | `12h`              | How long a session or agent can stay silent before the app marks it stale, in the same units; at least `1h`.                             |
-| `CCOBS_TELEMETRY_RECONCILE`  | `true`             | Whether the app reads Claude Code's `tool_decision` events from Loki to close permission prompts denied with Esc.                        |
-| `CCOBS_LOKI_URL`             | `http://loki:3100` | Loki's HTTP API as the app reaches it inside the stack.                                                                                  |
-| `CCOBS_LOG_LEVEL`            | `info`             | The app's log level: `debug`, `info`, `warning` or `error`.                                                                              |
+| Variable                     | Default                  | Effect                                                                                                                                   |
+| ---------------------------- | ------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| `CCOBS_OTLP_GRPC_PORT`       | `4317`                   | Host port of the collector's OTLP/gRPC receiver, for Claude Code's `grpc` protocol.                                                      |
+| `CCOBS_OTLP_HTTP_PORT`       | `4318`                   | Host port of the collector's OTLP/HTTP receiver, for Claude Code's `http/protobuf` and `http/json` protocols.                            |
+| `CCOBS_GRAFANA_PORT`         | `4330`                   | Host port of Grafana, and the port of its root URL, which Grafana redirects to; the app's links to Grafana follow it.                    |
+| `CCOBS_HOST_LABEL`           | `local`                  | The `host` label on every metric, event and trace, and on the app's rows and series ([ADR 0022](adr/0022-the-host-label.md)); see below. |
+| `CCOBS_PROMETHEUS_RETENTION` | `90d`                    | How long Prometheus keeps metrics, in Prometheus's units: `y`, `w`, `d`, `h`, `m`, `s` or `ms`.                                          |
+| `CCOBS_LOKI_RETENTION`       | `720h`                   | How long Loki keeps events, as a multiple of `24h`. It is also how far back a Loki query reaches.                                        |
+| `CCOBS_TEMPO_RETENTION`      | `168h`                   | How long Tempo keeps traces, as a Go duration in hours at most. Tempo refuses days, such as `7d`, and does not start.                    |
+| `CCOBS_PROMETHEUS_PORT`      | `4390`                   | Host port of Prometheus's HTTP API; debug override only.                                                                                 |
+| `CCOBS_LOKI_PORT`            | `4310`                   | Host port of Loki's HTTP API; debug override only.                                                                                       |
+| `CCOBS_TEMPO_PORT`           | `4320`                   | Host port of Tempo's HTTP API; debug override only, with the `traces` profile.                                                           |
+| `CCOBS_APP_PORT`             | `4300`                   | Host port of the app: the hook URL that Claude Code posts to, the API and `/healthz`.                                                    |
+| `CCOBS_APP_METRICS_PORT`     | `4301`                   | Host port of the app's metrics listener; debug override only.                                                                            |
+| `CCOBS_APP_RETENTION`        | `90d`                    | How long the app keeps a session after its last event, in Prometheus's units; at least `1d` and never below `CCOBS_SESSION_STALE_AFTER`. |
+| `CCOBS_SESSION_STALE_AFTER`  | `12h`                    | How long a session or agent can stay silent before the app marks it stale, in the same units; at least `1h`.                             |
+| `CCOBS_TELEMETRY_RECONCILE`  | `true`                   | Whether the app reads Claude Code's `tool_decision` events from Loki to close permission prompts denied with Esc.                        |
+| `CCOBS_LOKI_URL`             | `http://loki:3100`       | Loki's HTTP API as the app reaches it inside the stack.                                                                                  |
+| `CCOBS_PROMETHEUS_URL`       | `http://prometheus:9090` | Prometheus's HTTP API as the app reaches it inside the stack, for the tokens and cost on each session's page.                            |
+| `CCOBS_LOG_LEVEL`            | `info`                   | The app's log level: `debug`, `info`, `warning` or `error`.                                                                              |
 
 Advanced: the app's hook queue and body limits
 ([ADR 0027](adr/0027-the-app-http-surface-and-hook-queue.md)). A hook that does not fit

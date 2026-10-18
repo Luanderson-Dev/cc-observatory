@@ -11,7 +11,8 @@
   the next page of each list for the "Show older" controls, ``.../events?after=`` the
   events newer than a cursor, for the timeline's tail, and ``.../live`` the header,
   blocks and agents again, for the live refresh (see "Session page" and "Live
-  refresh").
+  refresh"). ``.../usage`` returns the "Tokens and cost" section (see "Tokens and
+  cost").
 - ``/static``: the package's ``static/`` directory.
 
 Every page's header links the Grafana overview dashboard for the app's host label, and
@@ -68,6 +69,17 @@ older list emptied and a "Show older" control from the new boundary, all out of 
 with the time of that refresh as its new start and the rows then open below the new
 boundary named, so the next refresh does not start over again.
 
+Tokens and cost (ADR 0035). The session page loads its "Tokens and cost" section from
+``.../usage`` with htmx on ``load`` and every 60 s, not on live updates: the totals come
+from Claude Code's metrics in Prometheus, which Claude Code exports about once a minute,
+not from the hooks that drive the change hub. The fragment reads the session once
+through the read gate, then, with no read slot held, asks the usage reader
+(``ccobs.server.usage``) for its totals over the session's window
+(``ccobs.domain.usage``). Every state it can show is a 200, so htmx swaps it in place of
+the loading text or the last totals: the values, no usage yet, Prometheus unavailable,
+values it can't read, or a database it could not read. Only an unknown session is a 404
+(left unswapped, like the other fragments' errors).
+
 Static cache policy: files under ``static/vendor/`` carry their version in their name
 (``tests/server/test_static.py`` checks htmx's), so a new version is a new URL and they
 are cached for a year as immutable. Every other static file (our CSS and JavaScript, the
@@ -117,6 +129,14 @@ from ccobs.domain.presentation import (
     project_name,
 )
 from ccobs.domain.sessions import Agent, Block, Session
+from ccobs.domain.usage import (
+    SessionUsage,
+    format_tokens,
+    format_usd,
+    model_rows,
+    token_type_label,
+    usage_window,
+)
 from ccobs.server.db.repository import (
     AgentPage,
     BoardRows,
@@ -127,6 +147,7 @@ from ccobs.server.db.repository import (
 )
 from ccobs.server.live import STREAM_PATH
 from ccobs.server.reads import ReadGate
+from ccobs.server.usage import UsageReader, UsageUnavailable
 
 __all__ = [
     "AGENTS_PAGE_SIZE",
@@ -456,17 +477,22 @@ def _grafana_home(request: Request) -> str:
     return dashboard_url(request.app.state.grafana_url, host=request.app.state.host_label)
 
 
+def _last_ms(session: Session) -> int | None:
+    """The session's last moment: its end, its last event once stale (it gets no more),
+    else ``None``: it is live."""
+    if session.ended_at_ms is None and session.status == "stale":
+        return session.last_event_at_ms
+    return session.ended_at_ms
+
+
 def _grafana_session(request: Request, session: Session) -> SessionLinks:
-    """The session page's links to Grafana, over the session's range: up to its end, its
-    last event once stale (it gets no more), else up to now."""
-    last_ms = session.ended_at_ms
-    if last_ms is None and session.status == "stale":
-        last_ms = session.last_event_at_ms
+    """The session page's links to Grafana, over the session's range: up to its last
+    moment (``_last_ms``), else up to now."""
     return session_links(
         request.app.state.grafana_url,
         host=request.app.state.host_label,
         session_id=session.session_id,
-        time_range=session_range(session.started_at_ms, last_ms),
+        time_range=session_range(session.started_at_ms, _last_ms(session)),
     )
 
 
@@ -953,6 +979,10 @@ def _live_link(session_id: str, blocks: _Window[int], agents: _Window[str]) -> L
     return LiveLink(href=href)
 
 
+def _usage_href(session_id: str) -> str:
+    return "/ui/sessions/" + quote(session_id, safe="") + "/usage"
+
+
 def _live_stream(session_id: str) -> str:
     return STREAM_PATH + "?" + urlencode({"session": session_id})
 
@@ -1019,6 +1049,7 @@ async def session_page(
         error=None,
         grafana=_grafana_session(request, detail.session),
         live_stream=_live_stream(session_id),
+        usage_href=_usage_href(session_id),
         live=_live_link(
             session_id,
             _Window(start=blocks_from, since_ms=now_ms, keep=_kept_blocks(blocks, blocks_from)),
@@ -1311,6 +1342,85 @@ async def live_fragment(
         agents=shown.region,
         agents_more=agents_more,
     )
+
+
+# Tokens and cost.
+
+
+@dataclass(frozen=True, kw_only=True)
+class UsageRow:
+    """One row of a usage table: a name (``mono`` for a model's) and its formatted
+    values; ``None`` where Prometheus had no series."""
+
+    name: str
+    tokens: str | None
+    cost: str | None = None
+    mono: bool = False
+
+
+@dataclass(frozen=True, kw_only=True)
+class UsageView:
+    total_cost: str
+    total_tokens: str
+    types: list[UsageRow]
+    models: list[UsageRow]
+
+
+_USAGE_MESSAGES: Final = {
+    "error": "Prometheus is unavailable, so tokens and cost can't be shown right now.",
+    "timeout": "Prometheus is unavailable, so tokens and cost can't be shown right now.",
+    "invalid": "Prometheus answered with values the app can't read, so tokens and cost"
+    " can't be shown right now.",
+}
+
+
+def _usage_view(usage: SessionUsage) -> UsageView:
+    return UsageView(
+        total_cost=format_usd(usage.total_cost),
+        total_tokens=format_tokens(usage.total_tokens),
+        types=[
+            UsageRow(name=token_type_label(name), tokens=format_tokens(value))
+            for name, value in usage.tokens_by_type
+        ],
+        models=[
+            UsageRow(
+                name=row.model or "Unknown model",
+                mono=bool(row.model),
+                tokens=None if row.tokens is None else format_tokens(row.tokens),
+                cost=None if row.cost is None else format_usd(row.cost),
+            )
+            for row in model_rows(usage)
+        ],
+    )
+
+
+def _usage_read(repository: Repository, session_id: str) -> Session | None:
+    return repository.find_session(session_id)
+
+
+def _usage_fragment(*, usage: UsageView | None = None, message: str | None = None) -> Response:
+    return _render("_usage.html", usage=usage, message=message)
+
+
+@router.get("/ui/sessions/{session_id}/usage", response_class=HTMLResponse)
+async def usage_fragment(
+    request: Request, repository: _Repo, reads: _Reads, session_id: str
+) -> Response:
+    """The session's "Tokens and cost" section (see "Tokens and cost")."""
+    if not is_valid_session_id(session_id):
+        return _fragment_error(_NO_SESSION, _NOT_FOUND)
+    # The read gate's slot is released before Prometheus is asked.
+    found = await _read(reads, _usage_read, repository, session_id)
+    if isinstance(found, ErrorView):
+        return _usage_fragment(message=f"{found.title}. {found.detail}")
+    if found is None:
+        return _fragment_error(_NO_SESSION, _NOT_FOUND)
+    window = usage_window(found.started_at_ms, _last_ms(found), _now_ms(request))
+    reader: UsageReader = request.app.state.usage
+    usage = await reader.read(session_id, window)
+    if isinstance(usage, UsageUnavailable):
+        return _usage_fragment(message=_USAGE_MESSAGES[usage.reason])
+    return _usage_fragment(usage=None if usage.empty else _usage_view(usage))
 
 
 # Static files.
