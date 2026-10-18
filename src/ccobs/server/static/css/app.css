@@ -1,0 +1,1180 @@
+/*
+ * cc-observatory web UI: tokens and base element styles (ADR 0031).
+ *
+ * Every file this stylesheet loads ships with the app; nothing comes from another origin.
+ * Component styles (strips, bays, panels) build on these tokens.
+ */
+
+/* Fonts: Atkinson Hyperlegible Next and Mono, variable (wght 200-800), SIL OFL 1.1,
+   unmodified upstream files listed in ../VENDOR.json. */
+
+@font-face {
+  font-family: "Atkinson Hyperlegible Next";
+  font-style: normal;
+  font-weight: 200 800;
+  font-display: swap;
+  src: url("../fonts/atkinson-hyperlegible-next-wght.woff2") format("woff2");
+}
+
+@font-face {
+  font-family: "Atkinson Hyperlegible Next";
+  font-style: italic;
+  font-weight: 200 800;
+  font-display: swap;
+  src: url("../fonts/atkinson-hyperlegible-next-italic-wght.woff2") format("woff2");
+}
+
+@font-face {
+  font-family: "Atkinson Hyperlegible Mono";
+  font-style: normal;
+  font-weight: 200 800;
+  font-display: swap;
+  src: url("../fonts/atkinson-hyperlegible-mono-wght.woff2") format("woff2");
+}
+
+/* Tokens. Light is the default; dark follows the system unless the page carries
+   data-theme="light", and data-theme="dark" forces it (the manual choice wins). */
+
+:root {
+  color-scheme: light;
+
+  /* Colour: the strip board. Amber is the only saturated colour in the common case.
+     Text tokens reach WCAG AA (4.5:1) on --board and --strip, --on-waiting on --waiting;
+     tests/server/test_static.py computes the ratios. */
+  --board: #dce3e0;
+  --strip: #f6f8f7;
+  --ink: #1c2623;
+  --ink-muted: #56645f;
+  --waiting: #e39b12;
+  --waiting-text: #8a5a00;
+  --on-waiting: #1c2623;
+  --working: #285fbf;
+  --idle: #7a8a85;
+  --ended: #b4beba;
+  --error: #b33a28;
+  --focus: var(--working);
+
+  /* Type: one superfamily; Mono only for identifiers. Scale 1.25: 13/16/20/25/31 px. */
+  --font-sans: "Atkinson Hyperlegible Next", system-ui, sans-serif;
+  --font-mono: "Atkinson Hyperlegible Mono", ui-monospace, monospace;
+  --text-sm: 0.8125rem;
+  --text-base: 1rem;
+  --text-lg: 1.25rem;
+  --text-xl: 1.5625rem;
+  --text-2xl: 1.9375rem;
+  --leading-tight: 1.25;
+  --leading-normal: 1.5;
+  --weight-regular: 400;
+  --weight-semibold: 600;
+  --weight-bold: 700;
+
+  /* Space: a 4 px base. */
+  --space-1: 0.25rem;
+  --space-2: 0.5rem;
+  --space-3: 0.75rem;
+  --space-4: 1rem;
+  --space-5: 1.5rem;
+  --space-6: 2rem;
+  --space-7: 3rem;
+  --space-8: 4rem;
+
+  /* Shape: strips are flat rows with a solid holder band on the left; no shadows. */
+  --radius-strip: 2px;
+  --band-width: 6px;
+  --page-max-width: 75rem;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --board: #18211f;
+    --strip: #222d2a;
+    --ink: #e8eeeb;
+    --ink-muted: #93a39d;
+    --waiting: #f0b33a;
+    --waiting-text: #f0b33a;
+    --on-waiting: #18211f;
+    --working: #6c9cf0;
+    --idle: #7f918b;
+    --ended: #4a5753;
+    --error: #f07a62;
+  }
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --board: #18211f;
+  --strip: #222d2a;
+  --ink: #e8eeeb;
+  --ink-muted: #93a39d;
+  --waiting: #f0b33a;
+  --waiting-text: #f0b33a;
+  --on-waiting: #18211f;
+  --working: #6c9cf0;
+  --idle: #7f918b;
+  --ended: #4a5753;
+  --error: #f07a62;
+}
+
+/* Base elements. */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background: var(--board);
+  color: var(--ink);
+  font-family: var(--font-sans);
+  font-size: var(--text-base);
+  font-weight: var(--weight-regular);
+  line-height: var(--leading-normal);
+}
+
+h1,
+h2,
+h3 {
+  margin: 0 0 var(--space-3);
+  line-height: var(--leading-tight);
+  font-weight: var(--weight-semibold);
+}
+
+h1 {
+  font-size: var(--text-xl);
+}
+
+h2 {
+  font-size: var(--text-lg);
+}
+
+h3 {
+  font-size: var(--text-base);
+}
+
+p {
+  margin: 0 0 var(--space-3);
+}
+
+small {
+  font-size: var(--text-sm);
+}
+
+a {
+  color: var(--working);
+  text-underline-offset: 0.15em;
+}
+
+code,
+kbd,
+samp {
+  font-family: var(--font-mono);
+  font-size: 0.95em;
+}
+
+/* Durations and counts stay in the UI face, with tabular figures. */
+time,
+data {
+  font-variant-numeric: tabular-nums;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+  color: inherit;
+}
+
+:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* Utilities. */
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
+.skip-link {
+  position: absolute;
+  top: var(--space-2);
+  left: var(--space-2);
+  z-index: 10;
+  padding: var(--space-2) var(--space-3);
+  background: var(--strip);
+  color: var(--ink);
+  border-radius: var(--radius-strip);
+  transform: translateY(-200%);
+}
+
+.skip-link:focus {
+  transform: none;
+}
+
+/* The page: left-aligned, at most --page-max-width wide. */
+
+.masthead__inner,
+.page {
+  max-width: var(--page-max-width);
+  padding-inline: var(--space-5);
+}
+
+.page {
+  padding-block: var(--space-4) var(--space-8);
+}
+
+.page:focus {
+  outline: none;
+}
+
+.masthead {
+  border-bottom: 1px solid color-mix(in srgb, var(--ink-muted) 30%, transparent);
+}
+
+.masthead__inner {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2) var(--space-5);
+  padding-block: var(--space-3);
+}
+
+.brand {
+  color: var(--ink);
+  font-size: var(--text-lg);
+  font-weight: var(--weight-semibold);
+  text-decoration: none;
+}
+
+.masthead__nav {
+  display: flex;
+  gap: var(--space-4);
+}
+
+.masthead__nav a {
+  color: var(--ink-muted);
+  text-decoration: none;
+}
+
+.masthead__nav a:hover,
+.masthead__nav a[aria-current="page"] {
+  color: var(--ink);
+  text-decoration: underline;
+  text-decoration-thickness: 2px;
+  text-underline-offset: 0.35em;
+}
+
+/* The theme toggle: three radios drawn as one segmented control. */
+
+.theme-toggle {
+  display: inline-flex;
+  margin: 0 0 0 auto;
+  padding: 2px;
+  border: 0;
+  border-radius: var(--radius-strip);
+  background: color-mix(in srgb, var(--ink) 8%, var(--board));
+}
+
+.theme-toggle[hidden] {
+  display: none;
+}
+
+.theme-toggle label {
+  position: relative;
+  cursor: pointer;
+}
+
+.theme-toggle input {
+  position: absolute;
+  inset: 0;
+  margin: 0;
+  opacity: 0;
+  cursor: pointer;
+}
+
+.theme-toggle span {
+  display: block;
+  padding: var(--space-1) var(--space-3);
+  border-radius: var(--radius-strip);
+  color: var(--ink-muted);
+  font-size: var(--text-sm);
+}
+
+.theme-toggle input:checked + span {
+  background: var(--strip);
+  color: var(--ink);
+  font-weight: var(--weight-semibold);
+}
+
+.theme-toggle input:focus-visible + span {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+.page-title {
+  margin-top: var(--space-3);
+}
+
+.page-lede {
+  color: var(--ink-muted);
+}
+
+/* The board: bays of strips, by state. */
+
+.bay {
+  margin-top: var(--space-6);
+}
+
+.bay:first-child {
+  margin-top: var(--space-3);
+}
+
+.bay__title {
+  margin-bottom: var(--space-3);
+  font-size: var(--text-lg);
+  font-weight: var(--weight-semibold);
+}
+
+.bay__count {
+  margin-left: var(--space-1);
+  color: var(--ink-muted);
+  font-weight: var(--weight-regular);
+  font-variant-numeric: tabular-nums;
+}
+
+.bay__summary {
+  display: block;
+  cursor: pointer;
+  list-style: none;
+}
+
+.bay__summary::-webkit-details-marker {
+  display: none;
+}
+
+.bay__summary .bay__title {
+  display: inline-flex;
+  align-items: baseline;
+  gap: var(--space-2);
+}
+
+/* A disclosure triangle drawn with borders, turned when the bay is open. */
+.bay__summary .bay__title::before {
+  content: "";
+  align-self: center;
+  width: 0;
+  height: 0;
+  border-block: 0.35em solid transparent;
+  border-left: 0.5em solid var(--ink-muted);
+  transition: transform 120ms ease-out;
+}
+
+details[open] > .bay__summary .bay__title::before {
+  transform: rotate(90deg);
+}
+
+.bay__empty,
+.board__quiet,
+.bay__more {
+  color: var(--ink-muted);
+}
+
+.bay__more {
+  margin-top: var(--space-2);
+}
+
+.board__quiet {
+  margin-top: var(--space-5);
+}
+
+/* A strip: a flat row with the state's holder band on its left edge. */
+
+.strips {
+  display: grid;
+  gap: var(--space-1);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.strip {
+  position: relative;
+  display: grid;
+  grid-template-columns: minmax(10rem, 18rem) minmax(0, 1fr) auto;
+  grid-template-areas: "head body elapsed";
+  align-items: center;
+  gap: var(--space-1) var(--space-5);
+  min-height: 3.25rem;
+  padding: var(--space-2) var(--space-4) var(--space-2) var(--space-3);
+  border-left: var(--band-width) solid var(--idle);
+  border-radius: var(--radius-strip);
+  background: var(--strip);
+}
+
+.strip:hover {
+  background: color-mix(in srgb, var(--ink) 4%, var(--strip));
+}
+
+.strip:focus-within {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+.strip--waiting_user {
+  border-left-color: var(--waiting);
+  background: color-mix(in srgb, var(--waiting) 9%, var(--strip));
+}
+
+.strip--waiting_user:hover {
+  background: color-mix(in srgb, var(--waiting) 15%, var(--strip));
+}
+
+.strip--working {
+  border-left-color: var(--working);
+}
+
+.strip--idle {
+  border-left-color: var(--idle);
+}
+
+.strip--ended {
+  border-left-color: var(--ended);
+}
+
+/* Stale: a dashed outline and no band fill. */
+.strip--stale {
+  border-left-color: transparent;
+  background: transparent;
+  outline: 1px dashed var(--ink-muted);
+  outline-offset: -1px;
+}
+
+/* After .strip:hover, which would fill it: a stale strip keeps only a faint tint. */
+.strip--stale:hover {
+  background: color-mix(in srgb, var(--ink) 3%, transparent);
+}
+
+.strip--stale:focus-within {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+.strip__head {
+  grid-area: head;
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.strip__project {
+  overflow: hidden;
+  color: var(--ink);
+  font-weight: var(--weight-semibold);
+  text-decoration: none;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* The whole strip is the link's target; the strip draws the focus ring. */
+.strip__project::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+}
+
+.strip__project:hover {
+  text-decoration: underline;
+}
+
+.strip__project:focus-visible {
+  outline: none;
+}
+
+.strip__unknown {
+  color: var(--ink-muted);
+  font-style: italic;
+  font-weight: var(--weight-regular);
+}
+
+.strip__id {
+  flex: none;
+  color: var(--ink-muted);
+  font-size: var(--text-sm);
+}
+
+.strip__body {
+  grid-area: body;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-1) var(--space-4);
+  min-width: 0;
+}
+
+.strip__state {
+  color: var(--ink-muted);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-semibold);
+}
+
+.strip--waiting_user .strip__state {
+  color: var(--waiting-text);
+}
+
+.strip__agents {
+  color: var(--ink-muted);
+}
+
+.strip__error {
+  color: var(--error);
+  font-size: var(--text-sm);
+}
+
+.strip__elapsed {
+  grid-area: elapsed;
+  color: var(--ink-muted);
+  font-size: var(--text-sm);
+  text-align: right;
+  white-space: nowrap;
+}
+
+/* The one bold element: how long a session has waited on you. */
+.strip__wait {
+  color: var(--waiting-text);
+  font-size: var(--text-xl);
+  font-weight: var(--weight-bold);
+  line-height: 1;
+}
+
+/* Empty and error states. */
+
+.empty-state,
+.error-state {
+  max-width: 52rem;
+  margin-top: var(--space-4);
+  padding: var(--space-4) var(--space-5);
+  border-left: var(--band-width) solid var(--idle);
+  border-radius: var(--radius-strip);
+  background: var(--strip);
+}
+
+.error-state {
+  border-left-color: var(--error);
+}
+
+.error-state h2 {
+  color: var(--error);
+}
+
+/* Live updates paused (live.js): a quiet line above the content, empty and hidden while
+   the stream is up. The text says what happened; the band is not the only signal. */
+.live-status {
+  margin-bottom: var(--space-4);
+  padding: var(--space-2) var(--space-4);
+  border-left: var(--band-width) solid var(--ink-muted);
+  border-radius: var(--radius-strip);
+  background: var(--strip);
+  color: var(--ink);
+  font-size: var(--text-sm);
+}
+
+.live-status:empty {
+  display: none;
+}
+
+.hook-settings-box {
+  position: relative;
+}
+
+.hook-settings {
+  max-height: 24rem;
+  margin: 0;
+  padding: var(--space-3) var(--space-4);
+  overflow: auto;
+  border-radius: var(--radius-strip);
+  background: var(--board);
+  font-size: var(--text-sm);
+  line-height: var(--leading-tight);
+}
+
+.copy-button {
+  position: absolute;
+  top: var(--space-2);
+  right: var(--space-4);
+  padding: var(--space-1) var(--space-3);
+  border: 1px solid var(--ink-muted);
+  border-radius: var(--radius-strip);
+  background: var(--strip);
+  font-size: var(--text-sm);
+  cursor: pointer;
+}
+
+.copy-button[hidden] {
+  display: none;
+}
+
+/* Paging. */
+
+.pager {
+  display: flex;
+  gap: var(--space-5);
+  margin-top: var(--space-5);
+}
+
+/* The session page: the header is a strip, enlarged; the lists below are plain
+   sections separated by space and a heading, not boxed cards. Phone: stacked; desktop:
+   blocks and agents in one column, the hook timeline in the other. */
+
+.back-link {
+  margin: var(--space-2) 0 0;
+  font-size: var(--text-sm);
+}
+
+/* The band's colour and the waiting tint come from the strip--<status> classes, so this
+   rule sets neither: declared later with the same specificity, it would win over them. */
+.session-head {
+  display: grid;
+  gap: var(--space-2);
+  margin-top: var(--space-3);
+  padding: var(--space-4) var(--space-5);
+  border-left-width: var(--band-width);
+  border-left-style: solid;
+  border-radius: var(--radius-strip);
+}
+
+/* The surface: :where() has no specificity, so any strip--<status> background wins. */
+:where(.session-head) {
+  background: var(--strip);
+}
+
+/* The header is not a link: it keeps its colours under the pointer. */
+.session-head.strip--waiting_user:hover {
+  background: color-mix(in srgb, var(--waiting) 9%, var(--strip));
+}
+
+.session-head.strip--stale:hover {
+  background: transparent;
+}
+
+.session-head__title {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-1) var(--space-3);
+}
+
+.session-head__project {
+  margin: 0;
+  font-size: var(--text-2xl);
+  overflow-wrap: anywhere;
+}
+
+.session-head__short {
+  color: var(--ink-muted);
+  font-size: var(--text-sm);
+}
+
+.session-head__path {
+  margin: 0;
+  color: var(--ink-muted);
+  overflow-wrap: anywhere;
+}
+
+.session-head__status {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-1) var(--space-4);
+}
+
+.session-head__state {
+  font-weight: var(--weight-semibold);
+}
+
+.strip--waiting_user .session-head__state {
+  color: var(--waiting-text);
+}
+
+/* The one bold element of the page: how long the session has waited on you. */
+.session-head__wait {
+  color: var(--waiting-text);
+  font-size: var(--text-2xl);
+  font-weight: var(--weight-bold);
+  line-height: 1;
+}
+
+.session-head__error {
+  color: var(--error);
+  font-size: var(--text-sm);
+}
+
+.session-head__facts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1) var(--space-5);
+  margin: var(--space-1) 0 0;
+  font-size: var(--text-sm);
+}
+
+.session-head__facts div,
+.event__details div {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.session-head__facts dt,
+.event__details dt {
+  color: var(--ink-muted);
+}
+
+.session-head__facts dd,
+.event__details dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+/* The full ID: one click selects all of it. */
+.session-head__id {
+  user-select: all;
+}
+
+/* The links to Grafana: one quiet line under the header, a label and three links. */
+.grafana-links {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-1) var(--space-4);
+  margin-top: var(--space-3);
+  font-size: var(--text-sm);
+}
+
+.grafana-links__label {
+  color: var(--ink-muted);
+}
+
+.session-columns {
+  display: grid;
+  gap: var(--space-6) var(--space-7);
+  margin-top: var(--space-6);
+}
+
+.session-columns__side {
+  display: grid;
+  gap: var(--space-6);
+  align-content: start;
+  min-width: 0;
+}
+
+.session-section {
+  min-width: 0;
+}
+
+.session-section__title {
+  margin-bottom: var(--space-3);
+  font-size: var(--text-lg);
+}
+
+.session-section__subtitle {
+  margin: var(--space-4) 0 var(--space-2);
+  color: var(--ink-muted);
+  font-size: var(--text-base);
+}
+
+.session-section__title + .session-section__subtitle {
+  margin-top: 0;
+}
+
+.session-section__lede,
+.session-section__empty {
+  color: var(--ink-muted);
+}
+
+.session-section__lede {
+  font-size: var(--text-sm);
+}
+
+/* Tokens and cost: the two totals large, then plain tables with hairline rules and
+   right-aligned tabular figures. No boxes. */
+.usage {
+  margin-bottom: var(--space-2);
+}
+
+.usage__totals {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2) var(--space-6);
+  margin: 0 0 var(--space-3);
+}
+
+.usage__totals dt {
+  color: var(--ink-muted);
+  font-size: var(--text-sm);
+}
+
+.usage__totals dd {
+  margin: 0;
+  font-size: var(--text-lg);
+  font-weight: var(--weight-semibold);
+  font-variant-numeric: tabular-nums;
+}
+
+.usage__table {
+  width: 100%;
+  margin-bottom: var(--space-3);
+  border-collapse: collapse;
+  font-size: var(--text-sm);
+}
+
+.usage__table caption {
+  text-align: left;
+}
+
+.usage__table th,
+.usage__table td {
+  padding: var(--space-1) var(--space-3) var(--space-1) 0;
+  border-top: 1px solid color-mix(in srgb, var(--ink-muted) 25%, transparent);
+  text-align: left;
+  vertical-align: baseline;
+}
+
+.usage__table thead th {
+  border-top: 0;
+  color: var(--ink-muted);
+  font-weight: var(--weight-regular);
+}
+
+.usage__table tbody th {
+  font-weight: var(--weight-regular);
+  overflow-wrap: anywhere;
+}
+
+.usage__table .usage__number {
+  padding-right: 0;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.usage__error {
+  color: var(--error);
+}
+
+.blocks,
+.agents,
+.timeline {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+/* Rows: separated by a hairline rule, no boxes. */
+.block,
+.agent,
+.event {
+  border-top: 1px solid color-mix(in srgb, var(--ink-muted) 25%, transparent);
+}
+
+.block {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-1) var(--space-4);
+  padding: var(--space-2) 0;
+}
+
+/* An open block is a small waiting strip: the amber band and its timer. */
+.block--open {
+  margin-bottom: var(--space-1);
+  padding: var(--space-2) var(--space-3);
+  border-top: 0;
+  border-left: var(--band-width) solid var(--waiting);
+  border-radius: var(--radius-strip);
+  background: color-mix(in srgb, var(--waiting) 9%, var(--strip));
+}
+
+.block__what {
+  font-weight: var(--weight-semibold);
+}
+
+.block__elapsed {
+  margin-left: auto;
+}
+
+.block__wait {
+  color: var(--waiting-text);
+  font-size: var(--text-lg);
+  font-weight: var(--weight-bold);
+}
+
+.block__scope,
+.block__waited,
+.block__when {
+  color: var(--ink-muted);
+  font-size: var(--text-sm);
+}
+
+/* The older pages of a list sit right under the rows the live refresh replaces. An
+   empty one takes no room and is not announced as an empty list. */
+.blocks--older:empty,
+.agents--older:empty {
+  display: none;
+}
+
+.agents__root {
+  margin: 0 0 var(--space-1);
+  color: var(--ink-muted);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-semibold);
+}
+
+/* The tree: each level indented, with a rule on the left; running agents in blue. */
+.agent {
+  padding: var(--space-2) 0 var(--space-2) var(--space-3);
+  border-left: 2px solid color-mix(in srgb, var(--ink-muted) 35%, transparent);
+}
+
+.agent--running {
+  border-left-color: var(--working);
+}
+
+.agent--depth-2 {
+  margin-left: var(--space-5);
+}
+
+.agent--depth-3 {
+  margin-left: calc(2 * var(--space-5));
+}
+
+.agent--depth-4 {
+  margin-left: calc(3 * var(--space-5));
+}
+
+.agent--depth-5 {
+  margin-left: calc(4 * var(--space-5));
+}
+
+.agent--depth-6 {
+  margin-left: calc(5 * var(--space-5));
+}
+
+.agent__head,
+.agent__body {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-1) var(--space-3);
+}
+
+.agent__type {
+  font-weight: var(--weight-semibold);
+  overflow-wrap: anywhere;
+}
+
+.agent__unknown {
+  color: var(--ink-muted);
+  font-style: italic;
+  font-weight: var(--weight-regular);
+}
+
+.agent__head code,
+.agent__body code,
+.block__scope code {
+  color: var(--ink-muted);
+  font-size: var(--text-sm);
+}
+
+.agent__flag {
+  padding: 0 var(--space-1);
+  border: 1px solid color-mix(in srgb, var(--ink-muted) 50%, transparent);
+  border-radius: var(--radius-strip);
+  color: var(--ink-muted);
+  font-size: var(--text-sm);
+}
+
+.agent__body {
+  color: var(--ink-muted);
+  font-size: var(--text-sm);
+}
+
+.agent__status {
+  color: var(--ink);
+  font-weight: var(--weight-semibold);
+}
+
+.event {
+  display: grid;
+  grid-template-columns: 3.5rem minmax(0, 1fr) auto;
+  grid-template-areas:
+    "seq name when"
+    ". details details";
+  align-items: baseline;
+  gap: 0 var(--space-3);
+  padding: var(--space-2) 0;
+}
+
+.event__seq {
+  grid-area: seq;
+  color: var(--ink-muted);
+  font-size: var(--text-sm);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+.event__name {
+  grid-area: name;
+  font-weight: var(--weight-semibold);
+  overflow-wrap: anywhere;
+}
+
+.event__when {
+  grid-area: when;
+  color: var(--ink-muted);
+  font-size: var(--text-sm);
+  white-space: nowrap;
+}
+
+.event__details {
+  grid-area: details;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0 var(--space-4);
+  margin: var(--space-1) 0 0;
+  font-size: var(--text-sm);
+}
+
+/* The control's box stays empty at the end of a list: the margin is on the button. */
+.more__button {
+  margin-top: var(--space-3);
+  padding: var(--space-1) var(--space-4);
+  border: 1px solid var(--ink-muted);
+  border-radius: var(--radius-strip);
+  background: var(--strip);
+  cursor: pointer;
+}
+
+.more__button:hover {
+  background: color-mix(in srgb, var(--ink) 6%, var(--strip));
+}
+
+.more__button:disabled {
+  cursor: progress;
+  opacity: 0.6;
+}
+
+.not-found h1 {
+  color: var(--error);
+}
+
+.not-found__links {
+  display: flex;
+  gap: var(--space-5);
+  margin-bottom: 0;
+}
+
+/* Desktop: blocks and agents beside the timeline. */
+
+@media (min-width: 64rem) {
+  .session-columns {
+    grid-template-columns: minmax(0, 5fr) minmax(0, 7fr);
+    align-items: start;
+  }
+}
+
+/* Tablet. */
+
+@media (max-width: 48rem) {
+  .strip {
+    grid-template-columns: minmax(8rem, 12rem) minmax(0, 1fr) auto;
+    gap: var(--space-1) var(--space-4);
+  }
+}
+
+/* Phone: the fields wrap into two lines; the band stays, the time stays right. */
+
+@media (max-width: 30rem) {
+  .masthead__inner,
+  .page {
+    padding-inline: var(--space-3);
+  }
+
+  .theme-toggle {
+    margin-left: 0;
+  }
+
+  .strip {
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-areas:
+      "head elapsed"
+      "body body";
+    padding-right: var(--space-3);
+  }
+
+  .session-head {
+    padding: var(--space-3) var(--space-3) var(--space-3) var(--space-4);
+  }
+
+  .session-head__project,
+  .session-head__wait {
+    font-size: var(--text-xl);
+  }
+
+  .agent--depth-2 {
+    margin-left: var(--space-3);
+  }
+
+  .agent--depth-3 {
+    margin-left: calc(2 * var(--space-3));
+  }
+
+  .agent--depth-4 {
+    margin-left: calc(3 * var(--space-3));
+  }
+
+  .agent--depth-5 {
+    margin-left: calc(4 * var(--space-3));
+  }
+
+  .agent--depth-6 {
+    margin-left: calc(5 * var(--space-3));
+  }
+
+  .event {
+    grid-template-columns: 2.5rem minmax(0, 1fr);
+    grid-template-areas:
+      "seq name"
+      ". when"
+      ". details";
+  }
+}

@@ -17,6 +17,7 @@ import http.client
 import json
 import math
 import time
+import uuid
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from typing import Final
@@ -47,6 +48,16 @@ POLL_INTERVAL: Final = 0.2
 PAGE: Final = 500
 # Statuses the session gauge counts: every one but ended (ADR 0028).
 CLOSED_STATUSES: Final = frozenset({"ended", "stale"})
+# The start of the session IDs a test queries Loki with on purpose, as a user does when
+# they follow a session page's Logs link (test_app_ui.py): test_app_privacy.py, which
+# checks that the app itself never puts a session ID in a Loki query, requires every
+# Loki log line that names one to be that link's query.
+LINKED_SESSION_PREFIX: Final = "0000ccb5-"
+
+
+def linked_session_id() -> str:
+    """A fresh UUID4 session ID that starts with ``LINKED_SESSION_PREFIX``."""
+    return LINKED_SESSION_PREFIX + str(uuid.uuid4())[len(LINKED_SESSION_PREFIX) :]
 
 
 @dataclass(frozen=True)

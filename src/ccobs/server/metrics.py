@@ -2,10 +2,12 @@
 
 ``AppMetrics`` holds one ``CollectorRegistry`` per app, never prometheus_client's global
 one, so that several apps (in tests) never share series. Live state is read at scrape
-time, not pushed: a collector asks the writer for its counts and the queue for its depth,
-bytes and drop counters, so a gauge never goes stale. Only the block-duration histogram
-and the Loki query counter keep state of their own, fed by the writer's
-``on_block_closed`` callback and the reconciler's ``on_query`` (ADR 0029). Every label
+time, not pushed: a collector asks the writer for its counts, the queue for its depth,
+bytes and drop counters and the live updates hub (ADR 0032) for its open and refused
+streams, so a gauge never goes stale. Only the block-duration histogram
+and the Loki and Prometheus query counters keep state of their own, fed by the writer's
+``on_block_closed`` callback, the reconciler's ``on_query`` (ADR 0029) and the usage
+reader's ``on_query`` (ADR 0035). Every label
 value comes from a closed list (``ccobs.domain.app_metrics``), states, kinds, reasons and
 events are exported with zeros, and there is no ``_created`` series.
 
@@ -55,11 +57,16 @@ from ccobs.domain.app_metrics import (
     LOKI_QUERIES,
     LOKI_RESULTS,
     METRICS_PATH,
+    PROMETHEUS_QUERIES,
+    PROMETHEUS_RESULTS,
     SESSION_STATES,
     SESSIONS,
     SESSIONS_ENDED,
+    UI_STREAMS,
+    UI_STREAMS_REFUSED,
     AppMetric,
     LokiQueryResult,
+    PrometheusQueryResult,
 )
 from ccobs.domain.sessions import BlockKind
 from ccobs.server.ingest import DROP_REASONS, HookQueue
@@ -71,6 +78,7 @@ __all__ = [
     "AppMetrics",
     "CountsSource",
     "MetricsListener",
+    "StreamCounts",
     "address_family",
 ]
 
@@ -102,6 +110,16 @@ class CountsSource(Protocol):
     def counts(self) -> WriterCounts: ...
 
 
+class StreamCounts(Protocol):
+    """What the collector needs of the live updates hub: ``ChangeHub``, or a test double."""
+
+    @property
+    def open_streams(self) -> int: ...
+
+    @property
+    def refused_streams(self) -> int: ...
+
+
 def _gauge(metric: AppMetric) -> GaugeMetricFamily:
     return GaugeMetricFamily(metric.name, metric.help, labels=metric.labels)
 
@@ -113,19 +131,28 @@ def _counter(metric: AppMetric) -> CounterMetricFamily:
 class _StateCollector(Collector):
     """Reads the queue, and the writer once attached, at every scrape."""
 
-    def __init__(self, host: str, queue: HookQueue, version: str) -> None:
+    def __init__(
+        self, host: str, queue: HookQueue, version: str, streams: StreamCounts | None
+    ) -> None:
         self._host = host
         self._queue = queue
         self._version = version
+        self._streams = streams
         self.writer: CountsSource | None = None
         self.wal = False
-        # Fed from the reconciler's thread, read at scrape time.
-        self._loki_lock = threading.Lock()
+        # The query counters: fed from the reconciler's thread and the event loop, read at
+        # scrape time on the listener's thread.
+        self._queries_lock = threading.Lock()
         self._loki_queries: Counter[str] = Counter()
+        self._prometheus_queries: Counter[str] = Counter()
 
     def count_loki_query(self, result: LokiQueryResult) -> None:
-        with self._loki_lock:
+        with self._queries_lock:
             self._loki_queries[result] += 1
+
+    def count_prometheus_query(self, result: PrometheusQueryResult) -> None:
+        with self._queries_lock:
+            self._prometheus_queries[result] += 1
 
     def collect(self) -> Iterator[Metric]:
         host = self._host
@@ -133,12 +160,18 @@ class _StateCollector(Collector):
         build = _gauge(BUILD_INFO)
         build.add_metric([host, self._version], 1)
         yield build
-        with self._loki_lock:
+        with self._queries_lock:
             queries = dict(self._loki_queries)
+            prometheus_queries = dict(self._prometheus_queries)
         loki = _counter(LOKI_QUERIES)
         for result in LOKI_RESULTS:
             loki.add_metric([host, result], queries.get(result, 0))
         yield loki
+        prometheus = _counter(PROMETHEUS_QUERIES)
+        for outcome in PROMETHEUS_RESULTS:
+            prometheus.add_metric([host, outcome], prometheus_queries.get(outcome, 0))
+        yield prometheus
+        yield from self._from_streams()
         writer = self.writer
         if writer is None:
             return
@@ -160,6 +193,15 @@ class _StateCollector(Collector):
         size = _gauge(HOOK_QUEUE_BYTES)
         size.add_metric([host], self._queue.bytes)
         yield size
+
+    def _from_streams(self) -> Iterator[Metric]:
+        streams = self._streams
+        opened = _gauge(UI_STREAMS)
+        opened.add_metric([self._host], 0 if streams is None else streams.open_streams)
+        yield opened
+        refused = _counter(UI_STREAMS_REFUSED)
+        refused.add_metric([self._host], 0 if streams is None else streams.refused_streams)
+        yield refused
 
     def _from_writer(self, counts: WriterCounts) -> Iterator[Metric]:
         host = self._host
@@ -190,16 +232,24 @@ class AppMetrics:
     """The registry of one app: the state collector and the block-duration histogram.
 
     The writer's series (and the WAL flag) appear once ``attach`` is called, after the
-    writer exists; the queue's series and build info from the start.
+    writer exists; the queue's series, the live stream series (zeros without
+    ``streams``) and build info from the start.
     """
 
-    def __init__(self, host: str, queue: HookQueue, *, version: str = ccobs.__version__) -> None:
+    def __init__(
+        self,
+        host: str,
+        queue: HookQueue,
+        *,
+        streams: StreamCounts | None = None,
+        version: str = ccobs.__version__,
+    ) -> None:
         # The flag is process-wide: no _created series on any registry (ADR 0013's note
         # on created-timestamp-zero-ingestion, ADR 0028). Set on every construction, in
         # case something turned it back on.
         _disable_created_metrics()
         self.registry: Final = CollectorRegistry(auto_describe=False)
-        self._state = _StateCollector(host, queue, version)
+        self._state = _StateCollector(host, queue, version, streams)
         self.registry.register(self._state)
         durations = Histogram(
             BLOCK_DURATION.name,
@@ -219,6 +269,11 @@ class AppMetrics:
     def count_loki_query(self, result: LokiQueryResult) -> None:
         """The reconciler's ``on_query``: one query sent to Loki, with its ``result``."""
         self._state.count_loki_query(result)
+
+    def count_prometheus_query(self, result: PrometheusQueryResult) -> None:
+        """The usage reader's ``on_query``: one query sent to Prometheus, with its
+        ``result``."""
+        self._state.count_prometheus_query(result)
 
     def observe_block_closed(self, kind: BlockKind, seconds: float) -> None:
         """The writer's ``on_block_closed``: one closed block of ``kind``, open ``seconds``."""

@@ -165,6 +165,12 @@ a new ADR supersedes it, and only the old one's status line changes.
   app only accepts a `Host` header in the allowlist (`localhost`, `127.0.0.1`, `[::1]`),
   the hook endpoint ignores any request whose `Content-Type` is not `application/json`
   (still answering an empty 2xx), and there is no permissive CORS.
+- From v0.4.0 the app also enforces Fetch Metadata (a browser request whose `Sec-Fetch-Site` is
+  `cross-site` or `same-site` gets a 403 unless it is a top-level `GET` navigation), a
+  strict CSP, `Cross-Origin-Resource-Policy` and `Cross-Origin-Opener-Policy`
+  `same-origin`, `nosniff`, `no-referrer` and `Cache-Control: no-store` outside
+  `/static/` (ADR 0034). Every route but the hook route is `GET`-only. The hook route
+  is exempt and keeps its empty 2xx with no added header.
 - Keep a `host` label on stored data for a future central mode, without implementing it.
 
 ### Code
@@ -176,6 +182,13 @@ a new ADR supersedes it, and only the old one's status line changes.
   reach Prometheus. Use the names recorded in the ADRs, never guesses.
 - UI (from milestone 3): Jinja2 + HTMX + SSE with vendored JS and CSS (no CDN, works
   offline). No JavaScript dialogs (`alert`, `confirm`, `prompt`); use HTML modals.
+  No inline scripts, styles or event handlers: the CSP allows only the app's own files
+  (ADR 0034). A new vendored file goes into `static/VENDOR.json` with its SHA-256 and
+  its license under `static/licenses/` (ADR 0031). Pages never show the full `cwd`
+  (the project name, or the path with the home directory as `~`, from
+  `ccobs.domain.presentation`) and never content. Live updates are change pings plus
+  refetch, never session data over SSE (ADR 0032); UI reads go through the read gate,
+  like the API's (ADR 0033).
   Before any UI change, the main context loads the `frontend-design` skill (when
   available) and passes the visual direction to the implementer; after it, the main
   context verifies the change in a real browser (Claude in Chrome, when available)
@@ -217,6 +230,11 @@ stack/            service configs, mounted read-only into the containers; stack/
                   the app's image (built with the repository root as context)
 src/ccobs/        package (CLI entry point in cli.py; the app in server/, its pure rules
                   in domain/)
+src/ccobs/server/templates/
+                  Jinja2 pages and htmx fragments of the web UI
+src/ccobs/server/static/
+                  the UI's CSS and JS, vendored htmx and fonts (SHA-256 in VENDOR.json,
+                  licenses in licenses/), served under /static/
 tests/            unit tests; integration tests (tests/integration/) are marked
                   @pytest.mark.integration
 tests/fixtures/   sanitized real payloads (hooks and OTLP) captured from Claude Code
@@ -225,7 +243,8 @@ tools/capture/    dev-only fixture capture tooling (not packaged; tests import i
 tools/stack/      dev-only stack tools (not packaged): OTLP replay, isolated ccobs-it
                   project, memory per service, egress sink override
 docs/stack.md     operator reference for the stack (settings, memory, troubleshooting)
-docs/app.md       operator reference for the app (hook settings, API, metrics, data)
+docs/app.md       operator reference for the app (web UI, hook settings, API, metrics,
+                  data, troubleshooting)
 docs/adr/         architecture decision records (MADR)
 .claude/agents/   project subagents
 ```
@@ -243,4 +262,4 @@ docs/adr/         architecture decision records (MADR)
 | 6         | v0.7.0  | Grafana dashboards and polish                                                          |
 | 7         | v1.0.0  | Distribution: GHCR multi-arch images, release hardening, contributor docs              |
 
-Current: milestone 3 (milestone 2 released as v0.3.0).
+Current: milestone 4 (milestone 3 released as v0.4.0).

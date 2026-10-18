@@ -1,0 +1,26 @@
+{#- One session as a strip: the holder band (CSS, by state), the project, what it is
+    doing or waiting on, and how long. The state is in words too, never colour alone. -#}
+{% macro strip(s) -%}
+<li class="strip strip--{{ s.status }}">
+  <div class="strip__head">
+    <a class="strip__project" href="{{ s.href }}">{% if s.project %}{{ s.project }}{% else %}<span class="strip__unknown">Unknown project</span>{% endif %}</a>
+    <code class="strip__id">{{ s.short_id }}</code>
+  </div>
+  <div class="strip__body">
+    <span class="strip__state">{{ s.state_label }}</span>
+    {% if s.doing %}<span class="strip__doing">{{ s.doing }}</span>{% endif %}
+    {% if s.agents %}<span class="strip__agents">{{ s.agents }}</span>{% endif %}
+    {% if s.error_code %}<span class="strip__error">Last error <code>{{ s.error_code }}</code></span>{% endif %}
+  </div>
+  <div class="strip__elapsed">
+    {% if s.elapsed_kind == "wait" %}
+    <span class="visually-hidden">Waiting for</span>
+    <time class="strip__wait" datetime="{{ s.elapsed.iso }}" data-since-ms="{{ s.elapsed.since_ms }}">{{ s.elapsed.text }}</time>
+    {% elif s.elapsed_kind == "ended" %}
+    <span class="strip__since">Ended <time datetime="{{ s.elapsed.iso }}" data-since-ms="{{ s.elapsed.since_ms }}">{{ s.elapsed.text }}</time> ago</span>
+    {% else %}
+    <span class="strip__since">Last event <time datetime="{{ s.elapsed.iso }}" data-since-ms="{{ s.elapsed.since_ms }}">{{ s.elapsed.text }}</time> ago</span>
+    {% endif %}
+  </div>
+</li>
+{%- endmacro %}

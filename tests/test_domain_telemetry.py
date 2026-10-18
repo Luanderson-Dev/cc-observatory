@@ -82,12 +82,17 @@ UNIT_SUFFIXES: Final = {"": "", "s": "seconds", "tokens": "tokens", "USD": "USD"
 # json is there for json.dumps, which the hook parser uses to size tool inputs and
 # responses (ADR 0023); with open banned below, the domain has no file to dump to or load.
 # ccobs.domain.hooks is a domain module, held to these same rules: the session reducer
-# consumes its events (ADR 0024).
+# consumes its events (ADR 0024). urllib.parse is string handling only (quoting and
+# encoding query strings, for the Grafana links); it opens no connection.
 ALLOWED_IMPORTS: Final = frozenset(
-    {"__future__", "collections.abc", "dataclasses", "datetime", "json", "re", "typing"}
+    {"__future__", "collections.abc", "dataclasses", "datetime", "enum", "json", "re", "typing"}
+    | {"urllib.parse"}
+    # Pure arithmetic: math.isfinite and math.fsum (ccobs.domain.usage).
+    | {"math"}
     # Domain modules, each one checked by the same test.
     | {
         "ccobs.domain.durations",
+        "ccobs.domain.grafana_links",
         "ccobs.domain.hook_config",
         "ccobs.domain.hooks",
         "ccobs.domain.sessions",

@@ -1,3 +1,9 @@
+## v0.4.0 (2026-10-18)
+
+### Feat
+
+- add a live web UI for sessions, agents and blocks with per-session tokens and cost and links to Grafana (#14)
+
 ## v0.3.0 (2026-10-16)
 
 ### Feat

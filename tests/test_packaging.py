@@ -2,6 +2,8 @@
 
 import importlib
 import importlib.metadata
+import subprocess
+import sys
 
 import pytest
 
@@ -30,3 +32,19 @@ def test_version_falls_back_when_package_is_not_installed(
     finally:
         monkeypatch.undo()
         importlib.reload(ccobs)
+
+
+def test_testclient_imports_without_a_warning() -> None:
+    """Starlette's TestClient runs on httpx2; on plain httpx it warns at import time.
+
+    A fresh interpreter with every warning turned into an error, so the check does not
+    depend on what this process imported first or on pytest's warning filters.
+    """
+    result = subprocess.run(
+        [sys.executable, "-W", "error", "-c", "import fastapi.testclient"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr

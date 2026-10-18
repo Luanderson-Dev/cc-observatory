@@ -28,6 +28,7 @@ import pytest
 from app_support import (
     API,
     APP,
+    LINKED_SESSION_PREFIX,
     PAGE,
     detail,
     events,
@@ -41,6 +42,9 @@ from app_support import (
 )
 
 from ccobs.domain.app_metrics import HOOK_EVENTS_DROPPED
+from ccobs.domain.denials import DECISION_EVENT, REJECT
+from ccobs.domain.grafana_links import SERVICE_NAME_LABEL, SESSION_ID_KEY
+from ccobs.domain.telemetry import DEFAULT_HOST, HOST_LABEL, SERVICE_NAME, quote
 from tools.stack.replay import (
     HOOKS_PATH,
     Prepared,
@@ -225,7 +229,32 @@ def test_loki_logs_no_canary_and_no_session_id_of_the_app(
     assert replay.marker not in logs
     session_ids = [str(session["session_id"]) for session in sessions(app_url)]
     assert replay.telemetry.session_id in session_ids
-    assert not [session_id for session_id in session_ids if session_id in logs]
+    # test_app_ui.py follows the Logs link of its linked sessions, as a user would: every
+    # line that names one must be that link's query, never one of the app's.
+    linked = [
+        session_id for session_id in session_ids if session_id.startswith(LINKED_SESSION_PREFIX)
+    ]
+    for session_id in linked:
+        for line in logs.splitlines():
+            if session_id in line:
+                assert _is_logs_link_query(line, session_id), line
+    others = [session_id for session_id in session_ids if session_id not in linked]
+    assert not [session_id for session_id in others if session_id in logs]
+
+
+def _is_logs_link_query(line: str, session_id: str) -> bool:
+    """Whether a Loki log line is a query of a session page's Logs link
+    (``grafana_links.session_events_query``) and not one of the reconciler's. Loki logs
+    the LogQL in logfmt, so its quotes come escaped: backslashes and spaces are ignored."""
+    loose = re.sub(r"[\\\s]", "", line)
+    matchers = (
+        f"{SERVICE_NAME_LABEL}={quote(SERVICE_NAME)}",
+        f"{HOST_LABEL}={quote(DEFAULT_HOST)}",
+        f"{SESSION_ID_KEY}={quote(session_id)}",
+    )
+    return all(matcher in loose for matcher in matchers) and not (
+        DECISION_EVENT in line or REJECT in line
+    )
 
 
 def test_the_database_holds_no_canary(

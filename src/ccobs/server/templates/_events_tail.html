@@ -1,0 +1,15 @@
+{#- New events, prepended to the timeline out of band, and the tail that replaces the
+    one that asked, with the new cursor. -#}
+{% from "_session.html" import event_row, tail_element %}
+{% if events %}
+{% if first %}
+{#- The page had no event, so it shows the empty message: it goes with the first rows. -#}
+<p id="timeline-empty" hx-swap-oob="delete"></p>
+{% endif %}
+<ol hx-swap-oob="afterbegin:#timeline">
+{% for e in events %}
+{{ event_row(e) }}
+{% endfor %}
+</ol>
+{% endif %}
+{{ tail_element(tail) }}

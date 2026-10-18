@@ -1,0 +1,29 @@
+{% extends "base.html" %}
+{% from "_strip.html" import strip %}
+{% block title %}All sessions - cc-observatory{% endblock %}
+{% block content %}
+<h1 class="page-title">All sessions</h1>
+{% if error %}
+{% include "_error.html" %}
+<p><a href="/sessions">Newest sessions</a></p>
+{% elif not strips and not before %}
+{% include "_empty.html" %}
+{% else %}
+<p class="page-lede">Every stored session, the latest activity first.</p>
+{% if strips %}
+<ol class="strips">
+{% for s in strips %}
+{{ strip(s) }}
+{% endfor %}
+</ol>
+{% else %}
+<p class="bay__empty">No older sessions.</p>
+{% endif %}
+{% if before or next_href %}
+<nav class="pager" aria-label="More sessions">
+  {% if before %}<a class="pager__first" href="/sessions">Newest sessions</a>{% endif %}
+  {% if next_href %}<a class="pager__next" href="{{ next_href }}">Older sessions</a>{% endif %}
+</nav>
+{% endif %}
+{% endif %}
+{% endblock %}

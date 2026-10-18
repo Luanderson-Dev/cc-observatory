@@ -18,6 +18,13 @@ and when nothing can be written (a full disk, say) the thread backs off instead 
 spinning. Logs hold counts and exception type names only: never bodies, paths, session
 IDs or exception messages (SQLAlchemy's hide bound values but still quote SQL).
 
+After each commit the writer names the sessions it changed to ``on_committed`` (the live
+updates hub, ADR 0032), and ``ALL`` after retention deletes sessions: only once the
+batch is in the database, so a page that refetches on that news reads it, and never for
+a batch that failed. Like the block observer, the callback must be quick and must not
+block (the hub only schedules work on the event loop); its errors are logged and never
+reach the writer.
+
 Hooks still queued when ``stop`` runs out of time are counted ``internal``: ADR 0027
 already accepts that a stop loses what is still in memory and counts losses there, and
 ``internal`` is its reason for an app-side loss, so the drop reasons stay as recorded.
@@ -47,17 +54,20 @@ from ccobs.domain.sessions import (
     close_block_denied,
     mark_stale,
 )
+from ccobs.server.changes import ALL, Change
 from ccobs.server.db.repository import Applied, Repository, hook_event_row
 from ccobs.server.ingest import HookQueue, RawHook
 
 __all__ = [
     "BlockClosedCallback",
+    "CommittedCallback",
     "Control",
     "Retention",
     "TelemetryClose",
     "Tick",
     "Writer",
     "WriterCounts",
+    "WriterObservers",
 ]
 
 _log = logging.getLogger(__name__)
@@ -71,6 +81,17 @@ _MS_PER_S: Final = 1000
 
 # Receives each closed block's kind and how long it was open, in seconds.
 type BlockClosedCallback = Callable[[BlockKind, float], None]
+# Receives the sessions each commit changed, or ALL (ADR 0032).
+type CommittedCallback = Callable[[Change], None]
+
+
+@dataclass(frozen=True, kw_only=True)
+class WriterObservers:
+    """The callbacks the app gives the writer it builds: the block-duration histogram
+    (ADR 0028) and the live updates hub (ADR 0032)."""
+
+    on_block_closed: BlockClosedCallback
+    on_committed: CommittedCallback
 
 
 @dataclass(frozen=True, slots=True)
@@ -177,6 +198,7 @@ class Writer:
     A write that nothing in a batch survives makes the thread wait ``backoff_initial_s``,
     doubling up to ``backoff_max_s``, until a write succeeds. ``monotonic`` and ``sleep``
     are injectable for tests; the default sleep returns early when ``stop`` is called.
+    ``on_block_closed`` and ``on_committed`` are the observers (``WriterObservers``).
     """
 
     def __init__(
@@ -192,6 +214,7 @@ class Writer:
         backoff_initial_s: float = 0.1,
         backoff_max_s: float = 30.0,
         on_block_closed: BlockClosedCallback | None = None,
+        on_committed: CommittedCallback | None = None,
         monotonic: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], object] | None = None,
     ) -> None:
@@ -206,6 +229,7 @@ class Writer:
         self._backoff_max_s = backoff_max_s
         self._backoff_s = backoff_initial_s
         self._on_block_closed = on_block_closed
+        self._on_committed = on_committed
         self._monotonic = monotonic
         self._stopping = threading.Event()
         self._sleep: Callable[[float], object] = sleep or self._stopping.wait
@@ -530,12 +554,12 @@ class Writer:
         self._settled.update(item.event_row.seq for item in applied if item.event_row)
         self._backoff_s = self._backoff_initial_s
         callback = self._on_block_closed
-        if callback is None:
-            return
-        for item in applied:
-            for effect in item.effects:
-                if isinstance(effect, BlockClosed):
-                    _observe(callback, effect)
+        if callback is not None:
+            for item in applied:
+                for effect in item.effects:
+                    if isinstance(effect, BlockClosed):
+                        _observe(callback, effect)
+        self._notify(frozenset(item.state.session.session_id for item in applied))
 
     def _retain(self, cutoff_ms: int) -> None:
         try:
@@ -553,6 +577,18 @@ class Writer:
             for session_id in gone:
                 del self._states[session_id]
         _log.info("retention deleted %d sessions", deleted)
+        if deleted:
+            self._notify(ALL)
+
+    def _notify(self, change: Change) -> None:
+        """Tell ``on_committed`` what a commit changed; an error is logged, not raised."""
+        callback = self._on_committed
+        if callback is None:
+            return
+        try:
+            callback(change)
+        except Exception as error:
+            _log.error("commit observer failed (%s)", type(error).__name__)
 
 
 def _observe(callback: BlockClosedCallback, effect: BlockClosed) -> None:

@@ -6,3 +6,7 @@
 *.gif binary
 *.ico binary
 *.woff2 binary
+# Vendored third-party files and their licence texts stay byte for byte as published
+# (their checksums are in src/ccobs/server/static/VENDOR.json): no EOL normalisation.
+src/ccobs/server/static/vendor/** -text
+src/ccobs/server/static/licenses/** -text

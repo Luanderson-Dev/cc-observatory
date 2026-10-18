@@ -1,10 +1,12 @@
 [project]
 name = "cc-observatory"
-version = "0.3.0"
+version = "0.4.0"
 description = "Local observability for Claude Code: sessions, subagents, blocks, logs, tokens and cost on OpenTelemetry, Prometheus, Loki and Grafana."
 readme = "README.md"
-license = "MIT"
-license-files = ["LICENSE"]
+# The app's own code is MIT; the vendored htmx (0BSD) and fonts (OFL-1.1) ship in the
+# wheel with their licence texts (src/ccobs/server/static/VENDOR.json, ADR 0031).
+license = "MIT AND OFL-1.1 AND 0BSD"
+license-files = ["LICENSE", "src/ccobs/server/static/licenses/*"]
 authors = [{ name = "Luanderson Pimenta Mendes", email = "contato@luanderson.dev.br" }]
 requires-python = ">=3.12"
 keywords = [
@@ -44,8 +46,10 @@ cc-observatory = "ccobs.cli:main"
 [project.optional-dependencies]
 server = [
   "alembic>=1.20.0",
+  "anyio>=4.15.1",
   "fastapi>=0.143.2",
   "httpx>=0.28.1",
+  "jinja2>=3.1.6",
   "prometheus-client>=0.26.0",
   "pydantic-settings>=2.16.0",
   "sqlalchemy>=2.1.4",
@@ -95,11 +99,6 @@ markers = [
 pythonpath = ["."]
 testpaths = ["tests"]
 xfail_strict = true
-# Starlette 1.x deprecates its TestClient on httpx in favour of httpx2, warning on import
-# (a UserWarning subclass). Moving the app tests to httpx2 is a later follow-up.
-filterwarnings = [
-  "ignore:Using `httpx` with `starlette\\.testclient` is deprecated:UserWarning",
-]
 
 [tool.coverage.run]
 branch = true
@@ -125,6 +124,9 @@ dev = [
   # The app's dependencies, so that `uv sync`, mypy and pytest see them.
   "cc-observatory[server]",
   "commitizen>=4.19.2",
+  # Starlette's TestClient runs on httpx2 (on plain httpx it warns at import time). The
+  # app itself keeps httpx for its Loki client (ADR 0029).
+  "httpx2>=2.13.1",
   "mypy>=2.4.0",
   "pre-commit>=4.7.0",
   "pytest>=9.1.1",
