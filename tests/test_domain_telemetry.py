@@ -93,6 +93,7 @@ ALLOWED_IMPORTS: Final = frozenset(
     | {"copy"}
     # Domain modules, each one checked by the same test.
     | {
+        "ccobs.domain.denials",
         "ccobs.domain.durations",
         "ccobs.domain.grafana_links",
         "ccobs.domain.hook_config",
@@ -100,6 +101,7 @@ ALLOWED_IMPORTS: Final = frozenset(
         "ccobs.domain.sessions",
         "ccobs.domain.telemetry",
         "ccobs.domain.telemetry_settings",
+        "ccobs.domain.usage",
     }
 )
 # Builtins that read or write outside the process, or run code from strings.
