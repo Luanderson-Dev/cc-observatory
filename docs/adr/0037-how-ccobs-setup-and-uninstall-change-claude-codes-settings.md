@@ -102,10 +102,22 @@ without the flag.
   other `http` hooks. When an existing allowlist blocks our URL, setup only warns (the
   doctor stage).
 - **File handling** (the CLI stage):
-    - invalid JSON or an unexpected shape aborts without writing or repairing anything;
+    - an empty `--config-dir` is rejected;
+    - a file setup cannot read back exactly is refused, never repaired: invalid JSON, a
+      top level that is not an object, duplicate keys, non-finite numbers (`1e400`,
+      `NaN`), lone surrogate escapes, or nesting deeper than 100 levels (real
+      settings nest a few); setup writes nothing and exits 2, as it does for an
+      unexpected shape;
     - before every write, a backup of the current file goes to
-      `<config dir>/ccobs/backups/`, keeping the last 10; backups and the state get mode
-      `0600` where the OS supports it;
+      `<config dir>/ccobs/backups/`, keeping the last 10;
+    - the state can hold user values that `--force` replaced (an old endpoint may carry
+      credentials), so it gets the backups' protection: mode `0600` on POSIX. On
+      Windows setup does not change ACLs; the files inherit the config directory's
+      (the user profile by default, or that of a `--config-dir` elsewhere), the same
+      exposure `settings.json` itself has;
+    - setup writes the state first, then `settings.json`; if `settings.json` cannot be
+      written, the previous state is put back, so a failure never leaves the settings
+      changed without the state uninstall needs;
     - the write goes to a temporary file in the same directory, then `os.replace`, after
       checking (by hash) that the file did not change since it was read, with a short
       retry on Windows while the file is held open; a symlinked `settings.json` is
@@ -113,7 +125,10 @@ without the flag.
     - key order, indentation, a UTF-8 BOM and CRLF line endings are kept; every `env`
       value is a string.
 - **`--dry-run`** writes nothing and prints a diff of only the keys setup touches,
-  masking every value it did not write, since the user's `env` can hold API keys.
+  masking every value it did not write, since the user's `env` can hold API keys. A
+  hook group appears in full only when it is identical to one this run writes; any
+  other shows as a placeholder (`<earlier cc-observatory group>`,
+  `<your hook group>`), and an `env` value setup did not write as `<your value>`.
 - **Messages.** Hooks apply to running sessions at once, and with the stack down every
   `http` event shows a hook-error notice (ADR 0011); telemetry starts only in sessions
   started afterwards; after uninstall, running sessions keep exporting until restarted,
@@ -131,7 +146,9 @@ without the flag.
   `url` and `timeout`, or exec-form async `curl` that posts stdin (`--data-binary @-`)
   to such a URL, is taken as ours; the docs say so.
 - Bad, because whitespace details of a hand-edited file that the writer cannot
-  reproduce may change; `--dry-run` and the backups show and undo it.
+  reproduce may change, and every float is rewritten in Python's shortest form (`1e5`
+  becomes `100000.0`, `0.1000000000000000055511` becomes `0.1`);
+  `--dry-run` shows it and the backups undo it.
 - Bad, because a lost or rejected state file leaves the `env` keys for the user to
   remove; the uninstall output lists them, as it does for any unowned telemetry key.
 - Neutral, because Claude Code may rewrite the file between runs (reordering or
