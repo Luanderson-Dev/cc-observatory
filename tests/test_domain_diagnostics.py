@@ -26,8 +26,16 @@ from ccobs.domain.diagnostics import (
     HOOK_FAILURES_WINDOW_S,
     NON_BLOCKING_ERROR,
     NON_BLOCKING_ERROR_KEY,
+    UNAVAILABLE_REASONS,
+    CountedHookFailures,
+    Diagnostics,
     HookFailures,
+    ReportedHooks,
+    ReportedSessions,
+    UnavailableReason,
+    UncountedHookFailures,
     hook_failures_query,
+    parse_diagnostics,
     parse_hook_failures,
 )
 from ccobs.domain.telemetry import DEFAULT_HOST, HOST_LABEL, SERVICE_NAME
@@ -212,3 +220,154 @@ def test_an_integral_float_is_a_count() -> None:
 )
 def test_a_malformed_answer_is_rejected(document: object) -> None:
     assert parse_hook_failures(document) is None
+
+
+# The client side: the app's diagnostics document, as doctor and status read it.
+
+
+def diagnostics_document(**change: object) -> dict[str, object]:
+    document: dict[str, object] = {
+        "version": "0.5.0",
+        "host": "local",
+        "started_at_ms": 1,
+        "sessions": {
+            "by_state": {"working": 2, "waiting_user": 1, "idle": 0, "ended": 3, "stale": 0},
+            "open_blocks": 1,
+        },
+        "hooks": {"received": {"Stop": 2, "other": 0}, "dropped": {"invalid": 1, "full": 0}},
+        "hook_failures": {
+            "available": True,
+            "window_s": 3600,
+            "executions": 12,
+            "non_blocking_error": 1,
+            "cancelled": 2,
+        },
+    }
+    document.update(change)
+    return document
+
+
+def encoded(document: object) -> bytes:
+    return json.dumps(document).encode()
+
+
+def test_a_document_parses_into_its_parts() -> None:
+    parsed = parse_diagnostics(encoded(diagnostics_document()))
+
+    assert parsed == Diagnostics(
+        version="0.5.0",
+        sessions=ReportedSessions(
+            by_state={"working": 2, "waiting_user": 1, "idle": 0, "ended": 3, "stale": 0},
+            open_blocks=1,
+        ),
+        hooks=ReportedHooks(received={"Stop": 2, "other": 0}, dropped={"invalid": 1, "full": 0}),
+        hook_failures=CountedHookFailures(
+            window_s=3600, counts=HookFailures(executions=12, non_blocking_error=1, cancelled=2)
+        ),
+    )
+
+
+def test_a_missing_state_counts_0_and_an_unknown_one_is_left_out() -> None:
+    sessions = {"by_state": {"working": 1, "planted": 5}, "open_blocks": 0}
+
+    parsed = parse_diagnostics(encoded(diagnostics_document(sessions=sessions)))
+
+    assert parsed is not None
+    assert parsed.sessions.by_state == {
+        "working": 1,
+        "waiting_user": 0,
+        "idle": 0,
+        "ended": 0,
+        "stale": 0,
+    }
+
+
+@pytest.mark.parametrize("version", ["<planted>", "", "x" * 65, "0.5.0 beta"])
+def test_an_odd_version_becomes_unknown(version: str) -> None:
+    parsed = parse_diagnostics(encoded(diagnostics_document(version=version)))
+
+    assert parsed is not None
+    assert parsed.version == "unknown"
+
+
+@pytest.mark.parametrize("reason", ["unreachable", "timeout", "status", "shape"])
+def test_loki_unavailable_keeps_a_reason_of_adr_0038(reason: UnavailableReason) -> None:
+    failures = {"available": False, "reason": reason, "window_s": 600}
+
+    parsed = parse_diagnostics(encoded(diagnostics_document(hook_failures=failures)))
+
+    assert parsed is not None
+    assert parsed.hook_failures == UncountedHookFailures(window_s=600, reason=reason)
+
+
+def test_the_reasons_are_those_of_adr_0038() -> None:
+    assert frozenset(UNAVAILABLE_REASONS) == {"unreachable", "timeout", "status", "shape"}
+
+
+@pytest.mark.parametrize("reason", [None, 7, "<b>", "planted", "Timeout"])
+def test_any_other_reason_is_unknown(reason: object) -> None:
+    failures = {"available": False, "reason": reason, "window_s": 3600}
+
+    parsed = parse_diagnostics(encoded(diagnostics_document(hook_failures=failures)))
+
+    assert parsed is not None
+    assert parsed.hook_failures == UncountedHookFailures(window_s=3600, reason="unknown")
+
+
+def test_a_reason_may_be_missing() -> None:
+    failures = {"available": False, "window_s": 3600}
+
+    parsed = parse_diagnostics(encoded(diagnostics_document(hook_failures=failures)))
+
+    assert parsed is not None
+    assert parsed.hook_failures == UncountedHookFailures(window_s=3600, reason="unknown")
+
+
+_GOOD_FAILURES: Final = {
+    "available": True,
+    "window_s": 3600,
+    "executions": 1,
+    "non_blocking_error": 0,
+    "cancelled": 0,
+}
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        pytest.param(b"not json", id="not-json"),
+        pytest.param(b"[" * 100_000, id="too-deep"),
+        pytest.param(b"\xff", id="not-utf-8"),
+        encoded([]),
+        encoded(diagnostics_document(version=4)),
+        encoded({k: v for k, v in diagnostics_document().items() if k != "version"}),
+        encoded(diagnostics_document(sessions=[])),
+        encoded(diagnostics_document(sessions={"by_state": [], "open_blocks": 0})),
+        encoded(diagnostics_document(sessions={"by_state": {}, "open_blocks": -1})),
+        encoded(diagnostics_document(sessions={"by_state": {}, "open_blocks": True})),
+        encoded(diagnostics_document(sessions={"by_state": {}})),
+        encoded(diagnostics_document(sessions={"by_state": {"idle": "1"}, "open_blocks": 0})),
+        encoded(diagnostics_document(sessions={"by_state": {"idle": -1}, "open_blocks": 0})),
+        encoded(diagnostics_document(hooks=[])),
+        encoded(diagnostics_document(hooks={"received": {"Stop": "x"}, "dropped": {}})),
+        encoded(diagnostics_document(hooks={"received": {"Stop": True}, "dropped": {}})),
+        encoded(diagnostics_document(hooks={"received": {"Stop": -1}, "dropped": {}})),
+        encoded(diagnostics_document(hooks={"received": {}, "dropped": []})),
+        encoded(diagnostics_document(hooks={"received": {}})),
+        encoded(diagnostics_document(hook_failures=None)),
+        encoded(diagnostics_document(hook_failures=[])),
+        encoded(diagnostics_document(hook_failures={"available": "yes", "window_s": 3600})),
+        encoded(diagnostics_document(hook_failures={"available": True, "window_s": "1"})),
+        encoded(diagnostics_document(hook_failures={"available": False, "reason": "timeout"})),
+        encoded(diagnostics_document(hook_failures={**_GOOD_FAILURES, "window_s": 1.5})),
+        encoded(diagnostics_document(hook_failures={**_GOOD_FAILURES, "cancelled": None})),
+        encoded(diagnostics_document(hook_failures={**_GOOD_FAILURES, "executions": -1})),
+        encoded(
+            diagnostics_document(
+                hook_failures={k: v for k, v in _GOOD_FAILURES.items() if k != "executions"}
+            )
+        ),
+    ],
+)
+def test_a_malformed_document_is_rejected(body: bytes) -> None:
+    assert parse_diagnostics(body) is None

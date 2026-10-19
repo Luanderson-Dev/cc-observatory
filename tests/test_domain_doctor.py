@@ -868,7 +868,13 @@ def test_diagnostics_loki_unavailable(reason: str | None, shown: str) -> None:
 
 
 def test_diagnostics_hook_failures() -> None:
-    failures = {"available": True, "window_s": 3600, "non_blocking_error": 2, "cancelled": 1}
+    failures = {
+        "available": True,
+        "window_s": 3600,
+        "executions": 3,
+        "non_blocking_error": 2,
+        "cancelled": 1,
+    }
 
     check = doctor.check_diagnostics(
         _answer(_diagnostics(hook_failures=failures)), cli_version="0.5.0"

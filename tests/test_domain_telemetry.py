@@ -94,6 +94,7 @@ ALLOWED_IMPORTS: Final = frozenset(
     # Domain modules, each one checked by the same test.
     | {
         "ccobs.domain.denials",
+        "ccobs.domain.diagnostics",
         "ccobs.domain.durations",
         "ccobs.domain.grafana_links",
         "ccobs.domain.hook_config",

@@ -48,6 +48,7 @@ from ccobs.domain.app_metrics import EVENT_LABELS, LokiQueryResult
 from ccobs.domain.diagnostics import (
     HOOK_FAILURES_WINDOW_S,
     HookFailures,
+    UnavailableReason,
     hook_failures_query,
     parse_hook_failures,
 )
@@ -77,15 +78,14 @@ HTTP_TIMEOUT_S: Final = 2.0
 MAX_ANSWER_BYTES: Final = 64 * 1024
 QUERY_PATH: Final = "/loki/api/v1/query"
 
-# Why the counts are unavailable: no connection (or a broken exchange), no answer within
-# the timeout, a non-2xx status (a redirect included), or an answer that is too large,
-# not JSON or not the vector of counts.
-type UnavailableReason = Literal["unreachable", "timeout", "status", "shape"]
-
 
 @dataclass(frozen=True, slots=True)
 class HookFailuresUnavailable:
-    """Loki gave no usable answer, for ``reason``."""
+    """Loki gave no usable answer, for ``reason`` (the set of
+    ``ccobs.domain.diagnostics.UnavailableReason``, which the CLI reads back): no
+    connection (or a broken exchange), no answer within the timeout, a non-2xx status (a
+    redirect included), or an answer that is too large, not JSON or not the vector of
+    counts."""
 
     reason: UnavailableReason
 

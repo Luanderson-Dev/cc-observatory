@@ -52,7 +52,10 @@ __all__ = [
     "CONNECT_TIMEOUT_S",
     "HTTP_TIMEOUT_S",
     "PLIST_PATH",
+    "Connect",
     "Environment",
+    "Http",
+    "add_target_options",
     "configure_parser",
     "default_environment",
     "http_request",
@@ -222,8 +225,8 @@ def default_environment() -> Environment:
 # The parser.
 
 
-def configure_parser(parser: argparse.ArgumentParser) -> None:
-    """Add the options of ``ccobs doctor`` to its subparser."""
+def add_target_options(parser: argparse.ArgumentParser) -> None:
+    """Add ``--config-dir`` and the stack's port options, shared with ``ccobs status``."""
     parser.add_argument(
         "--config-dir",
         metavar="PATH",
@@ -241,6 +244,11 @@ def configure_parser(parser: argparse.ArgumentParser) -> None:
             metavar="N",
             help=f"{what} on 127.0.0.1 (default {default})",
         )
+
+
+def configure_parser(parser: argparse.ArgumentParser) -> None:
+    """Add the options of ``ccobs doctor`` to its subparser."""
+    add_target_options(parser)
     parser.add_argument(
         "--stack-dir",
         metavar="PATH",

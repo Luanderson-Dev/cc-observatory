@@ -7,7 +7,7 @@ from collections.abc import Sequence
 from datetime import UTC, datetime
 
 from ccobs import __version__
-from ccobs.cli import doctor, install, uninstall
+from ccobs.cli import doctor, install, status, uninstall
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -51,6 +51,17 @@ def build_parser() -> argparse.ArgumentParser:
             ),
         )
     )
+    status.configure_parser(
+        commands.add_parser(
+            "status",
+            help="show whether the stack is up, the settings are in place, and the sessions",
+            description=(
+                "A short summary: whether the app, the collector and Grafana answer, whether "
+                "ccobs setup's hooks and telemetry variables are in your user settings, and "
+                "the sessions by state. Changes nothing. Exits 1 when the app does not answer."
+            ),
+        )
+    )
     return parser
 
 
@@ -81,6 +92,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "doctor":
         return doctor.run_doctor(
             args, env=doctor.default_environment(), out=sys.stdout, err=sys.stderr
+        )
+
+    if args.command == "status":
+        return status.run_status(
+            args, env=status.default_environment(), out=sys.stdout, err=sys.stderr
         )
 
     parser.print_help()

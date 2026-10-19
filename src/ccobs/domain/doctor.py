@@ -38,6 +38,7 @@ from dataclasses import dataclass
 from datetime import timedelta
 from typing import Final, Literal, cast
 
+from ccobs.domain.diagnostics import UncountedHookFailures, parse_diagnostics
 from ccobs.domain.durations import parse_duration
 from ccobs.domain.hook_config import HOOK_PATH, hook_settings
 from ccobs.domain.settings_merge import is_ccobs_handler
@@ -134,7 +135,6 @@ _ALLOWLIST: Final = "allowedHttpHookUrls"
 
 _VERSION: Final = re.compile(r"(?<![0-9.])v?([0-9]+)\.([0-9]+)(?:\.([0-9]+))?")
 _HANDLER_PORT: Final = re.compile(r"http://127\.0\.0\.1(?::([0-9]+))?/")
-_APP_VERSION: Final = re.compile(r"[0-9A-Za-z.+-]{1,64}")
 _COMPOSE_NAME: Final = re.compile(r"""name:[ \t]*(["']?)cc-observatory\1[ \t]*(?:#.*)?""")
 # An allowlist pattern's scheme and host, which match case-insensitively.
 _PATTERN_HOST: Final = re.compile(r"(?P<scheme>[A-Za-z][A-Za-z0-9+.-]*://)(?P<host>[^/:?#]*)")
@@ -1002,56 +1002,12 @@ def check_hook_endpoint(answer: HttpAnswer, *, app_port: int) -> Check:
     )
 
 
-def _int(value: object) -> int | None:
-    return value if isinstance(value, int) and not isinstance(value, bool) else None
-
-
-def _counts(value: object) -> dict[str, int] | None:
-    if not isinstance(value, dict):
-        return None
-    counts = {key: _int(item) for key, item in value.items()}
-    return None if any(item is None for item in counts.values()) else cast(dict[str, int], counts)
-
-
-@dataclass(frozen=True)
-class _Diagnostics:
-    version: str
-    received: dict[str, int]
-    dropped: dict[str, int]
-    failures: Mapping[str, object]
-
-
-def _parse_diagnostics(body: bytes) -> _Diagnostics | None:
-    try:
-        document: object = json.loads(body)
-    except (ValueError, RecursionError):
-        return None
-    if not isinstance(document, dict):
-        return None
-    hooks = document.get("hooks")
-    hooks = hooks if isinstance(hooks, dict) else {}
-    received, dropped = _counts(hooks.get("received")), _counts(hooks.get("dropped"))
-    version, failures = document.get("version"), document.get("hook_failures")
-    if (
-        not isinstance(version, str)
-        or received is None
-        or dropped is None
-        or not isinstance(failures, dict)
-        or not isinstance(failures.get("available"), bool)
-    ):
-        return None
-    return _Diagnostics(version, received, dropped, failures)
-
-
-_UNDERSTOOD_REASONS: Final = frozenset({"unreachable", "timeout", "status", "shape"})
-
-
 def check_diagnostics(answer: HttpAnswer | None, *, cli_version: str) -> Check:
     """The app's ``GET /api/v1/diagnostics`` (ADR 0038). ``answer`` is None when the app
     is down (the request was not sent)."""
     if answer is None:
         return Check("diagnostics", "info", "the app's diagnostics", "Skipped: the app is down.")
-    parsed = _parse_diagnostics(answer.body) if answer.ok else None
+    parsed = parse_diagnostics(answer.body) if answer.ok else None
     if parsed is None:
         return Check(
             "diagnostics",
@@ -1061,21 +1017,19 @@ def check_diagnostics(answer: HttpAnswer | None, *, cli_version: str) -> Check:
             "has no such route.",
             "rebuild the app: `docker compose build app && docker compose up -d`",
         )
-    app_version = parsed.version if _APP_VERSION.fullmatch(parsed.version) else "unknown"
     lines: list[str] = []
     statuses: list[Status] = []
     if parsed.version != cli_version:
         statuses.append("warn")
-        lines.append(f"CLI {cli_version}, app {app_version}: rebuild the app or upgrade the CLI.")
-    failures = parsed.failures
-    if failures["available"] is False:
-        reason = failures.get("reason")
-        shown = reason if isinstance(reason, str) and reason in _UNDERSTOOD_REASONS else "unknown"
+        lines.append(
+            f"CLI {cli_version}, app {parsed.version}: rebuild the app or upgrade the CLI."
+        )
+    failures = parsed.hook_failures
+    if isinstance(failures, UncountedHookFailures):
         statuses.append("warn")
-        lines.append(f"The app cannot read Loki: {shown}.")
+        lines.append(f"The app cannot read Loki: {failures.reason}.")
     else:
-        errors = _int(failures.get("non_blocking_error")) or 0
-        cancelled = _int(failures.get("cancelled")) or 0
+        errors, cancelled = failures.counts.non_blocking_error, failures.counts.cancelled
         if errors or cancelled:
             statuses.append("warn")
             lines.append(
@@ -1083,23 +1037,23 @@ def check_diagnostics(answer: HttpAnswer | None, *, cli_version: str) -> Check:
                 "cancelled. They include Claude Code's own and your other hooks."
             )
     serious = {
-        reason: parsed.dropped.get(reason, 0) for reason in ("full", "too_large", "internal")
+        reason: parsed.hooks.dropped.get(reason, 0) for reason in ("full", "too_large", "internal")
     }
     if any(serious.values()):
         statuses.append("warn")
         counts = ", ".join(f"{reason} {count}" for reason, count in serious.items())
         lines.append(f"The app dropped hook events since it started: {counts}.")
-    if not any(parsed.received.values()):
+    if not any(parsed.hooks.received.values()):
         statuses.append("info")
         lines.append("No hook event since the app started: open a Claude Code session.")
     status = _worst(statuses)
     if status == "ok":
-        received = sum(parsed.received.values())
+        received = sum(parsed.hooks.received.values())
         return Check(
             "diagnostics",
             "ok",
             "the app's diagnostics",
-            f"App {app_version}; {received} hook events received since it started.",
+            f"App {parsed.version}; {received} hook events received since it started.",
         )
     title = "the app's diagnostics need attention" if status == "warn" else "the app's diagnostics"
     return Check("diagnostics", status, title, "\n".join(lines))
