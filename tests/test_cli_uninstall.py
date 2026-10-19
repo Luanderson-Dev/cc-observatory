@@ -769,6 +769,24 @@ def test_the_report_never_shows_an_env_value(tmp_path: Path) -> None:
     assert ENDPOINT not in run.out + run.err
 
 
+# A console that cannot encode the path.
+
+
+def test_output_survives_a_console_that_cannot_encode_the_path(tmp_path: Path) -> None:
+    config_dir = tmp_path / "config-\u8a2d\u5b9a"  # not in cp1252
+    _setup(config_dir)
+    args = build_parser().parse_args(["uninstall", "--config-dir", str(config_dir)])
+    out_raw = io.BytesIO()
+    out = io.TextIOWrapper(out_raw, encoding="cp1252")
+    err = io.TextIOWrapper(io.BytesIO(), encoding="cp1252")
+
+    code = run_uninstall(args, environ={}, out=out, err=err, now=LATER)
+
+    out.flush()
+    assert code == 0
+    assert "config-\\u8a2d\\u5b9a" in out_raw.getvalue().decode("cp1252")
+
+
 # The command line.
 
 

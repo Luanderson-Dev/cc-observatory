@@ -28,6 +28,7 @@ from ccobs.cli.settings_file import (
     LoadedSettings,
     SettingsFileError,
 )
+from ccobs.cli.streams import tolerate_unencodable
 from ccobs.domain.hook_config import HOOK_PATH, hook_settings
 from ccobs.domain.settings_merge import SettingsShapeError, SetupState, merge
 from ccobs.domain.telemetry_settings import telemetry_env
@@ -39,6 +40,7 @@ __all__ = [
     "Probe",
     "configure_parser",
     "masked_diff",
+    "port_type",
     "probe_app",
     "run_setup",
 ]
@@ -56,7 +58,8 @@ type Probe = Callable[[str, float], bool]
 type _Hooks = dict[str, list[dict[str, object]]]
 
 
-def _port(value: str) -> int:
+def port_type(value: str) -> int:
+    """The argparse type of a ``--*-port`` option: an integer from 1 to 65535."""
     try:
         number = int(value)
     except ValueError:
@@ -75,14 +78,14 @@ def configure_parser(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--app-port",
-        type=_port,
+        type=port_type,
         default=DEFAULT_APP_PORT,
         metavar="N",
         help=f"the app's port on 127.0.0.1, which receives the hooks (default {DEFAULT_APP_PORT})",
     )
     parser.add_argument(
         "--otlp-port",
-        type=_port,
+        type=port_type,
         default=DEFAULT_OTLP_PORT,
         metavar="N",
         help=f"the collector's OTLP/HTTP port on 127.0.0.1 (default {DEFAULT_OTLP_PORT})",
@@ -223,6 +226,7 @@ def run_setup(
     """Run ``ccobs setup`` with the parsed ``args``. Returns the exit code: 0 done (or
     nothing to do), 1 an actionable refusal (conflicts, a concurrent change), 2 a
     usage or file error. Nothing is written unless every check passes."""
+    tolerate_unencodable(out, err)
     config_arg: str | None = args.config_dir
     app_port: int = args.app_port
     otlp_port: int = args.otlp_port

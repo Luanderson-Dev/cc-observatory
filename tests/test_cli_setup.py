@@ -825,6 +825,26 @@ def test_an_invalid_port_is_a_usage_error(
     assert "not a port" in capsys.readouterr().err
 
 
+# A console that cannot encode the path.
+
+
+def test_output_survives_a_console_that_cannot_encode_the_path(tmp_path: Path) -> None:
+    config_dir = tmp_path / "config-\u8a2d\u5b9a"  # not in cp1252
+    args = build_parser().parse_args(["setup", "--config-dir", str(config_dir)])
+    out_raw, err_raw = io.BytesIO(), io.BytesIO()
+    out = io.TextIOWrapper(out_raw, encoding="cp1252")
+    err = io.TextIOWrapper(err_raw, encoding="cp1252")
+
+    code = run_setup(args, environ={}, out=out, err=err, probe=Probe(answers=False), now=NOW)
+
+    out.flush()
+    err.flush()
+    assert code == 0
+    assert "config-\\u8a2d\\u5b9a" in out_raw.getvalue().decode("cp1252")
+    assert "127.0.0.1:4300" in err_raw.getvalue().decode("cp1252")  # the probe's notice
+    assert (config_dir / "settings.json").exists()
+
+
 # The command line.
 
 

@@ -7,7 +7,7 @@ from collections.abc import Sequence
 from datetime import UTC, datetime
 
 from ccobs import __version__
-from ccobs.cli import install, uninstall
+from ccobs.cli import doctor, install, uninstall
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -40,6 +40,17 @@ def build_parser() -> argparse.ArgumentParser:
             ),
         )
     )
+    doctor.configure_parser(
+        commands.add_parser(
+            "doctor",
+            help="check Claude Code, its settings and policies, and the stack",
+            description=(
+                "Check what cc-observatory needs: Claude Code and Docker versions, the hooks "
+                "and telemetry variables in your user settings, policies that block them, "
+                "and the stack. Changes nothing. Exits 1 when a check fails."
+            ),
+        )
+    )
     return parser
 
 
@@ -65,6 +76,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "uninstall":
         return uninstall.run_uninstall(
             args, environ=os.environ, out=sys.stdout, err=sys.stderr, now=datetime.now(UTC)
+        )
+
+    if args.command == "doctor":
+        return doctor.run_doctor(
+            args, env=doctor.default_environment(), out=sys.stdout, err=sys.stderr
         )
 
     parser.print_help()

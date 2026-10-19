@@ -26,6 +26,7 @@ from ccobs.cli.settings_file import (
     LoadedSettings,
     SettingsFileError,
 )
+from ccobs.cli.streams import tolerate_unencodable
 from ccobs.domain.settings_merge import (
     SettingsShapeError,
     SetupState,
@@ -203,6 +204,7 @@ def run_uninstall(
     """Run ``ccobs uninstall`` with the parsed ``args``. Returns the exit code: 0 done
     (or nothing to do), 1 a concurrent change, 2 a usage or file error. The state is
     deleted only once settings.json no longer holds what it records."""
+    tolerate_unencodable(out, err)
     config_arg: str | None = args.config_dir
     dry_run: bool = args.dry_run
 

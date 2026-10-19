@@ -99,6 +99,7 @@ ALLOWED_IMPORTS: Final = frozenset(
         "ccobs.domain.hook_config",
         "ccobs.domain.hooks",
         "ccobs.domain.sessions",
+        "ccobs.domain.settings_merge",
         "ccobs.domain.telemetry",
         "ccobs.domain.telemetry_settings",
         "ccobs.domain.usage",

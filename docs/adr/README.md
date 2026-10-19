@@ -67,3 +67,4 @@ the ADR wins.
 | [0036](0036-the-telemetry-env-block-that-ccobs-setup-writes.md)               | The telemetry env block that `ccobs setup` writes                                     | Accepted |
 | [0037](0037-how-ccobs-setup-and-uninstall-change-claude-codes-settings.md)    | `ccobs setup` and `uninstall` recognize their entries and keep a state file           | Accepted |
 | [0038](0038-a-diagnostics-endpoint-for-ccobs-doctor-and-status.md)            | A read-only diagnostics route in the app for `ccobs doctor` and `status`              | Accepted |
+| [0039](0039-ccobs-doctor-and-status-checks-sources-and-exit-codes.md)         | `ccobs doctor` and `status`: graded checks, read-only sources and exit codes          | Accepted |
