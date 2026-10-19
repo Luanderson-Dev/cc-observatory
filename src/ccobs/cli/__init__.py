@@ -7,7 +7,7 @@ from collections.abc import Sequence
 from datetime import UTC, datetime
 
 from ccobs import __version__
-from ccobs.cli import install
+from ccobs.cli import install, uninstall
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -26,6 +26,17 @@ def build_parser() -> argparse.ArgumentParser:
                 "Add cc-observatory's hooks and telemetry variables to Claude Code's user "
                 "settings, keeping everything else in the file. Never touches a project's "
                 ".claude/ settings."
+            ),
+        )
+    )
+    uninstall.configure_parser(
+        commands.add_parser(
+            "uninstall",
+            help="take cc-observatory's hooks and telemetry out of Claude Code's user settings",
+            description=(
+                "Remove the hooks ccobs setup recognizes as its own and the telemetry "
+                "variables it still owns from Claude Code's user settings, putting back the "
+                "values it replaced. Keeps everything else in the file."
             ),
         )
     )
@@ -49,6 +60,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             err=sys.stderr,
             probe=install.probe_app,
             now=datetime.now(UTC),
+        )
+
+    if args.command == "uninstall":
+        return uninstall.run_uninstall(
+            args, environ=os.environ, out=sys.stdout, err=sys.stderr, now=datetime.now(UTC)
         )
 
     parser.print_help()

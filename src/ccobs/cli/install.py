@@ -14,8 +14,6 @@ Not named ``setup.py`` on purpose. Standard library only: the CLI stays light
 from __future__ import annotations
 
 import argparse
-import difflib
-import json
 import sys
 from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime
@@ -23,6 +21,7 @@ from pathlib import Path
 from typing import Final, TextIO, cast
 
 from ccobs.cli import settings_file
+from ccobs.cli.masking import MANAGED_VARIABLES, masked_view_diff, reason
 from ccobs.cli.settings_file import (
     ConcurrentChangeError,
     ConfigDirError,
@@ -30,8 +29,8 @@ from ccobs.cli.settings_file import (
     SettingsFileError,
 )
 from ccobs.domain.hook_config import HOOK_PATH, hook_settings
-from ccobs.domain.settings_merge import SettingsShapeError, SetupState, is_ccobs_handler, merge
-from ccobs.domain.telemetry_settings import TELEMETRY_VARIABLES, TRACES_VARIABLES, telemetry_env
+from ccobs.domain.settings_merge import SettingsShapeError, SetupState, merge
+from ccobs.domain.telemetry_settings import telemetry_env
 
 __all__ = [
     "DEFAULT_APP_PORT",
@@ -51,10 +50,7 @@ PROBE_TIMEOUT_S: Final = 1.0
 _HOST: Final = "127.0.0.1"
 _MAX_PORT: Final = 65535
 _HEALTH_PATH: Final = "/healthz"
-_MANAGED_VARIABLES: Final = frozenset((*TELEMETRY_VARIABLES, *TRACES_VARIABLES))
-YOUR_GROUP: Final = "<your hook group>"
 EARLIER_GROUP: Final = "<earlier cc-observatory group>"
-YOUR_VALUE: Final = "<your value>"
 
 type Probe = Callable[[str, float], bool]
 type _Hooks = dict[str, list[dict[str, object]]]
@@ -126,56 +122,6 @@ def probe_app(url: str, timeout: float) -> bool:
 # --dry-run.
 
 
-def _identical(first: object, second: object) -> bool:
-    # Equal and in the same key order ({"a": 1} == {"a": True} in Python).
-    return json.dumps(first) == json.dumps(second)
-
-
-def _group_view(group: Mapping[str, object], written: Sequence[object]) -> object:
-    """``group`` itself only when it is one this run writes. Any other group is
-    masked, even one setup recognizes as its own: a recognized curl handler can carry
-    extra arguments (an Authorization header), its URL a token, and the group other
-    keys. The shape (a group is an object with a "hooks" list) was checked by merge."""
-    if any(_identical(group, ours) for ours in written):
-        return group
-    handlers = cast(list[object], group["hooks"])
-    if handlers and all(is_ccobs_handler(handler) for handler in handlers):
-        return EARLIER_GROUP
-    # Not "unchanged": the merge removes our handlers from a group that mixes them.
-    return YOUR_GROUP
-
-
-def _view(
-    settings: Mapping[str, object],
-    hooks: Mapping[str, Sequence[object]],
-    shown_values: Mapping[str, frozenset[str]],
-) -> dict[str, object]:
-    """The part of ``settings`` setup touches, with every value it did not write
-    masked: the user's file can hold API keys and credentials."""
-    view: dict[str, object] = {}
-    block = settings.get("hooks")
-    if isinstance(block, dict):
-        events = {
-            event: [_group_view(group, written) for group in block[event]]
-            for event, written in hooks.items()
-            if event in block
-        }
-        if events:
-            view["hooks"] = events
-    env = settings.get("env")
-    if isinstance(env, dict):
-        variables = {
-            key: value
-            if isinstance(value, str) and value in shown_values.get(key, frozenset())
-            else YOUR_VALUE
-            for key, value in env.items()
-            if key in _MANAGED_VARIABLES
-        }
-        if variables:
-            view["env"] = variables
-    return view
-
-
 def masked_diff(
     before: Mapping[str, object],
     after: Mapping[str, object],
@@ -186,25 +132,15 @@ def masked_diff(
 ) -> list[str]:
     """A unified diff of the keys setup touches. A hook group is shown only when it is
     one this run writes, an env value only when it is what this run writes or what the
-    previous run wrote (``state``); nothing else from the file ever appears."""
+    previous run wrote (``state``); nothing else from the file ever appears. A group of
+    handlers setup recognizes but does not write now shows as ``EARLIER_GROUP``."""
     written = state.env_written if state is not None else {}
     shown = {
         key: frozenset(value for value in (env.get(key), written.get(key)) if value is not None)
-        for key in _MANAGED_VARIABLES
+        for key in MANAGED_VARIABLES
     }
-
-    def lines(settings: Mapping[str, object]) -> list[str]:
-        view = _view(settings, hooks, shown)
-        return json.dumps(view, indent=2, ensure_ascii=False).splitlines()
-
-    return list(
-        difflib.unified_diff(
-            lines(before),
-            lines(after),
-            fromfile="settings.json (before)",
-            tofile="settings.json (after)",
-            lineterm="",
-        )
+    return masked_view_diff(
+        before, after, events=hooks, shown_values=shown, recognized=EARLIER_GROUP
     )
 
 
@@ -218,10 +154,11 @@ def _env_of(settings: Mapping[str, object]) -> Mapping[str, object]:
 
 def _env_changes(before: Mapping[str, object], after: Mapping[str, object]) -> str:
     old, new = _env_of(before), _env_of(after)
-    managed = (*TELEMETRY_VARIABLES, *TRACES_VARIABLES)
-    added = sum(1 for key in managed if key in new and key not in old)
-    updated = sum(1 for key in managed if key in new and key in old and new[key] != old[key])
-    removed = sum(1 for key in managed if key in old and key not in new)
+    added = sum(1 for key in MANAGED_VARIABLES if key in new and key not in old)
+    updated = sum(
+        1 for key in MANAGED_VARIABLES if key in new and key in old and new[key] != old[key]
+    )
+    removed = sum(1 for key in MANAGED_VARIABLES if key in old and key not in new)
     return f"{added} added, {updated} updated, {removed} removed"
 
 
@@ -246,11 +183,6 @@ def _unreachable_message(app_port: int) -> str:
     )
 
 
-def _reason(error: OSError) -> str:
-    # strerror only: str(error) and error.filename can name a temporary file.
-    return error.strerror or type(error).__name__
-
-
 def _back_up_and_write(
     path: Path,
     state_dir: Path,
@@ -266,7 +198,7 @@ def _back_up_and_write(
         try:
             backup = settings_file.backup_settings(path, state_dir, now=now)
         except OSError as error:
-            return f"cannot back up the settings file: {_reason(error)}", 2
+            return f"cannot back up the settings file: {reason(error)}", 2
         print(f"Backup: {backup}", file=out)
     try:
         settings_file.write_settings(
@@ -275,7 +207,7 @@ def _back_up_and_write(
     except ConcurrentChangeError:
         return "the file changed while setup ran; run it again", 1
     except OSError as error:
-        return f"cannot write {path}: {_reason(error)}", 2
+        return f"cannot write {path}: {reason(error)}", 2
     return None
 
 
@@ -346,7 +278,7 @@ def run_setup(
         settings_file.write_state(state_dir, result.state)
     except OSError as error:
         print(
-            f"ccobs setup: cannot write {state_file}: {_reason(error)}; "
+            f"ccobs setup: cannot write {state_file}: {reason(error)}; "
             "settings.json was not changed.",
             file=err,
         )
@@ -361,7 +293,7 @@ def run_setup(
             settings_file.restore_state(state_dir, previous_state)
         except OSError as error:
             print(
-                f"ccobs setup: could not put back {state_file} either ({_reason(error)}); "
+                f"ccobs setup: could not put back {state_file} either ({reason(error)}); "
                 "run ccobs setup again.",
                 file=err,
             )
