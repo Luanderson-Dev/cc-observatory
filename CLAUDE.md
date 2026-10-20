@@ -241,7 +241,8 @@ tests/fixtures/   sanitized real payloads (hooks and OTLP) captured from Claude 
 tools/capture/    dev-only fixture capture tooling (not packaged; tests import it
                   through `pythonpath = ["."]`); its `out/` holds raw data, never committed
 tools/stack/      dev-only stack tools (not packaged): OTLP replay, isolated ccobs-it
-                  project, memory per service, egress sink override
+                  project, memory per service, egress sink override, in-process hook
+                  replay shared by unit tests
 docs/stack.md     operator reference for the stack (settings, memory, troubleshooting)
 docs/app.md       operator reference for the app (web UI, hook settings, API, metrics,
                   data, troubleshooting)

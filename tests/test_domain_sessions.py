@@ -16,76 +16,17 @@ from typing import Any, Final
 
 import pytest
 
-from ccobs.domain.hooks import _PARSERS, HookEvent, UnknownHookEvent, parse_hook
+from ccobs.domain.hooks import _PARSERS, UnknownHookEvent, parse_hook
 from ccobs.domain.sessions import (
     HANDLED_EVENTS,
-    Agent,
     AgentChanged,
-    Block,
     BlockClosed,
-    BlockNotified,
-    BlockOpened,
-    Effect,
     SessionChanged,
-    SessionState,
     apply,
     close_block_denied,
     mark_stale,
 )
-
-HOOK_FIXTURES: Final = Path(__file__).parent / "fixtures" / "hooks"
-SESSION: Final = "00000000-0000-4000-8000-000000000000"
-BASE: Final = 1_800_000_000_000
-
-
-def event(name: str, **fields: Any) -> HookEvent:
-    return parse_hook({"session_id": SESSION, "hook_event_name": name, **fields})
-
-
-class Run:
-    """Feeds events to ``apply`` one at a time, with increasing ``seq``, and keeps every
-    effect."""
-
-    def __init__(self) -> None:
-        self.state: SessionState | None = None
-        self.effects: list[Effect] = []
-        self.last: list[Effect] = []
-        self.seq = 0
-
-    def __call__(self, name: str, at: int, **fields: Any) -> SessionState:
-        self.seq += 1
-        self.state, self.last = apply(self.state, event(name, **fields), at, self.seq)
-        self.effects.extend(self.last)
-        return self.state
-
-    @property
-    def now(self) -> SessionState:
-        assert self.state is not None
-        return self.state
-
-    def opened(self) -> list[Block]:
-        return [e.block for e in self.effects if isinstance(e, BlockOpened)]
-
-    def notified(self) -> list[Block]:
-        return [e.block for e in self.effects if isinstance(e, BlockNotified)]
-
-    def closed(self) -> list[Block]:
-        return [e.block for e in self.effects if isinstance(e, BlockClosed)]
-
-    def agents(self) -> list[Agent]:
-        """The latest record of every agent, from the effects: stopped agents leave the
-        state, as closed blocks do."""
-        latest: dict[str, Agent] = {}
-        for effect in self.effects:
-            if isinstance(effect, AgentChanged):
-                latest[effect.agent.agent_id] = effect.agent
-        return list(latest.values())
-
-    def agent(self, agent_id: str) -> Agent:
-        (found,) = [agent for agent in self.agents() if agent.agent_id == agent_id]
-        in_state = self.now.agent(agent_id)
-        assert in_state == (found if found.status == "running" else None)
-        return found
+from tools.stack.session_replay import BASE, HOOK_FIXTURES, SESSION, Run, event, replay, waited
 
 
 def bash_permission(run: Run, at: int, tool_use_id: str = "t1", **scope: Any) -> None:
@@ -1123,19 +1064,6 @@ def test_close_block_denied_without_a_match_changes_nothing() -> None:
 # Fixture replays.
 
 
-def replay(name: str) -> Run:
-    run = Run()
-    lines = (HOOK_FIXTURES / f"{name}.jsonl").read_text(encoding="utf-8").splitlines()
-    for index, line in enumerate(lines):
-        document = json.loads(line)
-        run.seq = index + 1
-        run.state, run.last = apply(
-            run.state, parse_hook(document["payload"]), BASE + document["offset_ms"], run.seq
-        )
-        run.effects.extend(run.last)
-    return run
-
-
 def statuses(run: Run) -> list[str]:
     return [e.session.status for e in run.effects if isinstance(e, SessionChanged)]
 
@@ -1148,11 +1076,6 @@ def fixture_value(name: str, event_name: str, key: str) -> str:
     value = [p[key] for p in payloads if p["hook_event_name"] == event_name][-1]
     assert isinstance(value, str)
     return value
-
-
-def waited(block: Block) -> int:
-    assert block.closed_at_ms is not None
-    return block.closed_at_ms - block.opened_at_ms
 
 
 @pytest.mark.parametrize("path", sorted(HOOK_FIXTURES.glob("*.jsonl")), ids=lambda p: p.stem)
