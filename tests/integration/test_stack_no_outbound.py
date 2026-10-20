@@ -15,13 +15,14 @@ that states the rule for every service, each read from the running service:
 - Prometheus: no remote write or read, no Alertmanager and no service discovery; it
   scrapes only itself and services of the stack.
 - The collector: its only exporters are the stack's three backends.
-- The app: it calls only Loki (ADR 0029). A snapshot of its sockets, read from
-  ``/proc/net`` inside its container (after the app tests when the whole suite runs,
-  since test_app_*.py sort first), must listen only on its two ports, and every other
-  socket must be an answer on those ports, a loopback one (the healthcheck, Docker's
-  DNS) or a connection to Loki's port on one of Loki's addresses. A snapshot only sees
-  the sockets open at that moment, and may hold no connection to Loki at all, so it
-  does not require one.
+- The app: it calls only Loki (ADR 0029) and Prometheus (ADRs 0035 and 0043). A
+  snapshot of its sockets, read from ``/proc/net`` inside its container (after the app
+  tests when the whole suite runs, since test_app_*.py sort first), must listen only on
+  its two ports, and every other socket must be an answer on those ports, a loopback
+  one (the healthcheck, Docker's DNS), or a connection to Loki's port on one of Loki's
+  addresses or to Prometheus's port on one of Prometheus's addresses. A snapshot only
+  sees the sockets open at that moment, and may hold no connection to either at all, so
+  it does not require one.
 - Networks: the backend network is internal, so Docker drops its traffic to any other
   network. That Prometheus, Loki and Tempo join only backend is checked on compose.yaml
   by tests/test_compose.py; this project also runs compose.debug.yaml, which attaches
@@ -148,13 +149,15 @@ BACKEND_EXPORTERS: Final = frozenset({"otlp_http/loki", "otlp_http/prometheus", 
 STORAGE_SERVICES: Final = frozenset({"prometheus", "loki", "tempo"})
 # A container Compose names <project>-<service>-<number>.
 CONTAINER_NAME: Final = re.compile(rf"^{re.escape(PROJECT)}-(?P<service>.+)-\d+$")
-# The app: its own ports inside the container (ADRs 0027 and 0028), Loki's, and the
-# script that prints its sockets as JSON lists of [table, local, remote, state], the
-# fields of /proc/net/{tcp,tcp6,udp,udp6}.
+# The app: its own ports inside the container (ADRs 0027 and 0028), Loki's and
+# Prometheus's, and the script that prints its sockets as JSON lists of [table, local,
+# remote, state], the fields of /proc/net/{tcp,tcp6,udp,udp6}.
 APP: Final = "app"
 APP_PORTS: Final = frozenset({4300, 9464})
 LOKI_SERVICE: Final = "loki"
 LOKI_PORT: Final = 3100
+PROMETHEUS_SERVICE: Final = "prometheus"
+PROMETHEUS_PORT: Final = 9090
 LISTEN: Final = "0A"
 SOCKETS_SCRIPT: Final = (
     "import json\n"
@@ -491,16 +494,18 @@ def _service_addresses(
     return found
 
 
-def test_the_app_connects_to_nothing_but_loki(
+def test_the_app_connects_to_nothing_but_loki_and_prometheus(
     compose: Callable[..., subprocess.CompletedProcess[str]],
     network_inspect: Callable[[str], dict[str, object]],
 ) -> None:
     loki = _service_addresses(network_inspect, LOKI_SERVICE)
     assert loki, "Loki has no address on the project's networks"
+    prometheus = _service_addresses(network_inspect, PROMETHEUS_SERVICE)
+    assert prometheus, "Prometheus has no address on the project's networks"
     rows = json.loads(compose("exec", "-T", APP, "python", "-c", SOCKETS_SCRIPT).stdout)
     listening: set[int] = set()
     unexpected: list[str] = []
-    to_loki = 0
+    to_loki = to_prometheus = 0
     for table, local_text, remote_text, state in rows:
         (local, local_port), (remote, remote_port) = _address(local_text), _address(remote_text)
         tcp = table.startswith("tcp")
@@ -515,10 +520,13 @@ def test_the_app_connects_to_nothing_but_loki(
         if tcp and remote in loki and remote_port == LOKI_PORT:
             to_loki += 1
             continue
+        if tcp and remote in prometheus and remote_port == PROMETHEUS_PORT:
+            to_prometheus += 1
+            continue
         unexpected.append(f"{table} {local}:{local_port} -> {remote}:{remote_port} ({state})")
     assert listening == APP_PORTS
     assert not unexpected, unexpected
-    print(f"app sockets: {len(rows)}, to Loki: {to_loki}")
+    print(f"app sockets: {len(rows)}, to Loki: {to_loki}, to Prometheus: {to_prometheus}")
 
 
 # Networks.

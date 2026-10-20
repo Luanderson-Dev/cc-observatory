@@ -30,6 +30,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import text
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from ccobs.domain.alerts import AlertConfig, CostSample
 from ccobs.domain.denials import OpenBlock
 from ccobs.domain.hook_config import HOOK_PATH
 from ccobs.domain.hooks import parse_hook
@@ -99,6 +100,15 @@ class IdleWriter:
 
     def open_permission_blocks(self) -> list[OpenBlock]:
         return []
+
+    def alert_config(self) -> AlertConfig:
+        return AlertConfig()
+
+    def session_cost_since(self) -> int | None:
+        return None
+
+    def submit_cost_sample(self, sample: CostSample) -> None:
+        pass
 
     def counts(self) -> WriterCounts:
         return WriterCounts(

@@ -211,7 +211,13 @@ to each part from the release that ships it.
     - Prometheus has no remote write or read and no Alertmanager, and the collector
       exports only to Prometheus, Loki and Tempo;
     - Prometheus, Loki and Tempo sit on an internal Docker network with no route out,
-      so they cannot reach the internet even with a wrong setting.
+      so they cannot reach the internet even with a wrong setting;
+    - the app connects to nothing but Loki and Prometheus, over that internal network:
+      Loki to close permission prompts denied with Esc and for the diagnostics of
+      `ccobs doctor` and `status`, and Prometheus for a session page's tokens and
+      cost and, from v0.6.0, for the cost alerts' totals, at most once a minute and
+      only while a cost alert is enabled. The optional Discord webhook above will be
+      its only connection that leaves your machine.
 
   Tests check these settings in the configs and in the running stack, and
   [docs/stack.md](docs/stack.md#checking-that-nothing-leaves-the-machine) describes a

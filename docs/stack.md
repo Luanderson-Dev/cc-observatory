@@ -679,7 +679,8 @@ checks the settings of the running stack: Loki's and Tempo's usage reports are o
 Grafana applied every outbound setting and ran none of the jobs that call grafana.com;
 Prometheus has no remote write or read, no Alertmanager and no service discovery; the
 collector exports only to the three stores; and `backend` is internal. The app calls
-nothing but Loki, over `backend`, although it is on `edge` too to publish its port.
+nothing but Loki and Prometheus, over `backend`, although it is on `edge` too to publish
+its port.
 
 That no connection leaves, whatever the settings say, is a manual check with
 [`tools/stack/compose.egress-sink.yaml`](../tools/stack/compose.egress-sink.yaml), a

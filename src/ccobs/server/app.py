@@ -9,16 +9,18 @@ metrics listener (``ccobs.server.metrics``, ADR 0028), which serves ``/metrics``
 port of its own (this app has no ``/metrics`` route), then the sweeper
 (``ccobs.server.sweeps``), which submits the stale sweep and retention to the writer,
 then the alert ticker (``ccobs.server.sweeps.AlertTicker``, ADR 0041), which submits the
-alert rules to the writer every 5 s, then the reconciler (``ccobs.server.reconcile``, ADR
-0029), which closes permission blocks denied with Esc from Loki. The usage reader
-(``ccobs.server.usage``, ADR 0035), which reads a session's tokens and cost from
-Prometheus for the session page, opens with the metrics and closes last, like the hook
-failures reader of the diagnostics route (``ccobs.server.diagnostics``, ADR 0038), which
-reads Claude Code's hook failure counts from Loki. The live updates hub
-(``ccobs.server.live``, ADR 0032) opens on the event loop before the writer starts, and
-the writer tells it what each commit changed. At shutdown it closes the hub, which ends
-the UI's streams, then stops the listener, then the reconciler, then the alert ticker,
-then the sweeper, then the writer, draining the queue, before it disposes the engines.
+alert rules to the writer every 5 s, then the cost reader (``ccobs.server.costs``, ADR
+0043), which reads the cost rules' totals from Prometheus for the writer, then the
+reconciler (``ccobs.server.reconcile``, ADR 0029), which closes permission blocks denied
+with Esc from Loki. The usage reader (``ccobs.server.usage``, ADR 0035), which reads a
+session's tokens and cost from Prometheus for the session page, opens with the metrics
+and closes last, like the hook failures reader of the diagnostics route
+(``ccobs.server.diagnostics``, ADR 0038), which reads Claude Code's hook failure counts
+from Loki. The live updates hub (``ccobs.server.live``, ADR 0032) opens on the event
+loop before the writer starts, and the writer tells it what each commit changed. At
+shutdown it closes the hub, which ends the UI's streams, then stops the listener, then
+the reconciler, then the cost reader, then the alert ticker, then the sweeper, then the
+writer, draining the queue, before it disposes the engines.
 There are two (ADR 0033): the writer's, with one connection, and the readers',
 query-only, which the API reads through its read gate (``ccobs.server.reads``).
 """
@@ -40,6 +42,7 @@ from starlette.types import Receive, Scope, Send
 
 from ccobs.server import api, diagnostics, live, ui
 from ccobs.server.config import Settings
+from ccobs.server.costs import CostReader, CostTarget
 from ccobs.server.db.engine import create_engine_for, wal_enabled
 from ccobs.server.db.repository import Repository
 from ccobs.server.diagnostics import HookFailuresReader
@@ -91,13 +94,18 @@ ALERT_TICKER_STOP_TIMEOUT_S: Final = 5.0
 # (connect, each read or write), not to the whole request, and shutdown moves on (with
 # a warning) when this runs out.
 RECONCILER_STOP_TIMEOUT_S: Final = 5.0
+# How long shutdown waits for the cost reader thread, like the reconciler's: its stop
+# interrupts its wait at once, and a query in flight is bounded by its 3 s per phase.
+COST_READER_STOP_TIMEOUT_S: Final = 5.0
 
 
-class BackgroundWriter(SweepTarget, AlertTarget, ReconcileTarget, Protocol):
+class BackgroundWriter(SweepTarget, AlertTarget, ReconcileTarget, CostTarget, Protocol):
     """What the app needs of the writer: ``Writer``, or a test double. The sweeper
     submits its ticks and retention through ``SweepTarget``'s methods, the alert ticker
-    its alert ticks through ``AlertTarget``'s, and the reconciler reads open blocks and
-    submits closes through ``ReconcileTarget``'s."""
+    its alert ticks through ``AlertTarget``'s, the reconciler reads open blocks and
+    submits closes through ``ReconcileTarget``'s, and the cost reader reads the alert
+    rules and the oldest open session and submits cost samples through
+    ``CostTarget``'s."""
 
     def start(self) -> None: ...
 
@@ -188,6 +196,7 @@ def create_app(
     reconcile_interval_s: float | None = None,
     loki_transport: httpx.BaseTransport | None = None,
     prometheus_transport: httpx.AsyncBaseTransport | None = None,
+    cost_transport: httpx.BaseTransport | None = None,
     diagnostics_transport: httpx.AsyncBaseTransport | None = None,
     read_wait_timeout_s: float = READ_WAIT_TIMEOUT_S,
     stream_timing: StreamTiming | None = None,
@@ -205,7 +214,10 @@ def create_app(
     stale sweep and retention to the writer on ``sweep_intervals``, ``(tick, retention)``
     in seconds (60 s and 1 h by default), with the same clock as the hook route, and the
     alert ticker (``AlertTicker``) submits the alert rules every ``alert_interval_s``
-    (5 s by default), with that clock too; ``sweeps=False`` leaves both off. The default
+    (5 s by default), with that clock too, and the cost reader (``ccobs.server.costs``,
+    ADR 0043) reads the cost rules' totals from ``settings.prometheus_url`` every 60 s
+    while a cost rule is enabled, with that clock, through ``cost_transport`` (httpx's
+    by default); ``sweeps=False`` leaves all three off. The default
     writer takes the alert rules of the settings (``Settings.alert_config``) and whether
     Discord is configured. The reconciler (``ccobs.server.reconcile``, ADR
     0029) polls ``settings.loki_url`` every ``reconcile_interval_s`` (2 s by default)
@@ -327,6 +339,8 @@ def create_app(
             app.state.sweeper = None
             ticker: AlertTicker | None = None
             app.state.alert_ticker = None
+            costs: CostReader | None = None
+            app.state.cost_reader = None
             reconciler: Reconciler | None = None
             app.state.reconciler = None
             try:
@@ -348,6 +362,16 @@ def create_app(
                     )
                     ticker.start()
                     app.state.alert_ticker = ticker
+                    costs = CostReader(
+                        writer,
+                        prometheus_url=settings.prometheus_url,
+                        host=settings.host_label,
+                        clock=endpoint.clock,
+                        transport=cost_transport,
+                        on_query=metrics.count_prometheus_query,
+                    )
+                    costs.start()
+                    app.state.cost_reader = costs
                 if reconcile and settings.telemetry_reconcile:
                     reconciler = Reconciler(
                         writer,
@@ -373,6 +397,10 @@ def create_app(
                 if reconciler is not None:
                     await asyncio.to_thread(reconciler.stop, RECONCILER_STOP_TIMEOUT_S)
                     app.state.reconciler = None
+                # Before the ticker and the writer, for the same reasons.
+                if costs is not None:
+                    await asyncio.to_thread(costs.stop, COST_READER_STOP_TIMEOUT_S)
+                    app.state.cost_reader = None
                 # Before the writer stops, so nothing is submitted to a stopping writer.
                 if ticker is not None:
                     await asyncio.to_thread(ticker.stop, ALERT_TICKER_STOP_TIMEOUT_S)

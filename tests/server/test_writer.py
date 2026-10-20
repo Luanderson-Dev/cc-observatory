@@ -29,6 +29,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import Engine, func, select
 from sqlalchemy.exc import OperationalError
 
+from ccobs.domain.alerts import AlertConfig, CostSample
 from ccobs.domain.app_metrics import EVENT_LABELS, event_label
 from ccobs.domain.denials import OpenBlock
 from ccobs.domain.hook_config import HOOK_PATH
@@ -405,6 +406,15 @@ def test_the_lifespan_uses_an_injected_writer_factory(settings: Settings) -> Non
 
         def open_permission_blocks(self) -> list[OpenBlock]:
             return []
+
+        def alert_config(self) -> AlertConfig:
+            return AlertConfig()
+
+        def session_cost_since(self) -> int | None:
+            return None
+
+        def submit_cost_sample(self, sample: CostSample) -> None:
+            pass
 
         def counts(self) -> WriterCounts:
             return WriterCounts(

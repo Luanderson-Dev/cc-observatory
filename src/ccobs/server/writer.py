@@ -32,7 +32,10 @@ the order it was applied. Every ``AlertTick`` (``submit_alert_tick``, every 5 s 
 ``repeated_failures``, ``session_cost`` and ``daily_cost``, the cost rules on the last
 ``CostSample`` submitted (``submit_cost_sample``), and writes their effects in one
 transaction (``Repository.apply_alert_effects``); then ``on_committed`` gets
-``ALERTS``. A tick without effects writes nothing. The evaluators' state is rebuilt from
+``ALERTS``. The cost reader (``ccobs.server.costs``, ADR 0043) sends those samples from
+a thread of its own, after reading the rules in force (``alert_config``) and the oldest
+open session's start (``session_cost_since``, under the lock). A tick without effects
+writes nothing. The evaluators' state is rebuilt from
 the database at the first tick (ADR 0042: the open and cooling keys, and the failure
 windows, dropped while ``repeated_failures`` is off), with the saved settings applied
 over the environment's (``apply_saved_settings``); ``submit_alert_settings_changed``
@@ -68,6 +71,7 @@ from ccobs.domain.alerts import (
     evaluate_waiting_user,
     forget_sessions,
     record_failure_event,
+    session_cost_since,
 )
 from ccobs.domain.app_metrics import event_label
 from ccobs.domain.denials import OpenBlock
@@ -405,8 +409,18 @@ class Writer:
 
     def alert_config(self) -> AlertConfig:
         """The alert rules in force: the environment's, with the saved settings on top
-        once the first tick has loaded them."""
+        once the first tick has loaded them. Safe from any thread: the writer replaces
+        the frozen config whole, and this reads one reference."""
         return self._alert_config
+
+    def session_cost_since(self) -> int | None:
+        """The start of the cost reader's session query (ADR 0043): the earliest
+        ``started_at_ms`` of the committed sessions that are neither ended nor stale
+        (``alerts.session_cost_since``), or ``None`` when there is none. Read under the
+        lock, so another thread never sees a batch half committed."""
+        with self._lock:
+            states = list(self._states.values())
+        return session_cost_since(states)
 
     def open_permission_blocks(self) -> list[OpenBlock]:
         """The committed open permission blocks that have a ``tool_use_id``, which the

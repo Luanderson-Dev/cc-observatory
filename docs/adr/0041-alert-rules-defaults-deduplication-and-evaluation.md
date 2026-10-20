@@ -107,9 +107,10 @@ context's brief):
   tick is a walk over the sessions in memory plus the keys and failure windows.
 - **Order.** Each tick runs the rules in a fixed order, `waiting_user`,
   `repeated_failures`, `session_cost` and `daily_cost`, over the committed sessions the
-  writer holds and the last `CostSample` it was given (the cost reader of stage 7
-  submits one; until then there is none, and the cost rules neither fire nor clear).
-  Hooks queued before a tick are written first, so it sees them.
+  writer holds and the last `CostSample` it was given (the cost reader of stage 7,
+  [ADR 0043](0043-background-cost-queries-to-prometheus.md), submits one; until then
+  there is none, and the cost rules neither fire nor clear). Hooks queued before a tick
+  are written first, so it sees them.
 - **One transaction per tick.** The tick's effects are written in that order in one
   transaction (`Repository.apply_alert_effects`): an `AlertFired` becomes an `alerts`
   row whose Discord delivery is `pending`, due at once, when a webhook is configured,
@@ -183,9 +184,10 @@ narrowed to `StopFailure` in v0.6.0, because:
 **The cost rules.** Both read Claude Code's cost counter in Prometheus
 (`claude_code_cost_usage_USD_total`, ADR 0014) through ADR 0013's exact totals,
 `increase(... anchored)`, built by `telemetry.total_query` and filtered on the app's
-`host` label only. The reader that sends the queries in the background is a later stage
-of milestone 5; the domain builds the queries, parses the answers into a `CostSample`
-(the totals and the time the queries ran) and evaluates it.
+`host` label only. The reader that sends the queries in the background is stage 7 of
+milestone 5 ([ADR 0043](0043-background-cost-queries-to-prometheus.md)); the domain
+builds the queries, parses the answers into a `CostSample` (the totals and the time the
+queries ran) and evaluates it.
 
 - **`session_cost`** sends one query for every session,
   `sum by (session_id) (increase(claude_code_cost_usage_USD_total{host="<host>"}[<range>] anchored))`,
@@ -202,7 +204,9 @@ of milestone 5; the domain builds the queries, parses the answers into a `CostSa
   idle but alive for days makes a range of days, and every poll reads all the host's
   cost samples in it. The reader must therefore not query more often than Claude Code's
   metrics export interval (about one minute), since a faster poll sees no new sample;
-  the reader and its cadence are decided in stage 7 of milestone 5 (ADR 0043).
+  the reader and its cadence are decided in stage 7 of milestone 5
+  ([ADR 0043](0043-background-cost-queries-to-prometheus.md): every 60 s, only while a cost
+  rule is enabled).
 - Only a session the writer holds that is neither `ended` nor `stale` can alert. A
   session of the answer the writer does not hold (an older one still inside the range,
   whose total the range cuts) is ignored. A session that ends, turns stale or leaves the
@@ -241,9 +245,10 @@ of milestone 5; the domain builds the queries, parses the answers into a `CostSa
   and never fires, while `daily_cost` still works. A series idle for more than
   Prometheus's 5-minute lookback across the start of the 24-hour range takes its
   starting value from its first sample inside the range (ADR 0013), so the day can
-  undercount a session idle at that moment. Stage 7 of milestone 5 (ADR 0043) decides
-  whether the reader passes a `lookback_delta`, with evidence, per ADR 0013. The totals
-  lag Claude Code's export interval, about a minute.
+  undercount a session idle at that moment. Stage 7 of milestone 5
+  ([ADR 0043](0043-background-cost-queries-to-prometheus.md)) decided, with ADR 0013's
+  evidence, that the reader passes no `lookback_delta`. The totals lag Claude Code's
+  export interval, about a minute.
 
 **Out of v0.6.0:** immediate alerts on terminal error codes (one failure that no retry
 can fix), `api_error` from Loki, and per-rule channels (every rule goes to both
@@ -306,7 +311,7 @@ channels).
   `tests/test_domain_alerts_settings.py` the merge of saved settings;
   `tests/server/test_repository.py` the one-transaction write and its rollback; and
   `tests/server/test_metrics.py` the new series.
-- A later stage of milestone 5 adds the tests of the cost reader.
+- `tests/server/test_costs.py` covers the cost reader (ADR 0043).
 - `tests/test_domain_telemetry.py` and `tests/test_cli_light.py` keep
   `ccobs.domain.alerts` free of I/O.
 

@@ -31,7 +31,7 @@ from prometheus_client.samples import Sample
 from sqlalchemy import Engine, func, select
 
 import ccobs
-from ccobs.domain.alerts import ALERT_RULES
+from ccobs.domain.alerts import ALERT_RULES, AlertConfig, CostSample
 from ccobs.domain.app_metrics import (
     AGENTS_RUNNING,
     ALERTS_FIRED,
@@ -553,6 +553,15 @@ def test_the_listener_stops_before_the_writer(settings: Settings, queue: HookQue
 
         def open_permission_blocks(self) -> list[OpenBlock]:
             return []
+
+        def alert_config(self) -> AlertConfig:
+            return AlertConfig()
+
+        def session_cost_since(self) -> int | None:
+            return None
+
+        def submit_cost_sample(self, sample: CostSample) -> None:
+            pass
 
         def counts(self) -> WriterCounts:
             return WriterCounts(

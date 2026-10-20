@@ -814,3 +814,33 @@ def test_a_failed_hub_callback_is_logged_and_ignored(
     assert ALERTS in calls
     assert "RuntimeError" in caplog.text
     assert "someone-private" not in caplog.text
+
+
+# The start of the cost reader's session query (ADR 0043).
+
+
+def test_session_cost_since_is_the_oldest_open_session_start(
+    make_writer: Callable[..., Writer], feed: Feeder
+) -> None:
+    writer = make_writer()
+    assert writer.session_cost_since() is None  # no session held
+
+    third = "00000000-0000-4000-8000-000000000002"
+    feed(payload("UserPromptSubmit", OTHER), BASE)
+    feed(payload("UserPromptSubmit"), BASE + MINUTE)
+    feed(payload("UserPromptSubmit", third), BASE + STALE_AFTER_MS)
+    run_all(writer)
+    assert writer.session_cost_since() == BASE
+
+    # OTHER ends: the next oldest open session.
+    feed(payload("SessionEnd", OTHER, reason="other"), BASE + 2 * MINUTE)
+    run_all(writer)
+    assert writer.session_cost_since() == BASE + MINUTE
+
+    # SESSION turns stale; the third, started later, is still open.
+    writer.submit_tick(BASE + MINUTE + STALE_AFTER_MS + SECOND)
+    run_all(writer)
+    stale = writer.state(SESSION)
+    assert stale is not None
+    assert stale.session.status == "stale"
+    assert writer.session_cost_since() == BASE + STALE_AFTER_MS

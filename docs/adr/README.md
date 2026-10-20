@@ -71,3 +71,4 @@ the ADR wins.
 | [0040](0040-defer-the-capture-content-opt-in.md)                              | Defer the capture-content opt-in: v0.5.0 stores metadata only                         | Accepted |
 | [0041](0041-alert-rules-defaults-deduplication-and-evaluation.md)             | Alert rules: defaults, one key per rule and subject, episodes and a cooldown          | Proposed |
 | [0042](0042-alert-tables-settings-precedence-and-retention.md)                | Alert tables, settings saved over the environment, and their retention                | Proposed |
+| [0043](0043-background-cost-queries-to-prometheus.md)                         | A background reader sends the cost alerts' queries to Prometheus once a minute        | Proposed |
