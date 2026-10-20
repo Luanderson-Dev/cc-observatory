@@ -1,0 +1,39 @@
+{#- The alerts history (alerts_page.py): one strip per alert, newest first. It refetches
+    itself when live.js says the alerts changed (ADR 0044); this fragment carries the
+    same attributes, so the new history keeps listening. An alert still on has the
+    amber band; the state is in words too, never colour alone. -#}
+<div id="alert-history" class="alert-history" hx-get="{{ history.refresh_href }}" hx-trigger="ccobs:alerts from:body" hx-swap="outerHTML" hx-sync="this:replace">
+{% if history.items %}
+<ol class="strips">
+{% for a in history.items %}
+<li class="strip alert alert--{{ 'on' if a.on else 'cleared' }}">
+  <div class="strip__head">
+    {% if a.session_href %}
+    <a class="strip__project" href="{{ a.session_href }}">{% if a.project %}{{ a.project }}{% else %}<span class="strip__unknown">Unknown project</span>{% endif %}</a>
+    <code class="strip__id">{{ a.short_id }}</code>
+    {% else %}
+    <span class="strip__project">All sessions</span>
+    {% endif %}
+  </div>
+  <div class="strip__body">
+    <span class="alert__what">{{ a.what }}</span>
+    <span class="strip__state">{{ a.state }}</span>
+  </div>
+  <div class="strip__elapsed">
+    <span class="strip__since">Fired <time datetime="{{ a.fired.iso }}" data-since-ms="{{ a.fired.since_ms }}">{{ a.fired.text }}</time> ago</span>
+  </div>
+</li>
+{% endfor %}
+</ol>
+{% elif history.paged %}
+<p class="bay__empty">No older alerts.</p>
+{% else %}
+<p class="alert-history__empty">{{ history.invitation }}</p>
+{% endif %}
+{% if history.paged or history.next_href %}
+<nav class="pager" aria-label="More alerts">
+  {% if history.paged %}<a class="pager__first" href="/alerts">Newest alerts</a>{% endif %}
+  {% if history.next_href %}<a class="pager__next" href="{{ history.next_href }}">Older alerts</a>{% endif %}
+</nav>
+{% endif %}
+</div>

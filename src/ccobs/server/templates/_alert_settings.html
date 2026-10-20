@@ -1,32 +1,43 @@
-{#- The alert settings form (alert_settings.py, ADR 0045): each setting's value in force
-    and where it comes from. htmx posts it to the guarded POST routes and swaps the answer
-    in its place; a switch sends a hidden false before its checkbox's true, so an
-    unchecked box still says false. -#}
+{#- The alert settings form (alert_settings.py, ADR 0045): one group per rule, each
+    value with its unit, where it comes from, a Reset when it is saved and its error.
+    htmx posts it to the guarded POST routes and swaps the answer in its place; a switch
+    sends a hidden false before its checkbox's true, so an unchecked box still says
+    false. -#}
 <form id="alert-settings" class="alert-settings" hx-post="{{ settings_path }}" hx-target="this" hx-swap="outerHTML">
   {% if message %}
   <p class="alert-settings__message" role="status">{{ message }}</p>
   {% endif %}
-  {% for setting in settings %}
-  <div class="alert-settings__field">
-    {% if setting.kind == "switch" %}
-    <input type="hidden" name="{{ setting.name }}" value="false">
-    <input type="checkbox" id="{{ setting.name }}" name="{{ setting.name }}" value="true" aria-describedby="{{ setting.name }}-source{% if setting.error %} {{ setting.name }}-error{% endif %}"{% if setting.error %} aria-invalid="true"{% endif %}{% if setting.on %} checked{% endif %}>
-    <label for="{{ setting.name }}">{{ setting.label }}</label>
-    {% else %}
-    <label for="{{ setting.name }}">{{ setting.label }}</label>
-    <input type="text" id="{{ setting.name }}" name="{{ setting.name }}" value="{{ setting.value }}" inputmode="{{ 'numeric' if setting.kind == 'whole' else 'decimal' }}" aria-describedby="{{ setting.name }}-source{% if setting.error %} {{ setting.name }}-error{% endif %}"{% if setting.error %} aria-invalid="true"{% endif %}>
+  {% for group in groups %}
+  <fieldset class="alert-settings__group">
+    <legend class="alert-settings__legend">{{ group.legend }}</legend>
+    {% for setting in group.settings %}
+    {% set described = (setting.name ~ "-unit " if setting.unit else "") ~ setting.name ~ "-source" ~ (" " ~ setting.name ~ "-error" if setting.error else "") %}
+    <div class="alert-settings__field">
+      {% if setting.kind == "switch" %}
+      <input type="hidden" name="{{ setting.name }}" value="false">
+      <input type="checkbox" id="{{ setting.name }}" name="{{ setting.name }}" value="true" aria-describedby="{{ described }}"{% if setting.error %} aria-invalid="true"{% endif %}{% if setting.on %} checked{% endif %}>
+      <label for="{{ setting.name }}">{{ setting.label }}</label>
+      {% else %}
+      <label for="{{ setting.name }}">{{ setting.label }}</label>
+      <input type="text" id="{{ setting.name }}" name="{{ setting.name }}" value="{{ setting.value }}" class="alert-settings__input" inputmode="{{ 'numeric' if setting.kind == 'whole' else 'decimal' }}" autocomplete="off" aria-describedby="{{ described }}"{% if setting.error %} aria-invalid="true"{% endif %}>
+      <span id="{{ setting.name }}-unit" class="alert-settings__unit">{{ setting.unit }}</span>
+      {% endif %}
+      <span id="{{ setting.name }}-source" class="alert-settings__source">{{ setting.source_label }}</span>
+      {% if setting.source == "saved" %}
+      <button type="button" class="alert-settings__reset" name="field" value="{{ setting.name }}" hx-post="{{ reset_path }}" hx-target="closest form" hx-swap="outerHTML">Reset</button>
+      {% endif %}
+      {% if setting.error %}
+      <span id="{{ setting.name }}-error" class="alert-settings__error">{{ setting.error }}</span>
+      {% endif %}
+    </div>
+    {% endfor %}
+    {% if group.note %}
+    <p class="alert-settings__note">{{ group.note }}</p>
     {% endif %}
-    <span id="{{ setting.name }}-source" class="alert-settings__source">{{ setting.source_label }}</span>
-    {% if setting.error %}
-    <span id="{{ setting.name }}-error" class="alert-settings__error">{{ setting.error }}</span>
-    {% endif %}
-    {% if setting.source == "saved" %}
-    <button type="button" name="field" value="{{ setting.name }}" hx-post="{{ reset_path }}" hx-target="closest form" hx-swap="outerHTML">Reset</button>
-    {% endif %}
-  </div>
+  </fieldset>
   {% endfor %}
   <div class="alert-settings__actions">
-    <button type="submit">Save</button>
-    <button type="button" hx-post="{{ reset_path }}" hx-target="closest form" hx-swap="outerHTML">Reset all</button>
+    <button type="submit" class="alert-settings__save">Save changes</button>
+    <button type="button" class="alert-settings__reset-all" hx-post="{{ reset_path }}" hx-target="closest form" hx-swap="outerHTML">Reset all</button>
   </div>
 </form>

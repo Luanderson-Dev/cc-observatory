@@ -26,7 +26,7 @@ app's own pages, and from no other page?
 - The `Host` allowlist already defeats DNS rebinding
   ([ADR 0017](0017-grafana-access-and-dns-rebinding.md), ADR 0034), and the app sends no
   CORS headers.
-- A save must never echo a submitted value, and must not block the event loop on the
+- A save must never echo a submitted value in an error or a log line, and must not block the event loop on the
   single writer thread ([ADR 0026](0026-app-database-schema-migrations-and-retention.md)).
 
 ## Considered options
@@ -50,7 +50,11 @@ ADR 0034, which stays in force. The approach is the maintainer's decision for mi
 stage 9's implementation, pending the maintainer's review, which is why this ADR is
 proposed.
 
-**The routes.** `POST /ui/alerts/settings` (save the fields the form holds) and
+**The routes.** `POST /ui/alerts/settings` (save the fields the form holds whose value,
+parsed by its type, differs from the one in force; the form posts every field, and a
+field submitted unchanged writes nothing, so a saved value stays saved and an
+environment value keeps following `CCOBS_ALERT_*`, ADR 0042's precedence; with no
+change at all the writer is not called and the fragment says "No changes to save.") and
 `POST /ui/alerts/settings/reset` (`field=<name>` resets one setting, no field resets
 all) are the only routes besides the hook route that take a POST. `GET
 /ui/alerts/settings` renders the settings fragment and follows the `GET` rules. Every
@@ -104,7 +108,12 @@ failures recorded while the rule was off or narrower count at once; if that read
 fails, the alert state is dropped and the next tick rebuilds it. On any invalid
 field nothing is saved and the fragment comes back with 200 (htmx swaps only 2xx by
 default), each error naming the field and its range and never the value, and each
-field showing the value in force.
+submitted field refilled with the text typed (autoescaped), so the user sees what to fix;
+the rule against echoing a value covers messages and logs, not the user's own input.
+A save or reset that took answers with `HX-Trigger: ccobs:alerts`, the event the alerts
+ping dispatches ([ADR 0044](0044-alerts-reach-the-browser.md)): it bubbles to body,
+so the alerts page's history refetches and its empty state names the rules now on.
+Errors, refusals and a save with no change send no event.
 
 **503.** The route awaits the future with `asyncio.wrap_future`, so the event loop is
 never blocked, for at most 5 s. With no answer in time, when 8 changes already wait
@@ -139,7 +148,9 @@ in force").
   on `POST` but the two settings routes, which give 403 without the headers; the hook
   route unchanged.
 - `tests/server/test_alert_settings_routes.py`: the fragment's values and sources, the
-  hx-post save, a partial save, every type, validation errors without the value and
+  hx-post save, a partial save, a full form that saves only its changed field or
+  nothing, `HX-Trigger: ccobs:alerts` on a save or reset that took and on no other
+  answer, every type, validation errors without the value, the typed text refilled and
   nothing saved, reset of one and of all, the header matrix through the whole app, 415,
   413 and 400, and 503 on a writer timeout (the change cancelled) and on a full queue.
 - `tests/server/test_writer_alert_settings.py`: the writer's save, reset, validation,

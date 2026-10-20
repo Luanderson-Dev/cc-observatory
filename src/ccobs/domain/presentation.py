@@ -38,6 +38,10 @@ each bay by ``board_sort_key``. Ended sessions stay on the overview for
 ``RECENT_END_WINDOW_MS`` (product decision P4); older ones are only on the page of all
 sessions.
 
+Alerts. ``describe_alert`` says what an alert found in words, from its rule, value and
+threshold (a wait still on in the present tense), and ``alerts_invitation`` what the
+alerts page says before any alert fired, from the rules in force.
+
 Descriptions use stored metadata only (ADR 0023), never content.
 
 Standard library only, and no I/O: the CLI imports the domain (tests/test_cli_light.py).
@@ -50,17 +54,21 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Final
 
+from ccobs.domain.alerts import AlertConfig, AlertRule
 from ccobs.domain.sessions import BlockKind, SessionStatus
+from ccobs.domain.usage import format_usd
 
 __all__ = [
     "BAYS",
     "RECENT_END_WINDOW_MS",
     "Bay",
     "StripFacts",
+    "alerts_invitation",
     "bay_of",
     "board_sort_key",
     "describe_activity",
     "describe_agent_stop",
+    "describe_alert",
     "describe_block",
     "describe_block_close",
     "display_path",
@@ -321,3 +329,58 @@ _STOP_WORDING: Final = {
 def describe_agent_stop(reason: str | None) -> str:
     """How a stopped agent ended, from its ``stop_reason``."""
     return _STOP_WORDING.get(reason or "", "Stopped")
+
+
+# Alerts.
+
+_MS_PER_S: Final = 1000
+
+
+def _limit_usd(value: float) -> str:
+    """A dollar limit as a user typed it: ``$10``, or ``$12.50`` with cents."""
+    if value == int(value):
+        return f"${int(value):,}"
+    return f"${value:,.2f}"
+
+
+def _seconds(value: float) -> str:
+    return format_duration(round(value * _MS_PER_S))
+
+
+def describe_alert(rule: AlertRule, value: float, threshold: float, *, cleared: bool) -> str:
+    """What an alert says happened, in words, from its rule, value and threshold in the
+    rule's unit (seconds, failures, US dollars). A wait still on is not over: its value
+    is how long it had lasted when the alert fired."""
+    if rule == "waiting_user":
+        if cleared:
+            return f"Waited on you for {_seconds(value)}"
+        return f"Waiting on you for over {_seconds(value)}"
+    if rule == "repeated_failures":
+        return f"API requests failed {round(value)} times"
+    cost = f"{format_usd(value)} (limit {_limit_usd(threshold)})"
+    if rule == "session_cost":
+        return f"This session cost {cost}"
+    return f"The last 24 hours cost {cost}"
+
+
+def alerts_invitation(config: AlertConfig) -> str:
+    """What the alerts page says while no alert fired: when the app warns, from the
+    rules in force, the cost rules only when they are on."""
+    cases = []
+    if config.waiting_user.enabled:
+        waiting = _seconds(config.waiting_user.threshold_s)
+        cases.append(f"a session waits on you longer than {waiting}")
+    failures = config.repeated_failures
+    if failures.enabled:
+        window = _seconds(failures.window_s)
+        cases.append(f"API requests fail {failures.count} times within {window}")
+    if config.session_cost.enabled:
+        cases.append(f"a session costs more than {_limit_usd(config.session_cost.limit_usd)}")
+    if config.daily_cost.enabled:
+        limit = _limit_usd(config.daily_cost.limit_usd)
+        cases.append(f"the last 24 hours cost more than {limit}")
+    if not cases:
+        return "No alerts yet, and every alert is off. Turn one on under Settings."
+    whens = [f"when {case}" for case in cases]
+    listed = whens[0] if len(whens) == 1 else ", ".join(whens[:-1]) + ", or " + whens[-1]
+    return f"No alerts yet. The app warns you here {listed}."

@@ -93,6 +93,7 @@ ALLOWED_IMPORTS: Final = frozenset(
     | {"copy"}
     # Domain modules, each one checked by the same test.
     | {
+        "ccobs.domain.alerts",
         "ccobs.domain.denials",
         "ccobs.domain.diagnostics",
         "ccobs.domain.durations",

@@ -26,7 +26,7 @@ from starlette.routing import Mount
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from ccobs.domain.hook_config import HOOK_PATH
-from ccobs.server import alert_settings, api, diagnostics, live, ui
+from ccobs.server import alert_settings, alerts_page, api, diagnostics, live, ui
 from ccobs.server import app as server_app
 from ccobs.server.config import Settings
 from ccobs.server.guards import (
@@ -639,6 +639,8 @@ def test_the_hook_route_gets_no_added_header(client: TestClient, path: str, host
 
     assert_neutral(response)
     assert_no_added_headers(response.headers)
+    # Nor the settings routes' refresh of the alerts page (ADR 0045).
+    assert "hx-trigger" not in response.headers
 
 
 async def _headers_app(scope: Scope, receive: Receive, send: Send) -> None:
@@ -1088,6 +1090,7 @@ INCLUDED_ROUTERS: Final = (
     ui.router,
     live.router,
     alert_settings.router,
+    alerts_page.router,
 )
 # A file under a mount: the mount's own path matches nothing.
 MOUNTED_FILE: Final = "/x"
@@ -1116,6 +1119,8 @@ def test_the_read_only_check_sees_every_route(app: FastAPI) -> None:
     assert "/ui/board" in paths
     assert "/ui/stream" in paths
     assert "/ui/alerts/settings/reset" in paths
+    assert "/alerts" in paths
+    assert "/ui/alerts/history" in paths
     assert "/static" + MOUNTED_FILE in paths
     assert not any("{" in path for path in paths)
     # A router included without being added to INCLUDED_ROUTERS fails here.

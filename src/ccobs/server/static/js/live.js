@@ -6,9 +6,11 @@
  * session page; ADR 0044). This script opens one EventSource to it per tab, and on
  * each "changed" event dispatches a "ccobs:changed" event on document.body: the
  * elements that refetch (hx-trigger="ccobs:changed from:body") do the rest; a page with
- * none simply refetches nothing. The stream's "alerts" pings are not handled here yet.
- * Every "open", the first one and each reconnection, dispatches it too, so the page
- * catches up on whatever changed while it was not listening; no Last-Event-ID is needed.
+ * none simply refetches nothing. Each "alerts" event (ADR 0044) dispatches
+ * "ccobs:alerts" on document.body the same way, and it bubbles, so a script can listen
+ * on document too; the alerts page's history refetches on it. Every "open", the first
+ * one and each reconnection, dispatches both, so the page catches up on whatever changed
+ * while it was not listening; no Last-Event-ID is needed.
  *
  * On an error the source is closed, #live-status says that live updates are paused,
  * and the script opens a new source after a delay that doubles from 5 s up to 60 s and
@@ -30,6 +32,10 @@
 
   function changed() {
     document.body.dispatchEvent(new window.Event("ccobs:changed"));
+  }
+
+  function alerts() {
+    document.body.dispatchEvent(new window.Event("ccobs:alerts", { bubbles: true }));
   }
 
   function start() {
@@ -66,8 +72,10 @@
         delay = 0;
         show("");
         changed();
+        alerts();
       });
       source.addEventListener("changed", changed);
+      source.addEventListener("alerts", alerts);
       source.addEventListener("error", function () {
         close();
         show(PAUSED);

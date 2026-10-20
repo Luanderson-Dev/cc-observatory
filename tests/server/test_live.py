@@ -709,7 +709,9 @@ const status = {
   textContent: '',
   getAttribute(name) { return name === 'data-stream' ? '/ui/stream?session=s' : null; },
 };
-const body = { dispatchEvent(event) { log.push('changed:' + event.type); } };
+const body = {
+  dispatchEvent(event) { log.push('changed:' + event.type + (event.bubbles ? ':bubbles' : '')); },
+};
 const document = {
   readyState: 'complete', body,
   getElementById(id) { return id === 'live-status' ? status : null; },
@@ -725,7 +727,9 @@ class FakeSource {
   close() { this.closed = true; log.push('close'); }
   fire(name) { this.handlers[name]({ type: name }); }
 }
-class FakeEvent { constructor(type) { this.type = type; } }
+class FakeEvent {
+  constructor(type, init) { this.type = type; this.bubbles = Boolean(init && init.bubbles); }
+}
 const window = {
   EventSource: FakeSource, Event: FakeEvent,
   setTimeout(fn, ms) { timers.push([fn, ms]); log.push('wait:' + ms); return timers.length; },
@@ -738,6 +742,7 @@ const first = sources[0];
 first.fire('open');
 log.push('status:' + status.textContent);
 first.fire('changed');
+first.fire('alerts');
 first.fire('error');
 log.push('status:' + status.textContent);
 for (let n = 0; n < 6; n += 1) {
@@ -775,13 +780,17 @@ def test_live_js_reconnects_with_backoff_and_refetches_on_open() -> None:
     log = json.loads(completed.stdout)
     paused = "status:Live updates paused. Reconnecting\u2026"
     url = "open:/ui/stream?session=s"
+    alerts = "changed:ccobs:alerts:bubbles"
 
     assert log == [
         url,
-        # Every open, the first one included, makes the page refetch.
+        # Every open, the first one included, makes the page refetch, the alerts too.
         "changed:ccobs:changed",
+        alerts,
         "status:",
         "changed:ccobs:changed",
+        # An alerts ping is its own event, which bubbles to document (ADR 0044).
+        alerts,
         # An error closes the source (no browser retry storm on a 503) and waits.
         "close",
         "wait:5000",
@@ -806,6 +815,7 @@ def test_live_js_reconnects_with_backoff_and_refetches_on_open() -> None:
         "wait:60000",
         url,
         "changed:ccobs:changed",
+        alerts,
         "status:",
         # After an open the backoff starts over.
         "close",

@@ -9,15 +9,25 @@ from __future__ import annotations
 
 import pytest
 
+from ccobs.domain.alerts import (
+    AlertConfig,
+    AlertRule,
+    DailyCostRule,
+    RepeatedFailuresRule,
+    SessionCostRule,
+    WaitingUserRule,
+)
 from ccobs.domain.presentation import (
     BAYS,
     RECENT_END_WINDOW_MS,
     Bay,
     StripFacts,
+    alerts_invitation,
     bay_of,
     board_sort_key,
     describe_activity,
     describe_agent_stop,
+    describe_alert,
     describe_block,
     describe_block_close,
     display_path,
@@ -533,3 +543,84 @@ def test_describe_block_close(kind: BlockKind, reason: str | None, expected: str
 )
 def test_describe_agent_stop(reason: str | None, expected: str) -> None:
     assert describe_agent_stop(reason) == expected
+
+
+# Alerts
+
+
+@pytest.mark.parametrize(
+    ("rule", "value", "threshold", "expected"),
+    [
+        ("waiting_user", 134.4, 30.0, "Waited on you for 2m 14s"),
+        ("waiting_user", 31.5, 30.0, "Waited on you for 31s"),
+        ("repeated_failures", 3.0, 3.0, "API requests failed 3 times"),
+        ("session_cost", 12.4, 10.0, "This session cost $12.40 (limit $10)"),
+        ("session_cost", 0.5, 0.25, "This session cost $0.5000 (limit $0.25)"),
+        ("daily_cost", 52.1, 50.0, "The last 24 hours cost $52.10 (limit $50)"),
+        ("daily_cost", 1234.5, 1000.5, "The last 24 hours cost $1,234.50 (limit $1,000.50)"),
+    ],
+)
+def test_an_alert_says_what_happened_in_words(
+    rule: AlertRule, value: float, threshold: float, expected: str
+) -> None:
+    assert describe_alert(rule, value, threshold, cleared=True) == expected
+
+
+@pytest.mark.parametrize(
+    ("rule", "value", "threshold", "expected"),
+    [
+        # The wait is not over: the value is how long it had lasted when the alert fired.
+        ("waiting_user", 134.4, 30.0, "Waiting on you for over 2m 14s"),
+        ("waiting_user", 31.5, 30.0, "Waiting on you for over 31s"),
+        ("repeated_failures", 3.0, 3.0, "API requests failed 3 times"),
+        ("session_cost", 12.4, 10.0, "This session cost $12.40 (limit $10)"),
+        ("daily_cost", 52.1, 50.0, "The last 24 hours cost $52.10 (limit $50)"),
+    ],
+)
+def test_an_alert_still_on_says_what_is_happening(
+    rule: AlertRule, value: float, threshold: float, expected: str
+) -> None:
+    assert describe_alert(rule, value, threshold, cleared=False) == expected
+
+
+def test_the_invitation_names_the_rules_on_by_default() -> None:
+    assert alerts_invitation(AlertConfig()) == (
+        "No alerts yet. The app warns you here when a session waits on you longer than"
+        " 30s, or when API requests fail 3 times within 10m 00s."
+    )
+
+
+def test_the_invitation_names_the_cost_rules_only_when_they_are_on() -> None:
+    config = AlertConfig(
+        waiting_user=WaitingUserRule(threshold_s=90),
+        session_cost=SessionCostRule(enabled=True, limit_usd=10.0),
+        daily_cost=DailyCostRule(enabled=True, limit_usd=52.5),
+    )
+
+    assert alerts_invitation(config) == (
+        "No alerts yet. The app warns you here when a session waits on you longer than"
+        " 1m 30s, when API requests fail 3 times within 10m 00s, when a session costs"
+        " more than $10, or when the last 24 hours cost more than $52.50."
+    )
+
+
+def test_the_invitation_with_one_rule_on() -> None:
+    config = AlertConfig(
+        waiting_user=WaitingUserRule(enabled=False),
+        repeated_failures=RepeatedFailuresRule(count=5, window_s=60),
+    )
+
+    assert alerts_invitation(config) == (
+        "No alerts yet. The app warns you here when API requests fail 5 times within 1m 00s."
+    )
+
+
+def test_the_invitation_with_every_rule_off_says_so() -> None:
+    config = AlertConfig(
+        waiting_user=WaitingUserRule(enabled=False),
+        repeated_failures=RepeatedFailuresRule(enabled=False),
+    )
+
+    assert alerts_invitation(config) == (
+        "No alerts yet, and every alert is off. Turn one on under Settings."
+    )

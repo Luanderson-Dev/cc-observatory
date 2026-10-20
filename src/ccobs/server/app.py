@@ -41,7 +41,7 @@ from starlette.routing import Route
 from starlette.types import Receive, Scope, Send
 
 from ccobs.domain.alerts import ALERT_SETTINGS
-from ccobs.server import alert_settings, api, diagnostics, live, ui
+from ccobs.server import alert_settings, alerts_page, api, diagnostics, live, ui
 from ccobs.server.config import Settings
 from ccobs.server.costs import CostReader, CostTarget
 from ccobs.server.db.engine import create_engine_for, wal_enabled
@@ -460,6 +460,10 @@ def create_app(
     app.state.alert_env_config = settings.alert_config
     app.state.alert_env_fields = frozenset(settings.model_fields_set & set(ALERT_SETTINGS))
     app.state.settings_timeout_s = settings_timeout_s
+    # The alerts page says whether Discord gets the alerts too, and whether its messages
+    # name the project; never the webhook URL, which stays in the settings.
+    app.state.discord_configured = settings.discord_configured
+    app.state.discord_include_project = settings.discord_include_project
     for path in sorted(HOOK_PATHS):
         app.router.routes.append(Route(path, endpoint, include_in_schema=False))
 
@@ -477,6 +481,8 @@ def create_app(
     app.include_router(live.router)
     # The alert settings fragment and its POST routes (ADR 0045).
     app.include_router(alert_settings.router)
+    # The alerts page and its live history (ADR 0044).
+    app.include_router(alerts_page.router)
     app.mount("/static", ui.StaticAssets(), name="static")
     # The last one added is the outermost (ADR 0034): the Host guard, then the response
     # headers (so that a 403 carries them), then Fetch Metadata, then the checks of the
