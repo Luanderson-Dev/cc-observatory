@@ -264,4 +264,4 @@ docs/adr/         architecture decision records (MADR)
 | 6         | v0.7.0  | Grafana dashboards and polish                                                          |
 | 7         | v1.0.0  | Distribution: GHCR multi-arch images, release hardening, contributor docs              |
 
-Current: milestone 4 (milestone 3 released as v0.4.0).
+Current: milestone 5 (milestone 4 released as v0.5.0).
