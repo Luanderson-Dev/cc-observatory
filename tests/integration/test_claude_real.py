@@ -99,16 +99,17 @@ MAX_BUDGET_USD: Final = "0.25"
 OK_PROMPT: Final = "Reply with the single word OK."
 OK_MAX_TURNS: Final = 2
 
-# The cumulative re-export run (ADR 0013): metrics every 5 s, and one shell command that
-# keeps the process alive for several intervals after its token usage stops changing.
+# The cumulative re-export run (ADR 0013): metrics every 5 s, and a Stop hook that keeps
+# the process alive for several intervals after the last response, when its token usage
+# has stopped changing. A hook, not a Bash tool call: the model may refuse a plain
+# `sleep`, and Claude Code itself blocks a standalone `sleep 25` in the Bash tool. Exec
+# form (`args`) runs this interpreter with no shell on every OS; a Stop hook that exits
+# 0 with no output lets the session end normally. The hook writes a marker file once it
+# has slept, which proves it ran to the end (a slow API alone could also make a run
+# last 25 s).
 EXPORT_INTERVAL_MS: Final = 5000
 SLEEP_S: Final = 25
-SLEEP_PROMPT: Final = (
-    f"Use the Bash tool to run exactly this command, with nothing else: sleep {SLEEP_S}. "
-    "When it finishes, reply with the single word DONE."
-)
-SLEEP_ALLOWED: Final = "Bash(sleep *)"
-SLEEP_MAX_TURNS: Final = 4
+SLEEP_HOOK_TIMEOUT_S: Final = SLEEP_S + 35
 SLEEP_RUN_TIMEOUT: Final = 300
 # Samples in a row with the same value, inside the run, that show an unchanged series
 # was re-exported: a 25 s sleep at a 5 s interval spans at least four exports.
@@ -117,6 +118,21 @@ MIN_UNCHANGED_SAMPLES: Final = 4
 INGEST_DEADLINE: Final = 60.0
 # Seconds of margin before the run's start in the range selector.
 WINDOW_MARGIN_S: Final = 30
+
+
+def _sleep_hooks(marker: Path) -> dict[str, object]:
+    """The Stop hook that sleeps ``SLEEP_S`` seconds, then writes ``marker``."""
+    script = (
+        f"import pathlib, time; time.sleep({SLEEP_S}); "
+        f"pathlib.Path({str(marker)!r}).write_text('', encoding='utf-8')"
+    )
+    handler = {
+        "type": "command",
+        "command": sys.executable,
+        "args": ["-c", script],
+        "timeout": SLEEP_HOOK_TIMEOUT_S,
+    }
+    return {"Stop": [{"hooks": [handler]}]}
 
 
 def _unused_port() -> int:
@@ -310,26 +326,26 @@ def test_cumulative_metrics_reexport_unchanged_series(
     workspace: Path, tmp_path: Path, otlp_http_url: str, prometheus_url: str
 ) -> None:
     """ADR 0013 expects Claude Code in cumulative mode to export every series at each
-    interval, changed or not. The session sleeps through five 5 s intervals after its
-    first request, so inside the run one of its token series must hold the same value
-    above zero for at least four samples in a row. Only that last assertion failing is
-    evidence for a new ADR on lookback_delta; every earlier one is a setup failure."""
+    interval, changed or not. A Stop hook keeps the session alive through five 5 s
+    intervals after its last response, so inside the run one of its token series must
+    hold the same value above zero for at least four samples in a row. Only that last
+    assertion failing is evidence for a new ADR on lookback_delta; every earlier one is
+    a setup failure."""
     otlp_port = urlsplit(otlp_http_url).port
     assert otlp_port is not None
+    marker = tmp_path / "stop-hook-slept"
     env = {
         **telemetry_env(f"http://{LOOPBACK}:{otlp_port}"),
         "OTEL_METRIC_EXPORT_INTERVAL": str(EXPORT_INTERVAL_MS),
     }
 
     run = _run_claude(
-        {"env": env},
+        {"env": env, "hooks": _sleep_hooks(marker)},
         workspace,
         tmp_path,
-        SLEEP_PROMPT,
-        "--allowedTools",
-        SLEEP_ALLOWED,
+        OK_PROMPT,
         "--max-turns",
-        str(SLEEP_MAX_TURNS),
+        str(OK_MAX_TURNS),
         timeout=SLEEP_RUN_TIMEOUT,
     )
 
@@ -339,13 +355,9 @@ def test_cumulative_metrics_reexport_unchanged_series(
     assert result.get("is_error") is False, (
         f"setup: the run ended in an error, not ADR 0013 evidence\n{run.describe()}"
     )
-    assert not result.get("permission_denials"), (
-        f"setup: the sleep was denied, not ADR 0013 evidence\n{run.describe()}"
-    )
-    duration = run.ended - run.started
-    assert duration >= SLEEP_S, (
-        f"setup: the run took {duration:.1f} s, under the {SLEEP_S} s sleep, so it never "
-        f"slept; not ADR 0013 evidence\n{run.describe()}"
+    assert marker.exists(), (
+        f"setup: the Stop hook did not finish its {SLEEP_S} s sleep, not ADR 0013 "
+        f"evidence\n{run.describe()}"
     )
 
     session_id = result.get("session_id")
