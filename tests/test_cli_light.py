@@ -15,6 +15,7 @@ import sys
 
 import pytest
 
+import ccobs.cli
 import ccobs.domain
 
 SERVER_PACKAGES = (
@@ -52,10 +53,18 @@ def _domain_modules() -> list[str]:
     ]
 
 
+def _cli_modules() -> list[str]:
+    """Return the CLI package and every submodule, imported or not by ``ccobs.cli``."""
+    return [
+        "ccobs.cli",
+        *(info.name for info in pkgutil.walk_packages(ccobs.cli.__path__, prefix="ccobs.cli.")),
+    ]
+
+
 # The CLI on its own, and the CLI plus every domain module (the M4 CLI imports the domain).
 IMPORT_SETS = (
-    ("ccobs.cli",),
-    ("ccobs.cli", "ccobs.domain", *_domain_modules()),
+    (*_cli_modules(),),
+    (*_cli_modules(), "ccobs.domain", *_domain_modules()),
 )
 
 # Top-level names outside sys.stdlib_module_names that the child may hold. Each one was

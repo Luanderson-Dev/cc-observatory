@@ -228,7 +228,7 @@ compose*.yaml     compose.yaml is the stack; compose.debug.yaml publishes the st
                   loopback (debugging, integration tests)
 stack/            service configs, mounted read-only into the containers; stack/app/ is
                   the app's image (built with the repository root as context)
-src/ccobs/        package (CLI entry point in cli.py; the app in server/, its pure rules
+src/ccobs/        package (CLI entry point in cli/; the app in server/, its pure rules
                   in domain/)
 src/ccobs/server/templates/
                   Jinja2 pages and htmx fragments of the web UI
@@ -245,6 +245,8 @@ tools/stack/      dev-only stack tools (not packaged): OTLP replay, isolated cco
 docs/stack.md     operator reference for the stack (settings, memory, troubleshooting)
 docs/app.md       operator reference for the app (web UI, hook settings, API, metrics,
                   data, troubleshooting)
+docs/cli.md       operator reference for the ccobs commands (setup, uninstall, doctor,
+                  status, troubleshooting)
 docs/adr/         architecture decision records (MADR)
 .claude/agents/   project subagents
 ```

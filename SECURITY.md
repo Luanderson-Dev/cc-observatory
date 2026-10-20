@@ -185,11 +185,12 @@ to each part from the release that ships it.
   never contain them.
 - **Content capture is opt-in.** By default, prompt text, tool inputs and outputs,
   assistant messages and error text are dropped before anything is stored.
-  `ccobs setup --capture-content` (from v0.5.0) turns content capture on in Claude Code,
-  the collector and the app; without it, the collector drops content even if Claude
-  Code sends it.
-  Captured content can include source code, file contents and any secret that shows up
-  in a prompt or a tool's output.
+  `ccobs setup` never turns content capture on in Claude Code, the collector or the app:
+  v0.5.0 stores metadata only, and the opt-in is deferred
+  ([ADR 0040](docs/adr/0040-defer-the-capture-content-opt-in.md)). Without it, the
+  collector drops content even if Claude Code sends it.
+  Once an opt-in exists, captured content can include source code, file contents and
+  any secret that shows up in a prompt or a tool's output.
 - **Personal attributes.** The collector always deletes every attribute whose name
   starts with `user.` or `enduser.` (such as `user.email`, `user.id`, which on gateway
   sessions is the identity provider subject, `user.account_uuid`, `user.account_id` and

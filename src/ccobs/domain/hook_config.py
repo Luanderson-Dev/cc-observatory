@@ -26,6 +26,7 @@ __all__ = [
     "ASYNC_COMMAND_EVENTS",
     "ASYNC_COMMAND_TIMEOUT_S",
     "CURL_MAX_TIME_S",
+    "DEFAULT_APP_PORT",
     "DEFAULT_HOOK_URL",
     "FORBIDDEN_EVENTS",
     "HOOK_PATH",
@@ -33,11 +34,14 @@ __all__ = [
     "NOT_REGISTERED",
     "REGISTERED_HTTP_EVENTS",
     "hook_settings",
+    "is_hook_url",
 ]
 
 HOOK_PATH: Final = "/hooks"
-# The app's port in the stack's port block (ADR 0018).
-DEFAULT_HOOK_URL: Final = "http://127.0.0.1:4300" + HOOK_PATH
+# The app's port in the stack's port block (ADR 0018): the one place the CLI, the
+# domain and the UI take it from.
+DEFAULT_APP_PORT: Final = 4300
+DEFAULT_HOOK_URL: Final = f"http://127.0.0.1:{DEFAULT_APP_PORT}{HOOK_PATH}"
 
 # Seconds. An http hook is cancelled after HTTP_TIMEOUT_S, which bounds what a hung app
 # costs each event. Claude Code does not enforce the timeout of an async command hook,
@@ -113,10 +117,18 @@ _HOOK_URL: Final = re.compile(
 )
 
 
-def _check_url(url: str) -> str:
+def is_hook_url(url: object) -> bool:
+    """Whether ``url`` is a string that ``hook_settings`` accepts: http to 127.0.0.1, an
+    optional port up to 65535, and a path ending in ``HOOK_PATH``. Never raises."""
+    if not isinstance(url, str):
+        return False
     match = _HOOK_URL.fullmatch(url)
     port = match["port"] if match else None
-    if match is None or (port is not None and int(port) > _MAX_PORT):
+    return match is not None and (port is None or int(port) <= _MAX_PORT)
+
+
+def _check_url(url: str) -> str:
+    if not is_hook_url(url):
         # The URL is not echoed: it came from the user's input.
         raise ValueError(
             f"the hook URL must be http to 127.0.0.1 (not localhost, which may resolve to "

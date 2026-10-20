@@ -91,9 +91,10 @@ module = ["winpty", "mcp.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
-addopts = "-ra --strict-markers --strict-config -m 'not integration' --cov --cov-report=term-missing"
+addopts = "-ra --strict-markers --strict-config -m 'not integration and not claude' --cov --cov-report=term-missing"
 markers = [
   "integration: starts an isolated docker compose project (ccobs-it) and talks to it",
+  "claude: runs a real Claude Code session against the API; costs a little money; opt-in with CCOBS_IT_CLAUDE=1",
 ]
 # The repository root goes on sys.path so tests can import the `tools` package.
 pythonpath = ["."]

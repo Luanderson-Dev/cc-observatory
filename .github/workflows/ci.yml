@@ -210,7 +210,9 @@ jobs:
         timeout-minutes: 12
         env:
           CCOBS_IT_KEEP: "1"
-        run: uv run pytest -m integration --no-cov
+        # `not claude`: the opt-in real Claude Code tests (also marked integration where
+        # they need the stack) never run in CI; they skip without CCOBS_IT_CLAUDE=1 anyway.
+        run: uv run pytest -m "integration and not claude" --no-cov
 
       - name: Show the stack's resource use
         if: ${{ !cancelled() && steps.integration.outcome != 'skipped' }}

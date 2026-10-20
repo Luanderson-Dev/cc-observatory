@@ -5,8 +5,8 @@ messages, error text) and paths that contain the OS username (ADRs 0006 and 0012
 ``parse_hook`` turns a decoded payload into a frozen event that holds only the fields
 allowed for its event, plus sizes computed from content that is then discarded. Every
 other key, known or unknown, is dropped, so a field Claude Code adds later is never
-stored by accident. The content opt-in (milestone 4) extends this allowlist; it does not
-bypass it.
+stored by accident. A content opt-in, deferred by ADR 0040, would extend this allowlist;
+it would not bypass it.
 
 Field names follow the payloads of Claude Code 2.1.296 in ``tests/fixtures/hooks/``
 (ADR 0012). Kept values are bounded: optional fields of the wrong type, out of range or
