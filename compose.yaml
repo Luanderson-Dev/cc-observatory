@@ -351,6 +351,22 @@ services:
       CCOBS_HOOK_QUEUE_MAX_ITEMS: ${CCOBS_HOOK_QUEUE_MAX_ITEMS:-10000}
       CCOBS_HOOK_QUEUE_MAX_BYTES: ${CCOBS_HOOK_QUEUE_MAX_BYTES:-67108864}
       CCOBS_HOOK_BODY_MAX_BYTES: ${CCOBS_HOOK_BODY_MAX_BYTES:-8388608}
+      # The alert rules (ADR 0041), with the app's defaults; the settings screen may
+      # override them.
+      CCOBS_ALERT_WAITING_ENABLED: ${CCOBS_ALERT_WAITING_ENABLED:-true}
+      CCOBS_ALERT_WAITING_THRESHOLD_S: ${CCOBS_ALERT_WAITING_THRESHOLD_S:-30}
+      CCOBS_ALERT_FAILURES_ENABLED: ${CCOBS_ALERT_FAILURES_ENABLED:-true}
+      CCOBS_ALERT_FAILURES_COUNT: ${CCOBS_ALERT_FAILURES_COUNT:-3}
+      CCOBS_ALERT_FAILURES_WINDOW_S: ${CCOBS_ALERT_FAILURES_WINDOW_S:-600}
+      CCOBS_ALERT_SESSION_COST_ENABLED: ${CCOBS_ALERT_SESSION_COST_ENABLED:-false}
+      CCOBS_ALERT_SESSION_COST_USD: ${CCOBS_ALERT_SESSION_COST_USD:-10}
+      CCOBS_ALERT_DAILY_COST_ENABLED: ${CCOBS_ALERT_DAILY_COST_ENABLED:-false}
+      CCOBS_ALERT_DAILY_COST_USD: ${CCOBS_ALERT_DAILY_COST_USD:-50}
+      CCOBS_ALERT_COOLDOWN_S: ${CCOBS_ALERT_COOLDOWN_S:-300}
+      # The Discord webhook URL, a secret (ADR 0007): no value here, so compose takes it
+      # from the shell or .env, and leaves it unset (no Discord alerts) when neither has it.
+      CCOBS_DISCORD_WEBHOOK_URL:
+      CCOBS_DISCORD_INCLUDE_PROJECT: ${CCOBS_DISCORD_INCLUDE_PROJECT:-false}
     healthcheck:
       # The image has Python and no HTTP client. /healthz is behind the Host guard,
       # which allows the Host: 127.0.0.1:4300 that urllib sends; no proxy from the

@@ -19,7 +19,7 @@ import pytest
 import yaml
 
 from ccobs.domain.telemetry import DEFAULT_HOST, HOST_VALUE_PATTERN
-from ccobs.server.config import ENV_PREFIX, Settings
+from ccobs.server.config import ENV_PREFIX, Settings, load_settings
 
 ROOT: Final = Path(__file__).resolve().parents[1]
 COMPOSE: Final = ROOT / "compose.yaml"
@@ -848,6 +848,10 @@ APP_FIXED_VARIABLES: Final = frozenset(
 # through: Grafana's URL is Grafana's root URL (ADR 0017), from CCOBS_GRAFANA_PORT, since
 # Grafana redirects every other URL there, so .env does not offer it.
 APP_DERIVED_VARIABLES: Final = {"CCOBS_GRAFANA_URL": "http://localhost:${CCOBS_GRAFANA_PORT:-4330}"}
+# The app's secrets: passed through from the shell or .env with no default (a bare key,
+# null in compose.yaml), so an unset one stays unset in the container instead of being
+# written into compose.yaml, and .env.example offers them only as commented placeholders.
+APP_SECRET_VARIABLES: Final = frozenset({"CCOBS_DISCORD_WEBHOOK_URL"})
 APP_HEALTHCHECK: Final = [
     "CMD",
     "python",
@@ -929,10 +933,11 @@ def test_app_starts_without_waiting_for_loki() -> None:
 def test_app_environment_passes_every_setting_but_the_fixed_ones() -> None:
     variables = set(_settings_variables().values())
     assert variables >= APP_FIXED_VARIABLES | set(APP_DERIVED_VARIABLES)
-    passed = variables - APP_FIXED_VARIABLES - set(APP_DERIVED_VARIABLES)
+    assert variables >= APP_SECRET_VARIABLES
+    passed = variables - APP_FIXED_VARIABLES - set(APP_DERIVED_VARIABLES) - APP_SECRET_VARIABLES
     expected = {name: f"${{{name}:-" for name in passed}
     environment = _environment(_app())
-    assert set(environment) == set(expected) | set(APP_DERIVED_VARIABLES)
+    assert set(environment) == set(expected) | set(APP_DERIVED_VARIABLES) | APP_SECRET_VARIABLES
     for name, prefix in expected.items():
         assert environment[name].startswith(prefix), f"{name}: {environment[name]}"
     for name, value in APP_DERIVED_VARIABLES.items():
@@ -957,6 +962,8 @@ def test_app_compose_defaults_are_the_settings_defaults(monkeypatch: pytest.Monk
     defaults = Settings().model_dump()
     environment = _environment(_app())
     for name, value in environment.items():
+        if name in APP_SECRET_VARIABLES:
+            continue  # unset when .env is silent: see test_app_passes_secrets_through
         assert INTERPOLATION.search(value), f"{name}: {value}"
 
         def default(interpolation: re.Match[str], name: str = name) -> str:
@@ -966,6 +973,56 @@ def test_app_compose_defaults_are_the_settings_defaults(monkeypatch: pytest.Monk
 
         monkeypatch.setenv(name, INTERPOLATION.sub(default, value))
     assert Settings().model_dump() == defaults
+
+
+def test_app_passes_secrets_through_without_a_default() -> None:
+    # A bare key: compose takes the value from the shell or .env, and leaves it unset in
+    # the container otherwise; no URL, real or placeholder, is written in compose.yaml.
+    environment = _mapping(_app()["environment"], "app environment")
+    for name in APP_SECRET_VARIABLES:
+        assert name in environment, name
+        assert environment[name] is None, name
+    assert "discord.com" not in COMPOSE.read_text(encoding="utf-8")
+
+
+def test_env_example_offers_secrets_only_as_commented_placeholders() -> None:
+    text = ENV_EXAMPLE.read_text(encoding="utf-8")
+    assigned = _env_example()
+    for name in APP_SECRET_VARIABLES:
+        assert name not in assigned, f".env.example must not assign {name}"
+        lines = [line for line in text.splitlines() if line.startswith(f"# {name}=")]
+        assert len(lines) == 1, name
+        # A placeholder the app would refuse, never a real-looking value.
+        value = lines[0].partition("=")[2]
+        assert "<" in value, value
+        assert ">" in value, value
+
+
+def test_env_example_placeholder_webhook_is_refused_by_the_app(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    line = next(
+        line
+        for line in ENV_EXAMPLE.read_text(encoding="utf-8").splitlines()
+        if line.startswith("# CCOBS_DISCORD_WEBHOOK_URL=")
+    )
+    for name in [key for key in os.environ if key.upper().startswith(ENV_PREFIX)]:
+        monkeypatch.delenv(name)
+    monkeypatch.setenv("CCOBS_DISCORD_WEBHOOK_URL", line.partition("=")[2])
+    with pytest.raises(ValueError, match="CCOBS_DISCORD_WEBHOOK_URL"):
+        load_settings()
+
+
+def test_app_passes_every_alert_setting() -> None:
+    environment = _environment(_app())
+    alert_variables = {
+        variable
+        for name, variable in _settings_variables().items()
+        if name.startswith(("alert_", "discord_"))
+    }
+    assert len(alert_variables) == 12
+    assert alert_variables <= set(environment)
+    assert alert_variables - APP_SECRET_VARIABLES <= set(_env_example())
 
 
 def test_debug_override_publishes_the_app_metrics_on_loopback() -> None:
