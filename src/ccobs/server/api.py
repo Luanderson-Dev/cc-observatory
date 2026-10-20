@@ -1,4 +1,5 @@
-"""The app's read-only JSON API: sessions, their agents and blocks, and their hook events.
+"""The app's read-only JSON API: sessions, their agents and blocks, their hook events, and
+the alerts.
 
 Every route reads the database through the readers' ``Repository``, on connections of
 the query-only readers' engine (a WAL snapshot per read), and never the writer's memory:
@@ -23,6 +24,12 @@ with a session page by keyset, never by offset. Agents page by ``before`` (an
 ``agent_id``), blocks by ``before`` (a ``block_id``), and events by ``before_seq`` or
 ``after_seq``, never both; every cursor is exclusive and every page is in the lists'
 usual order, oldest first.
+
+Alerts (ADR 0044) page by ``id``, newest first like ADR 0042's ``list_alerts``: the
+latest, or the ones just below ``before``. ``after`` returns the ones just above it,
+oldest first, so a browser that keeps the last ``id`` it saw catches up in order, page
+by page, without skipping one. An alert never carries ``cwd``: the session's project
+name stands in for it, and its Discord delivery stays internal.
 """
 
 from __future__ import annotations
@@ -39,9 +46,11 @@ from pydantic import BaseModel, ConfigDict
 from starlette.responses import Response
 
 from ccobs.domain.hooks import is_valid_session_id
+from ccobs.domain.presentation import project_name
 from ccobs.domain.sessions import Agent, Block, SessionStatus
 from ccobs.server.db.repository import (
     AgentPage,
+    AlertView,
     HookEventRow,
     Repository,
     SessionDetail,
@@ -55,6 +64,7 @@ __all__ = [
     "MAX_LIMIT",
     "SESSION_STATUSES",
     "AgentOut",
+    "AlertOut",
     "BlockOut",
     "EventOut",
     "SessionDetailOut",
@@ -70,6 +80,9 @@ MAX_CURSOR: Final = 2**63 - 1
 _MAX_ID_LENGTH: Final = 256
 SESSION_STATUSES: Final[tuple[str, ...]] = get_args(SessionStatus.__value__)
 _NOT_FOUND: Final = "session not found"
+# What an alert is about (ADR 0044): a session, or the day (daily_cost).
+_SESSION: Final = "session"
+_DAY: Final = "day"
 
 
 class _Out(BaseModel):
@@ -196,6 +209,39 @@ class EventOut(_Out):
         return cls(**asdict(row))
 
 
+class AlertOut(_Out):
+    """An ``alerts`` row as the browser needs it (ADR 0044): what fired, about what and
+    when, never its Discord delivery, which is internal. ``subject_kind`` is ``session``
+    or ``day`` (``daily_cost``, with no session). ``project`` is the session's project
+    name (``presentation.project_name``), never its ``cwd``; ``None`` for a daily alert
+    or a session with no ``cwd``."""
+
+    id: int
+    rule: str
+    subject_kind: str
+    session_id: str | None
+    project: str | None
+    fired_at_ms: int
+    cleared_at_ms: int | None
+    value: float
+    threshold: float
+
+    @classmethod
+    def of(cls, view: AlertView) -> AlertOut:
+        alert = view.alert
+        return cls(
+            id=alert.id,
+            rule=alert.rule,
+            subject_kind=_DAY if alert.session_id is None else _SESSION,
+            session_id=alert.session_id,
+            project=project_name(view.cwd),
+            fired_at_ms=alert.fired_at_ms,
+            cleared_at_ms=alert.cleared_at_ms,
+            value=alert.value,
+            threshold=alert.threshold,
+        )
+
+
 # Async, like the routes: FastAPI runs a sync dependency on its default threadpool.
 async def _repository(request: Request) -> Repository:
     repository: Repository = request.app.state.read_repository
@@ -244,6 +290,12 @@ def _events(
     if not repository.session_exists(session_id):
         return None
     return repository.list_events(session_id, limit, before_seq=before_seq, after_seq=after_seq)
+
+
+def _alerts(
+    repository: Repository, host: str, limit: int, before: int | None, after: int | None
+) -> list[AlertView]:
+    return repository.alert_views(host, limit, before_id=before, after_id=after)
 
 
 def _invalid(loc: tuple[str, ...], msg: str) -> RequestValidationError:
@@ -351,6 +403,24 @@ async def list_events(
     if rows is None:
         raise HTTPException(status_code=404, detail=_NOT_FOUND)
     return [EventOut.of(row) for row in rows]
+
+
+@router.get("/alerts")
+async def list_alerts(
+    request: Request,
+    repository: _Repo,
+    reads: _Reads,
+    before: _Seq = None,
+    after: _Seq = None,
+    limit: _Limit = DEFAULT_LIMIT,
+) -> list[AlertOut]:
+    """The host's ``limit`` alerts by ``id``: its latest, or the ones just below
+    ``before``, newest first; or the ones just above ``after``, oldest first."""
+    if before is not None and after is not None:
+        raise _invalid(("query",), "before and after cannot be used together")
+    host: str = request.app.state.host_label
+    views = await reads.run(_alerts, repository, host, limit, before, after)
+    return [AlertOut.of(view) for view in views]
 
 
 async def validation_error(_request: Request, error: RequestValidationError) -> Response:

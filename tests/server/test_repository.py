@@ -66,6 +66,7 @@ from ccobs.server.db.repository import (
     DETAIL_CLOSED_LIMIT,
     AlertRecord,
     AlertSettingValue,
+    AlertView,
     Applied,
     HookEventRow,
     Repository,
@@ -1215,6 +1216,68 @@ def test_alert_pages_by_id_cover_every_alert_once(repo: Repository) -> None:
     assert repo.list_alerts(HOST, 0) == []
 
 
+def test_alert_views_page_both_ways_with_the_sessions_cwd(repo: Repository) -> None:
+    write = Writer(repo)
+    write(event("UserPromptSubmit", session_id=SESSION, cwd="/home/someone/proj"), BASE)
+    write(event("UserPromptSubmit", session_id=OTHER), BASE)
+    session_alert = repo.insert_alert(HOST, fired(), discord_state="none")
+    day = repo.insert_alert(HOST, daily(), discord_state="pending", discord_next_at_ms=BASE)
+    no_cwd = repo.insert_alert(HOST, fired(OTHER), discord_state="none")
+    ids = [repo.insert_alert(HOST, fired(at=BASE + i), discord_state="none") for i in range(5)]
+    repo.insert_alert("other-host", fired(OTHER), discord_state="none")
+    every = [session_alert, day, no_cwd, *ids]
+
+    views = repo.alert_views(HOST, 10)
+    assert [v.alert.id for v in views] == every[::-1]
+    by_id = {v.alert.id: v for v in views}
+    assert by_id[session_alert] == AlertView(
+        alert=repo.list_alerts(HOST, 1, before_id=day)[0], cwd="/home/someone/proj"
+    )
+    assert by_id[day].cwd is None
+    assert by_id[day].alert.session_id is None
+    assert by_id[no_cwd].cwd is None
+
+    # Older pages, newest first, below an exclusive cursor.
+    seen: list[int] = []
+    page = repo.alert_views(HOST, 3)
+    while page:
+        seen += [v.alert.id for v in page]
+        page = repo.alert_views(HOST, 3, before_id=page[-1].alert.id)
+    assert seen == every[::-1]
+    # Newer ones, oldest first, above an exclusive cursor: a client catches up in order.
+    seen = []
+    page = repo.alert_views(HOST, 3, after_id=0)
+    while page:
+        seen += [v.alert.id for v in page]
+        page = repo.alert_views(HOST, 3, after_id=page[-1].alert.id)
+    assert seen == every
+    assert [v.alert.id for v in repo.alert_views(HOST, 2, after_id=no_cwd)] == ids[:2]
+    assert repo.alert_views(HOST, 2, after_id=ids[-1]) == []
+    assert repo.alert_views(HOST, 0) == []
+    with pytest.raises(ValueError, match="not both"):
+        repo.alert_views(HOST, 2, before_id=ids[-1], after_id=0)
+
+
+def test_alert_views_are_capped_both_ways(repo: Repository) -> None:
+    with_sessions(repo)
+    row = {
+        "host": HOST,
+        "rule": "waiting_user",
+        "session_id": SESSION,
+        "subject": SESSION,
+        "fired_at_ms": BASE,
+        "value": 1.0,
+        "threshold": 1.0,
+        "discord_state": "none",
+    }
+    with repo.engine.begin() as connection:
+        connection.execute(insert(AlertModel), [row] * (ALERT_PAGE_MAX + 1))
+    assert len(repo.alert_views(HOST, 10_000)) == ALERT_PAGE_MAX
+    oldest = repo.alert_views(HOST, 10_000, after_id=0)
+    assert len(oldest) == ALERT_PAGE_MAX
+    assert oldest[0].alert.id < oldest[-1].alert.id
+
+
 def test_an_alert_page_is_capped(repo: Repository) -> None:
     with_sessions(repo)
     row = {
@@ -1444,6 +1507,7 @@ def test_alert_reads_run_on_the_readers_engine(repo: Repository) -> None:
     reader = reader_of(repo)
     try:
         assert reader.list_alerts(HOST, 10) == repo.list_alerts(HOST, 10) != []
+        assert reader.alert_views(HOST, 10) == repo.alert_views(HOST, 10) != []
         assert reader.due_deliveries(HOST, BASE, 10) == repo.due_deliveries(HOST, BASE, 10)
         assert reader.alert_keys(HOST, cooldown_since_ms=BASE) == repo.alert_keys(
             HOST, cooldown_since_ms=BASE

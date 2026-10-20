@@ -35,9 +35,12 @@
   </div>
 </header>
 <main id="main" class="page" tabindex="-1">
-{#- live.js opens the stream named by data-stream, when the page sets one, and says here
-    when live updates pause; empty (and hidden by the CSS) otherwise. -#}
-<div id="live-status" class="live-status" role="status"{% if live_stream is defined and live_stream %} data-stream="{{ live_stream }}"{% endif %}></div>
+{#- live.js opens the stream named by data-stream and says here when live updates pause;
+    empty (and hidden by the CSS) otherwise. Every page streams, so the alerts pings
+    reach any of them (ADR 0044): a page that names no stream of its own (a session
+    page filters on its session) gets the unfiltered one, and simply has nothing to
+    refetch on "changed". Without JavaScript nothing opens and the page works as is. -#}
+<div id="live-status" class="live-status" role="status" data-stream="{{ live_stream if live_stream is defined and live_stream else stream_path }}"></div>
 {% block content %}{% endblock %}
 </main>
 </body>

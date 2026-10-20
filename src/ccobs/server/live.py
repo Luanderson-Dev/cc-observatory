@@ -11,10 +11,13 @@ costs bounded memory however fast sessions change.
 ``GET /ui/stream`` (``?session=<id>`` to filter) is a ``text/event-stream``: first a
 ``retry: 5000`` line, then one ``event: changed`` per burst of changes, coalesced for
 ``COALESCE_S`` (``data: all`` or a JSON list of session IDs), and a comment every
-``HEARTBEAT_S`` while idle. It never reads the database: the page refetches its own
-fragments, through the read gate, when ``live.js`` turns the event into a
-``ccobs:changed`` event. At most ``MAX_STREAMS`` streams are open at once; one more gets
-a plain 503, which the metrics count (``UI_STREAMS_REFUSED``).
+``HEARTBEAT_S`` while idle. When an alert fires or clears, every stream, filtered or
+not, also gets one ``event: alerts`` per burst with a fixed ``data: alerts`` (ADR 0044):
+no alert, session or value, only "refetch the alerts". It never reads the database: the
+page refetches its own fragments, through the read gate, when ``live.js`` turns the
+``changed`` event into a ``ccobs:changed`` event. Every page of the UI opens a stream.
+At most ``MAX_STREAMS`` streams are open at once; one more gets a plain 503, which the
+metrics count (``UI_STREAMS_REFUSED``).
 
 A stream ends when the client goes away (Starlette cancels it) or when the hub closes.
 uvicorn waits for open connections before it runs the lifespan's shutdown, so the
@@ -44,6 +47,7 @@ from ccobs.domain.hooks import is_valid_session_id
 from ccobs.server.changes import ALL, AlertsChanged, Change, Everything, HubEvent
 
 __all__ = [
+    "ALERTS_EVENT",
     "ALL",
     "COALESCE_S",
     "HEARTBEAT_S",
@@ -64,7 +68,7 @@ __all__ = [
 _log = logging.getLogger(__name__)
 
 STREAM_PATH: Final = "/ui/stream"
-# Open streams at once, for the whole app: one per tab of the overview or a session page.
+# Open streams at once, for the whole app: one per tab of any page (ADR 0044).
 MAX_STREAMS: Final = 16
 # Session IDs a subscription keeps between two events before it says "all" instead.
 MAX_PENDING_IDS: Final = 64
@@ -75,6 +79,8 @@ COALESCE_S: Final = 0.25
 # How often an idle stream sends a comment, so that nothing between drops it as dead.
 HEARTBEAT_S: Final = 15.0
 _HEARTBEAT: Final = b": keep-alive\n\n"
+# The alerts ping: a fixed marker (an event with no data line is never dispatched).
+ALERTS_EVENT: Final = b"event: alerts\ndata: alerts\n\n"
 _RETRY_AFTER_S: Final = "5"
 _BAD_REQUEST: Final = 400
 _SERVICE_UNAVAILABLE: Final = 503
@@ -104,7 +110,9 @@ class Subscription:
         self._max_ids = max_ids
         self._release = release
         self._pending: set[str] | Everything = set()
-        # Set by a change and by close(); cleared by take().
+        # Whether an alert fired or cleared since the last alerts ping (ADR 0044).
+        self._alerts = False
+        # Set by a change, an alerts change and close(); cleared once both are taken.
         self._dirty = asyncio.Event()
         self._closed = asyncio.Event()
 
@@ -132,11 +140,30 @@ class Subscription:
                 self._pending = ALL
         self._dirty.set()
 
+    def offer_alerts(self) -> None:
+        """Note that the alerts changed: every subscription, whatever its session
+        filter, gets the next alerts ping (ADR 0044)."""
+        if self.closed:
+            return
+        self._alerts = True
+        self._dirty.set()
+
+    def take_alerts(self) -> bool:
+        """Whether the alerts changed since the last call, and start over. Stays dirty
+        while a session change is pending, which ``take`` returns."""
+        alerts = self._alerts
+        self._alerts = False
+        if not self._pending:
+            self._dirty.clear()
+        return alerts
+
     def take(self) -> Change:
-        """What changed since the last call, and start over."""
+        """What changed since the last call, and start over. Stays dirty while an
+        alerts change is pending, which ``take_alerts`` returns."""
         pending = self._pending
         self._pending = set()
-        self._dirty.clear()
+        if not self._alerts:
+            self._dirty.clear()
         return pending if isinstance(pending, Everything) else frozenset(pending)
 
     async def wait(self, timeout_s: float) -> bool:
@@ -210,8 +237,9 @@ class ChangeHub:
 
     def publish(self, change: HubEvent) -> None:
         if isinstance(change, AlertsChanged):
-            # No stream event for the alerts yet: the alerts API brings it (stage 8 of
-            # milestone 5). It is no session change, so no stream is marked.
+            # No session changed: every stream gets the alerts ping, filtered or not.
+            for subscription in list(self._subscriptions):
+                subscription.offer_alerts()
             return
         for subscription in list(self._subscriptions):
             subscription.offer(change)
@@ -256,7 +284,12 @@ async def stream_events(
             await subscription.settle(timing.coalesce_s)
             if subscription.closed:
                 return
-            yield encode_change(subscription.take())
+            alerts = subscription.take_alerts()
+            change = subscription.take()
+            if isinstance(change, Everything) or change:
+                yield encode_change(change)
+            if alerts:
+                yield ALERTS_EVENT
     finally:
         subscription.close()
 

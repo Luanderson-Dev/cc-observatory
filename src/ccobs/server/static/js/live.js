@@ -2,12 +2,13 @@
  * cc-observatory: live updates (ADR 0032). No inline code, no eval, no innerHTML, no
  * JavaScript dialogs (CSP, ADR 0034).
  *
- * A page that wants live updates gives #live-status a data-stream URL (/ui/stream, with
- * ?session= on a session page). This script opens one EventSource to it per tab, and on
+ * Every page gives #live-status a data-stream URL (/ui/stream, with ?session= on a
+ * session page; ADR 0044). This script opens one EventSource to it per tab, and on
  * each "changed" event dispatches a "ccobs:changed" event on document.body: the
- * elements that refetch (hx-trigger="ccobs:changed from:body") do the rest. Every
- * "open", the first one and each reconnection, dispatches it too, so the page catches up
- * on whatever changed while it was not listening; no Last-Event-ID is needed.
+ * elements that refetch (hx-trigger="ccobs:changed from:body") do the rest; a page with
+ * none simply refetches nothing. The stream's "alerts" pings are not handled here yet.
+ * Every "open", the first one and each reconnection, dispatches it too, so the page
+ * catches up on whatever changed while it was not listening; no Last-Event-ID is needed.
  *
  * On an error the source is closed, #live-status says that live updates are paused,
  * and the script opens a new source after a delay that doubles from 5 s up to 60 s and

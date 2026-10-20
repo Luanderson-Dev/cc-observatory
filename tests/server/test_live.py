@@ -265,23 +265,88 @@ def test_notify_threadsafe_reaches_subscribers_from_another_thread() -> None:
     assert run(body) == frozenset({SID})
 
 
-def test_an_alerts_change_marks_no_stream_until_the_alerts_have_an_event() -> None:
-    # The writer publishes ALERTS after a fire or a clear (ADR 0041); the streams'
-    # event for it comes with the alerts API (stage 8 of milestone 5), and until then
-    # it must neither reach nor break a session stream.
+def test_an_alerts_change_marks_every_stream_but_no_session() -> None:
+    # The writer publishes ALERTS after a fire or a clear (ADR 0041): every stream,
+    # filtered on a session or not, gets the alerts ping (ADR 0044), and no session is
+    # marked as changed.
     hub = ChangeHub()
 
-    async def body() -> tuple[bool, object]:
+    async def body() -> list[tuple[bool, bool, object, bool]]:
         hub.open(asyncio.get_running_loop())
-        subscription = hub.subscribe(None)
+        subscriptions = [hub.subscribe(None), hub.subscribe(SID), hub.subscribe(OTHER)]
+        hub.publish(ALERTS)
+        hub.publish(ALERTS)
+        seen: list[tuple[bool, bool, object, bool]] = []
+        for subscription in subscriptions:
+            assert subscription is not None
+            woke = await subscription.wait(1.0)
+            alerts = subscription.take_alerts()
+            change = subscription.take()
+            # Taken: nothing is pending until the next change.
+            seen.append((woke, alerts, change, await subscription.wait(0.01)))
+        return seen
+
+    assert run(body) == [(True, True, frozenset(), False)] * 3
+
+
+def test_taking_the_changes_keeps_the_alerts_pending_and_back() -> None:
+    hub = ChangeHub()
+
+    async def body() -> None:
+        hub.open(asyncio.get_running_loop())
+        subscription = hub.subscribe(SID)
         assert subscription is not None
         hub.publish(ALERTS)
-        quiet = not await subscription.wait(0.05)
         hub.publish(frozenset({SID}))
-        assert await subscription.wait(2.0)
-        return quiet, subscription.take()
+        assert subscription.take() == frozenset({SID})
+        # The alerts are still pending, so the stream still wakes for them.
+        assert await subscription.wait(0.5)
+        assert subscription.take_alerts()
+        assert not subscription.take_alerts()
+        assert not await subscription.wait(0.01)
 
-    assert run(body) == (True, frozenset({SID}))
+        hub.publish(frozenset({SID}))
+        hub.publish(ALERTS)
+        assert subscription.take_alerts()
+        assert await subscription.wait(0.5)
+        assert subscription.take() == frozenset({SID})
+        assert not await subscription.wait(0.01)
+
+    run(body)
+
+
+def test_a_stream_pings_alerts_without_data_and_apart_from_the_changes() -> None:
+    hub = ChangeHub()
+
+    async def body() -> list[bytes]:
+        hub.open(asyncio.get_running_loop())
+        subscription = hub.subscribe(SID)
+        assert subscription is not None
+        stream = live.stream_events(subscription, FAST)
+        chunks = [await anext(stream)]
+        # Alerts alone: the ping, no changed event.
+        waiting = asyncio.ensure_future(anext(stream))
+        await asyncio.sleep(0)
+        hub.publish(ALERTS)
+        chunks.append(await waiting)
+        # A change and alerts in one burst: the changed event, then the ping.
+        waiting = asyncio.ensure_future(anext(stream))
+        await asyncio.sleep(0)
+        hub.publish(ALERTS)
+        hub.publish(frozenset({SID}))
+        chunks.append(await waiting)
+        chunks.append(await anext(stream))
+        await stream.aclose()
+        return chunks
+
+    assert run(body) == [
+        b"retry: 5000\n\n",
+        live.ALERTS_EVENT,
+        f'event: changed\ndata: ["{SID}"]\n\n'.encode(),
+        live.ALERTS_EVENT,
+    ]
+    # A fixed marker: nothing about the alert, its session or its value.
+    assert live.ALERTS_EVENT == b"event: alerts\ndata: alerts\n\n"
 
 
 def test_notify_threadsafe_schedules_nothing_without_subscribers_or_a_loop() -> None:
@@ -318,7 +383,9 @@ def test_a_closed_subscription_ignores_changes() -> None:
         assert subscription is not None
         subscription.close()
         subscription.offer(frozenset({SID}))
+        subscription.offer_alerts()
         assert subscription.take() == frozenset()
+        assert not subscription.take_alerts()
 
     run(body)
 
@@ -438,6 +505,22 @@ def test_a_session_stream_skips_other_sessions(client: TestClient) -> None:
     response = stream(client, f"{live.STREAM_PATH}?session={SID}", during=during)
 
     assert response.text == f'retry: 5000\n\nevent: changed\ndata: ["{SID}"]\n\n'
+
+
+@pytest.mark.parametrize("url", [live.STREAM_PATH, f"{live.STREAM_PATH}?session={SID}"])
+def test_the_alerts_ping_reaches_every_stream(client: TestClient, url: str) -> None:
+    def during(hub: ChangeHub) -> None:
+        hub.notify_threadsafe(ALERTS)
+        time.sleep(SETTLE_S)
+        hub.notify_threadsafe(frozenset({SID}))
+        time.sleep(SETTLE_S)
+
+    response = stream(client, url, during=during)
+
+    # The ping carries a fixed marker only; the changed event is as before.
+    assert response.text == (
+        f'retry: 5000\n\nevent: alerts\ndata: alerts\n\nevent: changed\ndata: ["{SID}"]\n\n'
+    )
 
 
 def test_heartbeats_keep_an_idle_stream_open(settings: Settings) -> None:

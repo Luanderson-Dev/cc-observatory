@@ -233,6 +233,8 @@ _environment: Final = Environment(
     lstrip_blocks=True,
     keep_trailing_newline=True,
 )
+# The stream of a page that names none of its own: every page streams (ADR 0044).
+_environment.globals["stream_path"] = STREAM_PATH
 
 
 # View objects: what the templates see.

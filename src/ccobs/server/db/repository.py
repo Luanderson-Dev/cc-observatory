@@ -9,7 +9,8 @@ tables, and the bookkeeping no table holds comes from ``session_state``.
 
 The alerts and the alert settings saved on the settings screen have their own reads and
 writes (ADR 0042). Every write goes through the writer's engine; the API's reads
-(``list_alerts``, ``alert_settings``) run on the readers' engine (ADR 0033).
+(``list_alerts``, ``alert_views``, ``alert_settings``) run on the readers' engine (ADR
+0033).
 """
 
 from __future__ import annotations
@@ -99,6 +100,7 @@ __all__ = [
     "AgentPage",
     "AlertRecord",
     "AlertSettingValue",
+    "AlertView",
     "Applied",
     "BoardRows",
     "HookEventRow",
@@ -303,6 +305,16 @@ class AlertRecord:
     discord_state: DiscordState
     discord_attempts: int
     discord_next_at_ms: int | None
+
+
+@dataclass(frozen=True, kw_only=True)
+class AlertView:
+    """An alert as the API shows it: its row and the ``cwd`` of its session, ``None`` for
+    ``daily_cost`` or a session with none. The API turns ``cwd`` into the project name
+    (ADR 0044); neither table stores a project name (ADR 0042)."""
+
+    alert: AlertRecord
+    cwd: str | None
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -598,6 +610,40 @@ class Repository:
         statement = statement.order_by(AlertModel.id.desc()).limit(_capped(limit, ALERT_PAGE_MAX))
         with self.engine.connect() as connection:
             return [_alert(row) for row in connection.execute(statement).mappings()]
+
+    def alert_views(
+        self,
+        host: str,
+        limit: int,
+        *,
+        before_id: int | None = None,
+        after_id: int | None = None,
+    ) -> list[AlertView]:
+        """The host's alerts with their session's ``cwd``, at most ``limit`` and
+        ``ALERT_PAGE_MAX``, by keyset on ``id`` (ADR 0044): with no cursor, the latest,
+        newest first; below ``before_id``, the next older ones, newest first; above
+        ``after_id``, the next newer ones, oldest first, so a client that catches up
+        page by page never skips one. Cursors are exclusive; not both at once."""
+        if before_id is not None and after_id is not None:
+            raise ValueError("before_id or after_id, not both")
+        session_cwd = SessionModel.cwd.label("session_cwd")
+        statement = (
+            select(AlertModel.__table__, session_cwd)
+            .outerjoin(SessionModel, SessionModel.session_id == AlertModel.session_id)
+            .where(AlertModel.host == host)
+        )
+        if after_id is not None:
+            statement = statement.where(AlertModel.id > after_id).order_by(AlertModel.id)
+        else:
+            if before_id is not None:
+                statement = statement.where(AlertModel.id < before_id)
+            statement = statement.order_by(AlertModel.id.desc())
+        statement = statement.limit(_capped(limit, ALERT_PAGE_MAX))
+        with self.engine.connect() as connection:
+            return [
+                AlertView(alert=_alert(row), cwd=row["session_cwd"])
+                for row in connection.execute(statement).mappings()
+            ]
 
     def due_deliveries(self, host: str, now_ms: int, limit: int) -> list[AlertRecord]:
         """The host's ``pending`` Discord deliveries due at ``now_ms``, the earliest due

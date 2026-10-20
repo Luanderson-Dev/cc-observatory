@@ -77,8 +77,8 @@ Code. Until Claude Code sends hooks to the app, the overview shows how to connec
   settings for that port under "Connect one session without changing your settings",
   ready to save for `claude --settings`.
 - **All sessions** (`GET /sessions`): every stored session as a strip, the latest
-  activity first, 50 per page; "Older sessions" pages on with a cursor. It has no live
-  updates; reload it.
+  activity first, 50 per page; "Older sessions" pages on with a cursor. It does not
+  refresh itself; reload it.
 - **Session** (`GET /sessions/{session_id}`, the link of each strip): a header with the
   project name, the working directory with your home directory shown as `~`, the state
   in words, how long the session has waited on you, its last error code, when it
@@ -216,6 +216,13 @@ The overview and the session page follow your sessions without a reload
   seconds. The page then refetches its own parts: the overview its board, the session
   page its header, blocks and agents, and the new rows of its timeline. A change shows
   up once the writer commits it, normally within tens of milliseconds of the hook.
+- From v0.6.0 every other page (All sessions, Session not found, the error pages) opens
+  the same stream too, unfiltered, so that alerts can reach any open tab
+  ([ADR 0044](adr/0044-alerts-reach-the-browser.md)); those pages have nothing to
+  refetch. When an alert fires or clears, every stream also gets an `alerts` event with
+  no data but a fixed marker; the page then reads the alerts from
+  [the JSON API](#the-json-api). Without JavaScript no stream opens and every page works
+  as before.
 - Older pages you loaded with "Show older ..." stay as they are; new and newly closed
   rows appear above them, and a block or agent the page showed open or running stays
   on it once it closes (up to 8 of each that sit below the older pages). After 200 such
@@ -229,8 +236,9 @@ The overview and the session page follow your sessions without a reload
   "Live updates paused. Reconnecting…" and tries again after 5 seconds, then 10, 20 and
   so on up to a minute, until it connects; then the message goes away (see
   [Troubleshooting](#live-updates-paused-reconnecting)).
-- The app serves at most 16 streams at once, for all tabs and browsers together; the
-  17th gets a 503, and that tab shows the paused message and retries.
+- The app serves at most 16 streams at once, for all tabs and browsers together (every
+  page counts, from v0.6.0); the 17th gets a 503, and that tab shows the paused message
+  and retries.
 - The stream is read-only, never reads the database, and answers only the app's own
   pages: another site, Grafana included, gets a 403 (see [Browser defences](#browser-defences)).
 
@@ -499,6 +507,20 @@ reads at once, so readers never hold up the writer
 read that waits more than 5 seconds for a free connection gets a 503 with
 `{"detail": "database busy"}`, and can simply be retried.
 
+From v0.6.0, `GET /api/v1/alerts`
+([ADR 0044](adr/0044-alerts-reach-the-browser.md)) lists the alerts that fired, newest
+first: `id`, `rule` (`waiting_user`, `repeated_failures`, `session_cost`,
+`daily_cost`), `subject_kind` (`session`, or `day` for `daily_cost`), `session_id`
+(`null` for a daily alert), `project` (the session's project name, never its `cwd`;
+`null` for a daily alert or a session without one), `fired_at_ms`, `cleared_at_ms`
+(`null` while it fires), and `value` and `threshold` in the rule's unit (seconds,
+failures or US dollars). How its Discord delivery stands is not served. It takes
+`limit` (default 50, from 1 to 500) and one cursor, an alert `id`, exclusive: `before`
+returns the next older alerts, newest first; `after` returns the next newer ones,
+oldest first, which is how the browser catches up from the last `id` it saw, page by
+page until one comes back empty. Unlike the session routes, the default order is newest
+first. `before` and `after` together, or outside 0 to 2^63 - 1, are a 422.
+
 From v0.5.0, `GET /api/v1/diagnostics`
 ([ADR 0038](adr/0038-a-diagnostics-endpoint-for-ccobs-doctor-and-status.md)) gives the
 app's state for `ccobs doctor` and `ccobs status` ([cli.md](cli.md)), as counts only:
@@ -529,6 +551,8 @@ curl -s 'http://127.0.0.1:4300/api/v1/sessions/<session_id>/events?limit=100'
 curl -s 'http://127.0.0.1:4300/api/v1/sessions/<session_id>/events?after_seq=<seq>'
 curl -s 'http://127.0.0.1:4300/api/v1/sessions/<session_id>/blocks?before=<block_id>'
 curl -s 'http://127.0.0.1:4300/api/v1/sessions/<session_id>/agents?before=<agent_id>'
+curl -s 'http://127.0.0.1:4300/api/v1/alerts?limit=10'
+curl -s 'http://127.0.0.1:4300/api/v1/alerts?after=<id>'
 curl -s 'http://127.0.0.1:4300/api/v1/diagnostics'
 curl -s 'http://127.0.0.1:4300/healthz'      # {"status":"ok"}
 ~~~
@@ -835,12 +859,12 @@ page to retry at once.
 
 - **The app is down or restarting**: `docker compose ps app` should say `healthy`; see
   [The app is unhealthy](#the-app-is-unhealthy-or-keeps-restarting).
-- **Too many streams**: the app serves 16 at once, one per overview or session tab, for
-  every browser together. `ccobs_ui_streams` shows how many are open and
+- **Too many streams**: the app serves 16 at once, one per tab of any page of the app
+  (from v0.6.0; before, only overview and session tabs), for every browser together. `ccobs_ui_streams` shows how many are open and
   `ccobs_ui_streams_refused_total` how many were refused; the log says
   `live stream refused`. Close tabs you do not need.
 - **Many tabs in one browser**: browsers open at most about 6 connections to one host
-  over HTTP/1.1, and each tab with live updates holds one. With six or more such tabs,
+  over HTTP/1.1, and each tab of the app holds one (from v0.6.0, every page streams). With six or more such tabs,
   other requests to the app (pages, refetches) wait for a free connection and the pages
   look frozen. Close some tabs, or open the extra ones as `127.0.0.1:4300` and
   `localhost:4300`, which browsers count as two hosts.
@@ -924,7 +948,7 @@ measurement, or unverified.
 - **Live updates** (by design): at most 16 streams at once; each change costs every open
   overview tab one read and every session tab two, coalesced over a quarter of a second.
   A strip that changes bay moves without an animation. A browser holds about 6
-  connections to one host, so six or more live tabs in one browser stall each other.
+  connections to one host, so six or more tabs of the app in one browser stall each other.
 - **Tokens and cost** (by design,
   [ADR 0035](adr/0035-per-session-tokens-and-cost-from-prometheus-and-grafana-links.md)):
   per session only, on the session page; totals across sessions are on Grafana's
