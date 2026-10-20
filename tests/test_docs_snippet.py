@@ -6,8 +6,8 @@
   ``{"env": telemetry_env()}``: the first ``json`` code block after the
   ``telemetry-env`` marker comment.
 
-Until ``ccobs setup`` writes them (milestone 4), users copy the snippets by hand, so they
-must be exactly the blocks ``ccobs setup`` will write, keys in the same order.
+``ccobs setup`` writes these blocks; users who set them by hand copy the snippets, so
+they must be exactly the blocks ``ccobs setup`` writes, keys in the same order.
 """
 
 from __future__ import annotations

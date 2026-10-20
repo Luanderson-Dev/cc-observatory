@@ -245,6 +245,8 @@ tools/stack/      dev-only stack tools (not packaged): OTLP replay, isolated cco
 docs/stack.md     operator reference for the stack (settings, memory, troubleshooting)
 docs/app.md       operator reference for the app (web UI, hook settings, API, metrics,
                   data, troubleshooting)
+docs/cli.md       operator reference for the ccobs commands (setup, uninstall, doctor,
+                  status, troubleshooting)
 docs/adr/         architecture decision records (MADR)
 .claude/agents/   project subagents
 ```

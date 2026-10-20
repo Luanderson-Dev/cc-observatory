@@ -110,12 +110,7 @@ Grafana ◄── Prometheus, Loki, Tempo (provisioned datasources and dashboard
 More detail for contributors is in [docs/architecture.md](https://github.com/Luanderson-Dev/cc-observatory/blob/main/docs/architecture.md).
 The decisions behind this design, and their reasons, are recorded as architecture decision records in [docs/adr/](https://github.com/Luanderson-Dev/cc-observatory/blob/main/docs/adr/README.md).
 
-## Run the observability stack (from v0.2.0)
-
-From v0.2.0 you can run the observability stack from a clone of this repository and see
-Claude Code's metrics and events in Grafana. From v0.3.0 the stack also runs the app
-(hooks, sessions and blocks; see "Try the app" below), and from v0.4.0 the app's web UI.
-`ccobs setup` comes in v0.5.0, so until then you point Claude Code at the stack by hand.
+## Quick start (from v0.5.0)
 
 1. Start the stack:
 
@@ -126,20 +121,61 @@ Claude Code's metrics and events in Grafana. From v0.3.0 the stack also runs the
    ~~~
 
    The first start downloads about 750 MB of images and builds the collector's and the
-   app's images. `docker compose ps` shows each service and whether it is healthy. To
-   also store Claude Code's traces, a beta feature, start it with
-   `docker compose --profile traces up -d`, which adds Tempo, and pass
-   `--profile traces` every time you start or update the stack.
+   app's images. `docker compose ps` shows each service and whether it is healthy.
+
+2. Connect Claude Code to it:
+
+   ~~~bash
+   uvx cc-observatory setup
+   ~~~
+
+   `setup` backs up your user settings (`~/.claude/settings.json`) and adds the hooks
+   and the telemetry `env` block to them, keeping your own entries. It records what it
+   added, so that `ccobs uninstall` removes only that; `--dry-run` shows the diff without
+   writing anything, and running it again is safe.
+
+3. Start a new Claude Code session. The hooks reach the sessions already open at once,
+   but telemetry (tokens, cost, events) starts only in sessions started after `setup`,
+   so restart the ones you want to see in full.
+
+4. Open the app at <http://127.0.0.1:4300>, the address `setup` prints, and Grafana at
+   <http://localhost:4330>.
+
+If nothing shows up, run `uvx cc-observatory doctor`: it checks Claude Code, your
+settings, the policies that can block hooks or telemetry, and the stack, and says how to
+fix what it finds. `uvx cc-observatory status` is the short version.
+
+- **The CLI.** `ccobs` and `cc-observatory` are the same CLI: `uvx cc-observatory
+  <command>` runs it without installing it, and `uv tool install cc-observatory`
+  installs it as `ccobs`. [docs/cli.md](https://github.com/Luanderson-Dev/cc-observatory/blob/main/docs/cli.md) covers `setup`, `uninstall`,
+  `doctor` and `status`, their options and exit codes, and troubleshooting.
+- **Without changing your settings.** To connect one session only, start Claude Code
+  with the hooks in a file of their own, `claude --settings <file>`, as
+  [docs/app.md](https://github.com/Luanderson-Dev/cc-observatory/blob/main/docs/app.md#point-claude-code-at-the-app) shows.
+- **Undo.** `uvx cc-observatory uninstall` takes out what `setup` added and puts back
+  any value it replaced. The stack keeps running until `docker compose down`.
+
+## Run the observability stack (from v0.2.0)
+
+From v0.2.0 you can run the observability stack from a clone of this repository and see
+Claude Code's metrics and events in Grafana. From v0.3.0 the stack also runs the app
+(hooks, sessions and blocks; see "Try the app" below), and from v0.4.0 the app's web UI.
+
+1. Start the stack as in the quick start. To also store Claude Code's traces, a beta
+   feature, start it with `docker compose --profile traces up -d`, which adds Tempo, and
+   pass `--profile traces` every time you start or update the stack.
 
 2. Open Grafana at <http://localhost:4330>. Use `localhost`: Grafana redirects any other
    host name, `127.0.0.1` included, there. There is no login. The home page is the
    **Claude Code overview** dashboard: cost, tokens, sessions, active time, code
    changes, API errors and recent events.
 
-3. Point Claude Code at the stack. Add these variables to the `env` block of your user
-   settings, `~/.claude/settings.json`, keeping the entries you already have, or export
-   them in the shell that starts Claude Code. Project settings
-   (`.claude/settings.json` and `.claude/settings.local.json`) cannot set them.
+3. Point Claude Code at the stack. `ccobs setup` writes these variables into the `env`
+   block of your user settings, `~/.claude/settings.json` (`--traces` adds the two trace
+   variables below, `--otlp-port` changes the port). To set them by hand instead, add
+   them to that block, keeping the entries you already have, or export them in the shell
+   that starts Claude Code. Project settings (`.claude/settings.json` and
+   `.claude/settings.local.json`) cannot set them.
 
    <!-- telemetry-env: telemetry_env(), kept equal by tests/test_docs_snippet.py -->
 
@@ -166,11 +202,12 @@ Claude Code's metrics and events in Grafana. From v0.3.0 the stack also runs the
    - Leave `OTEL_METRICS_INCLUDE_SESSION_ID` at its default (`true`): without session
      IDs, the series of concurrent sessions collide.
    - For traces, also set `CLAUDE_CODE_ENHANCED_TELEMETRY_BETA` to `1` and
-     `OTEL_TRACES_EXPORTER` to `otlp`, and run the stack with `--profile traces`.
+     `OTEL_TRACES_EXPORTER` to `otlp` (or run `ccobs setup --traces`), and run the stack
+     with `--profile traces`.
 
 4. Restart Claude Code so that new sessions load the settings. Metrics arrive every 60
    seconds and events every 5 seconds, and the dashboard refreshes every minute. If
-   nothing shows up, see
+   nothing shows up, run `ccobs doctor`, or see
    [No data in the dashboard](https://github.com/Luanderson-Dev/cc-observatory/blob/main/docs/stack.md#no-data-in-the-dashboard).
 
 - **Settings.** Every setting is an environment variable with a default, so a `.env`
@@ -180,7 +217,8 @@ Claude Code's metrics and events in Grafana. From v0.3.0 the stack also runs the
   `local`) is the `host` label stored on every metric, event and trace; set it to name
   the machine. It is stored as you write it, so use the machine's real host name only if
   you want it stored. The ports and the retention (by default 90 days of metrics, 30 of
-  events and 7 of traces) are set the same way.
+  events and 7 of traces) are set the same way. If you move a port, pass the same port
+  to `ccobs` (`--app-port`, `--otlp-port`, `--grafana-port`).
 - **After a reboot.** The services restart unless you stop them with
   `docker compose stop`, so the stack comes back whenever Docker starts
   ([ADR 0019](https://github.com/Luanderson-Dev/cc-observatory/blob/main/docs/adr/0019-restart-unless-stopped.md)).
@@ -201,24 +239,16 @@ address; it also serves them as a read-only JSON API.
 1. Start or update the stack as above. `docker compose ps` shows `app` as healthy once
    it serves requests.
 
-2. Point Claude Code at the app. Until `ccobs setup` writes the hooks for you in v0.5.0,
-   save the hooks block from
-   [docs/app.md](https://github.com/Luanderson-Dev/cc-observatory/blob/main/docs/app.md#point-claude-code-at-the-app)
-   as `ccobs-hooks.json` in your home directory (on Windows, change `/dev/null` to `NUL`
-   in it, as that page explains), and start Claude Code with it:
-
-   ~~~bash
-   claude --settings "$HOME/ccobs-hooks.json"
-   ~~~
-
-   Your `~/.claude/settings.json` stays as it is, and only the sessions you start this
-   way send hooks. The hook URL uses `127.0.0.1`, not `localhost`.
+2. Point Claude Code at the app: `ccobs setup` writes the hooks (see the quick start).
+   The hook URL uses `127.0.0.1`, not `localhost`. To send the hooks of one session only,
+   without changing your settings, use the hooks file and `claude --settings` of
+   [docs/app.md](https://github.com/Luanderson-Dev/cc-observatory/blob/main/docs/app.md#point-claude-code-at-the-app).
 
 3. Open <http://127.0.0.1:4300> in your browser. The overview shows your sessions in
    bays by state, the ones waiting on you first, and follows them live; click a session
    for its blocks, agents, tokens and cost, and hook timeline, and for links to its logs
-   and usage in Grafana. Until the first session arrives, the overview shows the hook
-   settings from step 2. The same data is in the JSON API:
+   and usage in Grafana. Until the first session arrives, the overview shows the
+   `ccobs setup` command for its port. The same data is in the JSON API:
 
    ~~~bash
    curl -s http://127.0.0.1:4300/api/v1/sessions
@@ -227,56 +257,26 @@ address; it also serves them as a read-only JSON API.
    Each session has its state (`working`, `waiting_user`, `idle`, `ended` or `stale`),
    and `/api/v1/sessions/<session_id>` adds its agents and blocks.
 
-- **Stack down.** While the stack is down, sessions started with these hooks show a
-  hook-error notice in the transcript on most hook events; start Claude Code without
-  `--settings` until the stack is back.
+- **Stack down.** While the stack is down, Claude Code shows a hook-error notice in the
+  transcript on most hook events; start the stack, or run `ccobs uninstall` to take the
+  hooks out until it is back.
 - **Esc denials, tokens and cost.** A permission prompt denied with Esc fires no hook;
   the app closes it from Claude Code's events in Loki. A session's tokens and cost come
-  from Claude Code's metrics in Prometheus. Both need the telemetry settings from step 3
-  of the previous section.
+  from Claude Code's metrics in Prometheus. Both need the telemetry settings that
+  `ccobs setup` writes (step 3 of the previous section).
 - **More.** [docs/app.md](https://github.com/Luanderson-Dev/cc-observatory/blob/main/docs/app.md)
   covers the web UI, the API, the app's metrics in Grafana, its settings and retention,
   privacy and troubleshooting.
-
-## Quick start (planned, available from v0.5.0)
-
-**Not available yet.** Step 1 works from v0.2.0 (see the section above); steps 2 to 4
-need the `setup` command, which arrives in v0.5.0.
-
-1. Start the stack:
-
-   ~~~bash
-   git clone https://github.com/Luanderson-Dev/cc-observatory
-   cd cc-observatory
-   docker compose up -d
-   ~~~
-
-2. Connect Claude Code to it:
-
-   ~~~bash
-   uvx cc-observatory setup
-   ~~~
-
-   `setup` backs up `~/.claude/settings.json` and merges in the telemetry `env` block
-   and the hooks without touching your existing entries, marking what it adds so that
-   `ccobs uninstall` removes only that; `--dry-run` shows the diff without writing
-   anything.
-
-3. Open the app at the address that `setup` prints.
-4. Restart Claude Code so that new sessions load the new settings.
-
-`ccobs` and `cc-observatory` are the same CLI; `uvx cc-observatory <command>` runs it
-without installing it.
 
 ## Privacy
 
 - **Metadata only by default.** Prompt text, tool inputs and outputs, assistant messages
   and error text are not stored.
-- **Content capture is an explicit opt-in** (planned for v0.5.0).
-  `ccobs setup --capture-content` shows a warning and then turns content capture on in
-  Claude Code's telemetry settings and in the stack (the collector and the app). Without
-  it, the collector drops content from the telemetry even if Claude Code was set to send
-  it.
+- **No content capture yet.** `ccobs setup` never turns content capture on, and the
+  collector drops content from the telemetry even if Claude Code was set to send it;
+  `ccobs doctor` warns when Claude Code's content variables are on. The explicit opt-in
+  to keep content is deferred to a later release
+  ([ADR 0040](https://github.com/Luanderson-Dev/cc-observatory/blob/main/docs/adr/0040-defer-the-capture-content-opt-in.md)).
 - **Personal attributes are removed.** The collector deletes your email address, your
   user, account and organization IDs and your machine's host name from the telemetry
   before anything is stored.
@@ -333,8 +333,8 @@ can still do, and how to report a vulnerability.
 - Tested on Linux and on Windows 11 with Docker Desktop, both on amd64; macOS and arm64
   have not been tested. Details are in
   [docs/stack.md](https://github.com/Luanderson-Dev/cc-observatory/blob/main/docs/stack.md#requirements).
-- [uv](https://docs.astral.sh/uv/), for the `ccobs` CLI (`uvx cc-observatory`), whose
-  commands arrive in v0.5.0.
+- [uv](https://docs.astral.sh/uv/), for the `ccobs` CLI (`uvx cc-observatory`; see
+  [docs/cli.md](https://github.com/Luanderson-Dev/cc-observatory/blob/main/docs/cli.md)).
 - Claude Code 2.1.296 or later. That is the version cc-observatory was tested against
   ([ADR 0012](https://github.com/Luanderson-Dev/cc-observatory/blob/main/docs/adr/0012-observed-telemetry-and-hook-contract.md));
   older versions are not supported until they are tested.

@@ -5,7 +5,8 @@
 # (ADR 0006, ADR 0021):
 #   - transform/identity always deletes identity attributes;
 #   - filter/content and transform/content drop content while content capture is off.
-#     Milestone 4 turns the opt-in on by taking these two out of the pipelines.
+#     The opt-in is deferred (ADR 0040); the ADR that brings it decides how it takes
+#     these two out of the pipelines.
 # The privacy processors fail closed (error_mode: propagate): a statement error refuses
 # the batch instead of passing it on unfiltered. OTTL paths carry their context prefix
 # (resource., datapoint., log., span., spanevent.), as 0.162.0 expects, and an OTTL

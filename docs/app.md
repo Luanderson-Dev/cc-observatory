@@ -3,7 +3,8 @@
 A reference for operating the app, from v0.3.0 (its web UI from v0.4.0): what it does,
 what its pages show, how to point Claude Code at it, what it stores and serves, its
 settings, and what to check when something goes wrong. [stack.md](stack.md) covers the
-compose stack it runs in; the decisions behind the app are ADRs 0023 to 0035 in
+compose stack it runs in, and [cli.md](cli.md) the `ccobs` commands; the decisions
+behind the app are ADRs 0023 to 0035, and 0038 for its diagnostics route, in
 [`adr/`](adr/README.md), and this page links to them instead of repeating their reasons.
 
 Commands run from the repository root, where `compose.yaml` is, in bash (Git Bash on
@@ -41,8 +42,9 @@ The app is the `app` service of the compose stack, a FastAPI process
 - exports its live state as Prometheus metrics on a separate listener that Prometheus
   scrapes ([ADR 0028](adr/0028-app-metrics-and-their-listener.md)).
 
-`ccobs setup`, which writes the hooks into Claude Code's settings for you, comes in
-v0.5.0; until then, see [Point Claude Code at the app](#point-claude-code-at-the-app).
+`ccobs setup` writes the hooks into Claude Code's user settings for you
+([cli.md](cli.md)); [Point Claude Code at the app](#point-claude-code-at-the-app) shows
+what it writes, and how to connect one session without changing your settings.
 
 `docker compose up -d` builds the app's image on the first start and whenever the source
 changes, then starts it at <http://127.0.0.1:4300> (the port is `CCOBS_APP_PORT`).
@@ -57,8 +59,8 @@ server-rendered HTML with htmx and files that ship with the app: it loads nothin
 another origin, works offline and, like the rest of the app, has no login
 ([ADR 0031](adr/0031-server-rendered-pages-with-htmx-and-vendored-assets.md)). It is
 read-only: it shows what the app stored and changes nothing, in the app or in Claude
-Code. Until Claude Code sends hooks to the app, the overview shows the hook settings to
-save (see [Point Claude Code at the app](#point-claude-code-at-the-app)).
+Code. Until Claude Code sends hooks to the app, the overview shows how to connect it
+(see [Point Claude Code at the app](#point-claude-code-at-the-app)).
 
 ### Pages
 
@@ -69,8 +71,11 @@ save (see [Point Claude Code at the app](#point-claude-code-at-the-app)).
   the rest. A strip shows the project name (the last part of the session's working
   directory, never the whole path), what the session does or waits on, its running
   subagents and its last error code. The page title counts the sessions waiting on you,
-  such as `(2) cc-observatory`. With no session stored yet, the board shows the hook
-  settings for the port you opened it on, ready to save for `claude --settings`.
+  such as `(2) cc-observatory`. With no session stored yet, the board shows the
+  `ccobs setup` command to copy (with `--app-port` when you opened the app on a port
+  other than 4300), points to `ccobs doctor` if nothing shows up, and keeps the hook
+  settings for that port under "Connect one session without changing your settings",
+  ready to save for `claude --settings`.
 - **All sessions** (`GET /sessions`): every stored session as a strip, the latest
   activity first, 50 per page; "Older sessions" pages on with a cursor. It has no live
   updates; reload it.
@@ -235,17 +240,24 @@ The hook URL is `http://127.0.0.1:4300/hooks`. Use `127.0.0.1`, not `localhost`:
 stack publishes its ports on IPv4 loopback only, and `localhost` can resolve to `::1`,
 where nothing listens ([ADR 0018](adr/0018-ports-networks-and-exposure.md),
 [ADR 0025](adr/0025-registered-hook-events.md)). If you move `CCOBS_APP_PORT`, change
-the port in every URL below.
+the port in every URL below, and pass `--app-port` to `ccobs`.
 
-Until `ccobs setup` arrives in v0.5.0, put the hooks in a file of their own and pass it
-with `claude --settings`, so your `~/.claude/settings.json` stays as it is. Claude Code
-merges hook entries across settings levels, so the hooks you already have keep running
-next to these, in the sessions you start with the flag only
+`ccobs setup` writes these hooks, and the telemetry variables, into your user settings,
+`~/.claude/settings.json`, next to the entries you already have
+([cli.md](cli.md#ccobs-setup)): every Claude Code session then sends hooks, the ones
+already open included. That is the usual way.
+
+### Connect one session without changing your settings
+
+To send the hooks of some sessions only, and leave your `~/.claude/settings.json` as
+it is, put the hooks in a file of their own and pass it with `claude --settings`.
+Claude Code merges hook entries across settings levels, so the hooks you already have
+keep running next to these, in the sessions you start with the flag only
 ([CLI reference](https://code.claude.com/docs/en/cli-reference),
 [hooks reference](https://code.claude.com/docs/en/hooks)).
 
 1. Save this as `ccobs-hooks.json` somewhere outside any repository, for example in your
-   home directory. It is the block that `ccobs setup` will write, generated from
+   home directory. It is the block that `ccobs setup` writes, generated from
    `ccobs.domain.hook_config.hook_settings`, and a test keeps this copy equal to it:
 
    <!-- hook-settings: hook_settings(DEFAULT_HOOK_URL, windows=False),
@@ -334,9 +346,9 @@ next to these, in the sessions you start with the flag only
    ~~~
 
    Sessions started without the flag send no hooks to the app. Telemetry (tokens, cost,
-   events) is set separately, in the `env` block of your user settings, as the README's
-   "Run the observability stack" section shows; the Esc-denial close below needs those
-   events.
+   events) is set separately, in the `env` block of your user settings, which
+   `ccobs setup` writes, or by hand as the README's "Run the observability stack"
+   section shows; the Esc-denial close below needs those events.
 
 3. Check that the app received the session: open <http://127.0.0.1:4300>, where it shows
    on the overview, or ask the API:
@@ -347,7 +359,7 @@ next to these, in the sessions you start with the flag only
 
 ### Which events, and why
 
-The file registers 15 events as `http` hooks with a 1-second timeout, plus
+The hooks register 15 events as `http` hooks with a 1-second timeout, plus
 `SessionStart` as an async `curl` command, since `SessionStart` accepts no `http` hook:
 the events the state machine needs, and no others. Every handler has a short explicit
 timeout, and none has `onFailure`, `statusMessage` or a matcher. The events that would
@@ -364,7 +376,9 @@ model. The async `SessionStart` hook fails silently. While the app is up it answ
 every hook with an empty 204, so no hook becomes a notice; if the app hangs, Claude Code
 cancels each hook after 1 second. That trade-off, and how cc-observatory keeps it small,
 is [ADR 0011](adr/0011-hook-delivery-http-plus-async-sessionstart.md). If you stop the
-stack for a while, start Claude Code without `--settings` and nothing is posted.
+stack for a while, run `ccobs uninstall` (the hooks stop in open sessions at once, and
+`ccobs setup` puts them back), or, with the hooks file, start Claude Code without
+`--settings`, and nothing is posted.
 
 ## Sessions, agents and blocks
 
@@ -485,6 +499,29 @@ reads at once, so readers never hold up the writer
 read that waits more than 5 seconds for a free connection gets a 503 with
 `{"detail": "database busy"}`, and can simply be retried.
 
+From v0.5.0, `GET /api/v1/diagnostics`
+([ADR 0038](adr/0038-a-diagnostics-endpoint-for-ccobs-doctor-and-status.md)) gives the
+app's state for `ccobs doctor` and `ccobs status` ([cli.md](cli.md)), as counts only:
+no session ID, path or content.
+
+- `version` (the app's cc-observatory version), `host` (the host label) and
+  `started_at_ms`, when the app started, since the counters below count from then;
+- `sessions`: `by_state`, a count for each of `working`, `waiting_user`, `idle`,
+  `ended` and `stale`, and `open_blocks`, the blocks not closed;
+- `hooks`: `received`, the hooks parsed by event (`other` for events not registered),
+  and `dropped`, the hooks dropped by reason (see [Metrics](#metrics)), every event and
+  reason listed with 0 when none. Each `ccobs doctor` run adds one `invalid` drop: its
+  probe of the hook route posts `{}`;
+- `hook_failures`: Claude Code's `hook_execution_complete` events of the last hour, read
+  from Loki: `available: true` with `window_s` (3600), `executions` (how many runs of a
+  hook event's hooks), `non_blocking_error` and `cancelled` (the hooks that failed or
+  timed out, Claude Code's own and your other hooks included); or, when Loki gives no
+  usable answer within 2 seconds, `available: false` with `window_s` and a `reason`
+  (`unreachable`, `timeout`, `status` or `shape`). The route still answers 200 then.
+
+Its database read goes through the same readers as the rest of the API, so it can get
+the 503 `database busy`; it then sends no query to Loki.
+
 ~~~bash
 curl -s 'http://127.0.0.1:4300/api/v1/sessions?status=waiting_user'
 curl -s 'http://127.0.0.1:4300/api/v1/sessions/<session_id>'
@@ -492,6 +529,7 @@ curl -s 'http://127.0.0.1:4300/api/v1/sessions/<session_id>/events?limit=100'
 curl -s 'http://127.0.0.1:4300/api/v1/sessions/<session_id>/events?after_seq=<seq>'
 curl -s 'http://127.0.0.1:4300/api/v1/sessions/<session_id>/blocks?before=<block_id>'
 curl -s 'http://127.0.0.1:4300/api/v1/sessions/<session_id>/agents?before=<agent_id>'
+curl -s 'http://127.0.0.1:4300/api/v1/diagnostics'
 curl -s 'http://127.0.0.1:4300/healthz'      # {"status":"ok"}
 ~~~
 
@@ -534,7 +572,7 @@ counter in
 | `ccobs_hook_queue_bytes`            | gauge     | `host`            | Body bytes of those hooks.                                                           |
 | `ccobs_build_info`                  | gauge     | `host`, `version` | Always 1; `version` is the running cc-observatory version.                           |
 | `ccobs_database_wal`                | gauge     | `host`            | 1 if the database runs in WAL mode, 0 if its filesystem refused WAL.                 |
-| `ccobs_loki_queries_total`          | counter   | `host`, `result`  | Queries sent to Loki for Esc denials, by result (`ok`, `error`).                     |
+| `ccobs_loki_queries_total`          | counter   | `host`, `result`  | Queries sent to Loki (Esc denials, diagnostics), by result (`ok`, `error`).          |
 | `ccobs_prometheus_queries_total`    | counter   | `host`, `result`  | Queries sent to Prometheus for tokens and cost, by result (see below).               |
 | `ccobs_ui_streams`                  | gauge     | `host`            | Live update streams open to the web UI.                                              |
 | `ccobs_ui_streams_refused_total`    | counter   | `host`            | Live update streams refused because 16 were already open.                            |
@@ -587,8 +625,9 @@ you; going back to an older app image after a migration is not supported
 - **Never stored:** prompts, tool inputs and outputs, assistant messages, error text,
   task subjects, compaction summaries, and every path other than `cwd`
   (`transcript_path` and the others). A field Claude Code adds later is dropped until an
-  ADR lists it. The opt-in to keep content comes with `ccobs setup` in v0.5.0
-  ([ADR 0006](adr/0006-privacy-metadata-only-by-default.md)).
+  ADR lists it. v0.5.0 stores metadata only: the opt-in to keep content
+  ([ADR 0006](adr/0006-privacy-metadata-only-by-default.md)) is deferred
+  ([ADR 0040](adr/0040-defer-the-capture-content-opt-in.md)).
 - **`cwd` is personal data**: it contains your OS username. On Amazon Bedrock the model
   can be an inference-profile ARN that contains your AWS account ID. Both are in the
   database file, which a backup of the volume copies, and the API serves them to
@@ -722,12 +761,14 @@ requests.
 
 ### The overview stays empty
 
-The overview shows the hook settings until the app stores its first session. Check that
-you started Claude Code with `claude --settings` and the hooks file (see
-[Point Claude Code at the app](#point-claude-code-at-the-app)), and that you opened the
-app on the port in that file. A session shows up with its first hook, normally its first
-prompt; `SessionStart` alone can arrive late. If Claude Code shows hook errors, see
-below.
+The overview shows how to connect Claude Code until the app stores its first session.
+Run `ccobs doctor` ([cli.md](cli.md#ccobs-doctor)): it checks that setup's hooks are in
+your user settings for the app's port, that no policy turns them off, and that the app
+answers. With the hooks file instead, check that you started Claude Code with
+`claude --settings` and that file (see
+[Point Claude Code at the app](#point-claude-code-at-the-app)). A session shows up with
+its first hook, normally its first prompt; `SessionStart` alone can arrive late. If
+Claude Code shows hook errors, see below.
 
 ### Claude Code shows hook errors
 
@@ -735,10 +776,12 @@ A hook-error notice means that a hook could not reach the app in time, or got an
 answer other than an empty 2xx. Check:
 
 1. that the app is running and healthy (above); while it starts, hooks fail;
-2. that the URL in your hooks file is `http://127.0.0.1:<CCOBS_APP_PORT>/hooks`, with
-   `127.0.0.1`, not `localhost`.
+2. that the hook URL is `http://127.0.0.1:<CCOBS_APP_PORT>/hooks`, with `127.0.0.1`,
+   not `localhost`: `ccobs doctor` compares the hooks in your user settings with the
+   app's port (`hooks`) and posts to the hook URL (`hook-endpoint`).
 
-To stop the notices while the stack is down, start Claude Code without `--settings`.
+To stop the notices while the stack is down, run `ccobs uninstall`, or, with the hooks
+file, start Claude Code without `--settings`.
 
 ### A session stays `working` after you interrupted it with Esc
 
