@@ -1,8 +1,13 @@
-"""The hook settings snippet in ``docs/app.md`` equals ``hook_settings`` (ADR 0025).
+"""The settings snippets users copy by hand equal the blocks ``ccobs setup`` writes.
 
-Until ``ccobs setup`` writes the hooks (milestone 4), users copy the snippet by hand, so
-it must be exactly the block ``ccobs setup`` will write. The snippet is the first
-``json`` code block after the ``hook-settings`` marker comment.
+- The hook settings snippet in ``docs/app.md`` equals ``hook_settings`` (ADR 0025): the
+  first ``json`` code block after the ``hook-settings`` marker comment.
+- The telemetry ``env`` snippet in ``README.md`` and ``README.pt-BR.md`` equals
+  ``{"env": telemetry_env()}``: the first ``json`` code block after the
+  ``telemetry-env`` marker comment.
+
+``ccobs setup`` writes these blocks; users who set them by hand copy the snippets, so
+they must be exactly the blocks ``ccobs setup`` writes, keys in the same order.
 """
 
 from __future__ import annotations
@@ -12,10 +17,16 @@ import re
 from pathlib import Path
 from typing import Final
 
-from ccobs.domain.hook_config import DEFAULT_HOOK_URL, hook_settings
+import pytest
 
-APP_DOC: Final = Path(__file__).resolve().parent.parent / "docs" / "app.md"
+from ccobs.domain.hook_config import DEFAULT_HOOK_URL, hook_settings
+from ccobs.domain.telemetry_settings import telemetry_env
+
+ROOT: Final = Path(__file__).resolve().parent.parent
+APP_DOC: Final = ROOT / "docs" / "app.md"
+READMES: Final = (ROOT / "README.md", ROOT / "README.pt-BR.md")
 MARKER: Final = "<!-- hook-settings:"
+TELEMETRY_MARKER: Final = "<!-- telemetry-env:"
 # A fenced json block (``~~~`` or backticks, indented or not) and its body.
 _JSON_BLOCK: Final = re.compile(
     r"^(?P<indent>[ \t]*)(?P<fence>~~~|```)json[ \t]*\n(?P<body>.*?)^(?P=indent)(?P=fence)[ \t]*$",
@@ -25,12 +36,16 @@ _POSIX_NULL: Final = '"/dev/null"'
 _WINDOWS_NULL: Final = '"NUL"'
 
 
-def _snippet() -> str:
-    text = APP_DOC.read_text(encoding="utf-8")
-    assert text.count(MARKER) == 1, "docs/app.md must hold exactly one hook-settings marker"
-    match = _JSON_BLOCK.search(text, text.index(MARKER))
-    assert match is not None, "no json code block after the hook-settings marker"
+def _block_after(path: Path, marker: str) -> str:
+    text = path.read_text(encoding="utf-8")
+    assert text.count(marker) == 1, f"{path.name} must hold exactly one {marker!r} marker"
+    match = _JSON_BLOCK.search(text, text.index(marker))
+    assert match is not None, f"no json code block after the {marker!r} marker in {path.name}"
     return match["body"]
+
+
+def _snippet() -> str:
+    return _block_after(APP_DOC, MARKER)
 
 
 def _ordered_keys(value: object) -> object:
@@ -59,3 +74,12 @@ def test_the_windows_variant_differs_only_in_the_null_device() -> None:
     windows = json.loads(snippet.replace(_POSIX_NULL, _WINDOWS_NULL))
 
     assert windows == hook_settings(DEFAULT_HOOK_URL, windows=True)
+
+
+@pytest.mark.parametrize("readme", READMES, ids=lambda path: path.name)
+def test_the_readme_env_snippet_equals_telemetry_env(readme: Path) -> None:
+    snippet = json.loads(_block_after(readme, TELEMETRY_MARKER))
+    expected = {"env": telemetry_env()}
+
+    assert snippet == expected
+    assert _ordered_keys(snippet) == _ordered_keys(expected)

@@ -74,6 +74,7 @@ __all__ = [
     "BoardRows",
     "HookEventRow",
     "Repository",
+    "SessionCounts",
     "SessionDetail",
     "SessionView",
     "StripRow",
@@ -255,6 +256,15 @@ class AgentPage:
 
     agents: list[Agent]
     parents: Mapping[str, str | None]
+
+
+@dataclass(frozen=True, kw_only=True)
+class SessionCounts:
+    """How many sessions each stored status has (statuses with none are absent), and how
+    many blocks are open, in every session: what ``ccobs status`` shows (ADR 0038)."""
+
+    by_state: dict[str, int]
+    open_blocks: int
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -669,6 +679,25 @@ class Repository:
             rows = connection.execute(statement.limit(limit)).mappings().all()
         ordered = rows if after_seq is not None else reversed(rows)
         return [HookEventRow(**{name: row[name] for name in names}) for row in ordered]
+
+    # Reads for the diagnostics route (ADR 0038).
+
+    def session_counts(self) -> SessionCounts:
+        """The sessions by status and the open blocks: two aggregates on one connection,
+        so one read transaction, bounded by the number of statuses."""
+        with self.engine.connect() as connection:
+            by_state = connection.execute(
+                select(SessionModel.status, func.count()).group_by(SessionModel.status)
+            ).all()
+            open_blocks = connection.execute(
+                select(func.count())
+                .select_from(BlockModel)
+                .where(BlockModel.closed_at_ms.is_(None))
+            ).scalar_one()
+        return SessionCounts(
+            by_state={str(status): int(count) for status, count in by_state},
+            open_blocks=int(open_blocks),
+        )
 
     # Reads for the web UI.
 

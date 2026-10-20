@@ -11,7 +11,9 @@ port of its own (this app has no ``/metrics`` route), then the sweeper
 then the reconciler (``ccobs.server.reconcile``, ADR 0029), which closes permission
 blocks denied with Esc from Loki. The usage reader (``ccobs.server.usage``, ADR 0035),
 which reads a session's tokens and cost from Prometheus for the session page, opens with
-the metrics and closes last. The live updates hub (``ccobs.server.live``, ADR 0032)
+the metrics and closes last, like the hook failures reader of the diagnostics route
+(``ccobs.server.diagnostics``, ADR 0038), which reads Claude Code's hook failure counts
+from Loki. The live updates hub (``ccobs.server.live``, ADR 0032)
 opens on the event loop before the writer starts, and the writer tells it what each
 commit changed. At shutdown it closes the hub, which ends the UI's streams, then stops
 the listener, then the reconciler, then the sweeper, then the writer, draining the
@@ -35,10 +37,11 @@ from fastapi.exceptions import RequestValidationError
 from starlette.routing import Route
 from starlette.types import Receive, Scope, Send
 
-from ccobs.server import api, live, ui
+from ccobs.server import api, diagnostics, live, ui
 from ccobs.server.config import Settings
 from ccobs.server.db.engine import create_engine_for, wal_enabled
 from ccobs.server.db.repository import Repository
+from ccobs.server.diagnostics import HookFailuresReader
 from ccobs.server.guards import (
     HOOK_PATHS,
     ClientDisconnectedError,
@@ -172,6 +175,7 @@ def create_app(
     reconcile_interval_s: float | None = None,
     loki_transport: httpx.BaseTransport | None = None,
     prometheus_transport: httpx.AsyncBaseTransport | None = None,
+    diagnostics_transport: httpx.AsyncBaseTransport | None = None,
     read_wait_timeout_s: float = READ_WAIT_TIMEOUT_S,
     stream_timing: StreamTiming | None = None,
 ) -> FastAPI:
@@ -193,7 +197,10 @@ def create_app(
     (httpx's by default; tests pass an ``httpx.MockTransport``); it runs only when both
     ``reconcile`` and ``settings.telemetry_reconcile`` are true. The usage reader
     (``app.state.usage``) asks ``settings.prometheus_url`` through
-    ``prometheus_transport`` (httpx's by default). The API reads through an engine of
+    ``prometheus_transport`` (httpx's by default), and the diagnostics route's hook
+    failures reader (``app.state.hook_failures``) asks ``settings.loki_url`` through
+    ``diagnostics_transport`` (httpx's by default). ``app.state.started_at_ms`` is when
+    the lifespan started, by the wall clock. The API reads through an engine of
     its own, query-only, on the same database file, which the app always creates and
     disposes (ADR 0033); a read that waits ``read_wait_timeout_s`` for a free
     connection answers 503. The live updates hub is ``app.state.live``, built here so
@@ -249,6 +256,10 @@ def create_app(
             repo = repository
         reader: Repository | None = None
         usage: UsageReader | None = None
+        hook_failures: HookFailuresReader | None = None
+        # What the diagnostics route reports as the start: its counters count from here.
+        # The wall clock, not the injected one, whose readings tests script per hook.
+        app.state.started_at_ms = wall_clock_ms()
         try:
             # Before the first request: a failed migration stops the app (ADR 0026).
             upgrade_to_head(repo.engine)
@@ -275,6 +286,13 @@ def create_app(
                 on_query=metrics.count_prometheus_query,
             )
             app.state.usage = usage
+            hook_failures = HookFailuresReader(
+                loki_url=settings.loki_url,
+                host=settings.host_label,
+                transport=diagnostics_transport,
+                on_query=metrics.count_loki_query,
+            )
+            app.state.hook_failures = hook_failures
             hub.open(asyncio.get_running_loop())
             observers = WriterObservers(
                 on_block_closed=metrics.observe_block_closed,
@@ -346,6 +364,8 @@ def create_app(
                 reader.engine.dispose()
             if usage is not None:
                 await usage.aclose()
+            if hook_failures is not None:
+                await hook_failures.aclose()
             # After the writer has stopped: it writes until then.
             if owned:
                 repo.engine.dispose()
@@ -381,6 +401,8 @@ def create_app(
 
     # The read-only JSON API, behind the same guards.
     app.include_router(api.router)
+    # Its diagnostics route, for ccobs doctor and status (ADR 0038).
+    app.include_router(diagnostics.router)
     # The web UI's pages and fragments, and its static files (ADR 0031).
     app.include_router(ui.router)
     # The UI's live updates stream (ADR 0032).

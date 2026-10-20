@@ -64,3 +64,8 @@ the ADR wins.
 | [0033](0033-separate-writer-and-reader-engines-and-capped-reads.md)           | Separate writer and reader engines, capped reads and bounded session detail           | Accepted |
 | [0034](0034-browser-hardening-csp-fetch-metadata-and-response-headers.md)     | Browser hardening: a strict CSP, Fetch Metadata and response headers                  | Accepted |
 | [0035](0035-per-session-tokens-and-cost-from-prometheus-and-grafana-links.md) | Per-session tokens and cost from Prometheus, and links from the UI to Grafana         | Accepted |
+| [0036](0036-the-telemetry-env-block-that-ccobs-setup-writes.md)               | The telemetry env block that `ccobs setup` writes                                     | Accepted |
+| [0037](0037-how-ccobs-setup-and-uninstall-change-claude-codes-settings.md)    | `ccobs setup` and `uninstall` recognize their entries and keep a state file           | Accepted |
+| [0038](0038-a-diagnostics-endpoint-for-ccobs-doctor-and-status.md)            | A read-only diagnostics route in the app for `ccobs doctor` and `status`              | Accepted |
+| [0039](0039-ccobs-doctor-and-status-checks-sources-and-exit-codes.md)         | `ccobs doctor` and `status`: graded checks, read-only sources and exit codes          | Accepted |
+| [0040](0040-defer-the-capture-content-opt-in.md)                              | Defer the capture-content opt-in: v0.5.0 stores metadata only                         | Accepted |

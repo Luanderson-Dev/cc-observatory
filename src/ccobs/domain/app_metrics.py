@@ -105,10 +105,10 @@ BLOCK_DURATION_BUCKETS: Final[tuple[float, ...]] = (
     3600,
 )
 
-# The result of a query the app sends to Loki to close Esc denials (ADR 0029): answered
-# with a streams result, or not (no connection, a timeout, a non-2xx status, a body
-# that is not a streams result). A poll with nothing to ask sends no query and counts
-# nothing.
+# The result of a query the app sends to Loki, to close Esc denials (ADR 0029) or for the
+# diagnostics route's hook failure counts (ADR 0038): a usable answer, or not (no
+# connection, a timeout, a non-2xx status, a body that is not the expected result). A
+# poll with nothing to ask sends no query and counts nothing.
 type LokiQueryResult = Literal["ok", "error"]
 LOKI_RESULTS: Final[tuple[LokiQueryResult, ...]] = get_args(LokiQueryResult.__value__)
 
@@ -214,8 +214,8 @@ DATABASE_WAL: Final = AppMetric(
 LOKI_QUERIES: Final = AppMetric(
     "ccobs_loki_queries_total",
     "counter",
-    "Queries sent to Loki to close permission blocks denied with Esc since the app"
-    " started, by result.",
+    "Queries sent to Loki (to close permission blocks denied with Esc, and for the"
+    " diagnostics route) since the app started, by result.",
     (HOST_LABEL, RESULT_LABEL),
 )
 

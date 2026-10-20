@@ -12,43 +12,40 @@ tokens e custo na sua própria máquina.
 
 ## Status
 
-**Pré-alfa.** A v0.4.0 fecha o milestone 3 de 8: a interface web. O pacote
-`cc-observatory` no PyPI ainda só mostra a própria versão; a stack e o app rodam a partir
-de um clone deste repositório.
+**Pré-alfa.** A v0.5.0 fecha o milestone 4 de 8: a CLI `ccobs`. O pacote
+`cc-observatory` no PyPI agora traz a CLI (`uvx cc-observatory setup`); a stack e o app
+ainda rodam a partir de um clone deste repositório.
 
-O que a v0.4.0 traz:
+O que a v0.5.0 traz (veja o [docs/cli.md](docs/cli.md), em inglês):
 
-- uma interface web em `http://127.0.0.1:4300` (veja "Experimente o app" mais abaixo e
-  o [docs/app.md](docs/app.md), em inglês): uma visão geral das sessões agrupadas por
-  estado, com há quanto tempo cada uma espera por você, e uma página por sessão com os
-  bloqueios dela, a árvore de agentes e a linha do tempo dos hooks;
-- atualizações ao vivo por server-sent events, sem recarregar a página;
-- tokens e custo por sessão, lidos do Prometheus, e links de cada sessão para os logs,
-  tokens e custo dela no Grafana;
-- htmx e fontes embutidos no pacote, com checksums e licenças, para a interface
-  funcionar offline;
-- endurecimento contra o navegador: content security policy estrita, verificação de
-  Fetch Metadata e cabeçalhos de resposta defensivos;
-- engines de banco separados para o writer e para as leituras, com leituras
-  concorrentes limitadas, e páginas limitadas de bloqueios, agentes e eventos na API;
-- os ADRs 0031 a 0035, com as decisões da interface.
+- `ccobs setup`: grava as configurações de telemetria e os hooks nas settings de usuário
+  do Claude Code, com backup, `--dry-run` e escrita atômica, e nunca remove nem
+  sobrescreve as suas entradas;
+- `ccobs uninstall`: remove só o que o setup adicionou;
+- `ccobs doctor`: verifica as settings, o Claude Code, a stack e a máquina, e diz como
+  corrigir o que falha;
+- `ccobs status`: um resumo curto do app e das sessões;
+- um endpoint de diagnóstico no app para esses comandos, e uma visão geral vazia que
+  começa pelo comando de setup;
+- os ADRs 0036 a 0040, incluindo a decisão de manter a v0.5.0 só com metadados e adiar o
+  opt-in de conteúdo.
 
-Até o `ccobs setup` chegar na v0.5.0, você aponta o Claude Code para o app com um arquivo
-de settings passado ao `claude --settings`. Releases anteriores: a v0.3.0 (milestone 2)
-trouxe o app que recebe os hooks do Claude Code, a v0.2.0 (milestone 1) a stack de
+Releases anteriores: a v0.4.0 (milestone 3) trouxe a interface web, a v0.3.0 (milestone 2)
+o app que recebe os hooks do Claude Code, a v0.2.0 (milestone 1) a stack de
 observabilidade no Docker Compose com um Grafana provisionado, e a v0.1.0 (milestone 0)
 montou a fundação.
 
-O que vem a seguir: o milestone 4 (v0.5.0), os comandos `ccobs setup`, `uninstall`,
-`doctor` e `status`. O plano completo está no roteiro mais abaixo.
+O que vem a seguir: o milestone 5 (v0.6.0), alertas no navegador e no Discord. O plano
+completo está no roteiro mais abaixo.
 
 Salvo indicação em contrário, o restante deste README descreve o projeto planejado.
 
 ## O que ele mostra
 
-Entre parênteses está a release que traz cada parte. As partes até a v0.4.0 rodam a
-partir de um clone deste repositório (veja "Como rodar a stack de observabilidade" e
-"Experimente o app" mais abaixo); o resto está planejado.
+Entre parênteses está a release que traz cada parte. As partes até a v0.5.0 já funcionam:
+a stack e o app rodam a partir de um clone deste repositório (veja "Como rodar a stack de
+observabilidade" e "Experimente o app" mais abaixo), e a CLI vem do PyPI; o resto está
+planejado.
 
 - **Visão geral ao vivo** das sessões do Claude Code na sua máquina, em uma interface
   web em <http://127.0.0.1:4300>: primeiro as sessões esperando por você, com há quanto
@@ -117,13 +114,7 @@ Mais detalhes para quem contribui estão em [docs/architecture.md](docs/architec
 (em inglês). As decisões por trás desse projeto, e os motivos delas, estão nos registros
 de decisão de arquitetura em [docs/adr/](docs/adr/README.md) (em inglês).
 
-## Como rodar a stack de observabilidade (a partir da v0.2.0)
-
-A partir da v0.2.0 você pode rodar a stack de observabilidade com um clone deste
-repositório e ver as métricas e os eventos do Claude Code no Grafana. A partir da v0.3.0
-a stack também roda o app (hooks, sessões e bloqueios; veja "Experimente o app" mais
-abaixo) e, a partir da v0.4.0, a interface web dele. O `ccobs setup` chega na v0.5.0;
-até lá, você aponta o Claude Code para a stack manualmente.
+## Início rápido (a partir da v0.5.0)
 
 1. Suba a stack:
 
@@ -134,20 +125,66 @@ até lá, você aponta o Claude Code para a stack manualmente.
    ~~~
 
    A primeira subida baixa cerca de 750 MB de imagens e faz o build das imagens do
-   collector e do app. O `docker compose ps` mostra cada serviço e se ele está
-   saudável. Para guardar também os traces do Claude Code, um recurso beta, suba a stack
-   com `docker compose --profile traces up -d`, que acrescenta o Tempo, e passe
-   `--profile traces` toda vez que subir ou atualizar a stack.
+   collector e do app. O `docker compose ps` mostra cada serviço e se ele está saudável.
+
+2. Conecte o Claude Code a ela:
+
+   ~~~bash
+   uvx cc-observatory setup
+   ~~~
+
+   O `setup` faz um backup das suas configurações de usuário (`~/.claude/settings.json`)
+   e acrescenta a elas os hooks e o bloco `env` da telemetria, mantendo as suas próprias
+   entradas. Ele registra o que acrescentou, para que o `ccobs uninstall` remova só isso;
+   o `--dry-run` mostra o diff sem gravar nada, e rodá-lo de novo é seguro.
+
+3. Inicie uma nova sessão do Claude Code. Os hooks chegam na hora às sessões já
+   abertas, mas a telemetria (tokens, custo, eventos) só começa nas sessões iniciadas
+   depois do `setup`; então reinicie as que você quiser ver por completo.
+
+4. Abra o app em <http://127.0.0.1:4300>, o endereço que o `setup` mostra, e o Grafana
+   em <http://localhost:4330>.
+
+Se nada aparecer, rode `uvx cc-observatory doctor`: ele confere o Claude Code, as suas
+configurações, as políticas que podem bloquear os hooks ou a telemetria e a stack, e diz
+como corrigir o que encontrar. O `uvx cc-observatory status` é a versão curta.
+
+- **A CLI.** `ccobs` e `cc-observatory` são a mesma CLI: `uvx cc-observatory <comando>`
+  a executa sem instalá-la, e `uv tool install cc-observatory` a instala como `ccobs`. O
+  [docs/cli.md](docs/cli.md) (em inglês) cobre o `setup`, o `uninstall`, o `doctor` e o
+  `status`, as opções e os códigos de saída deles e a solução de problemas.
+- **Sem mudar as suas configurações.** Para conectar só uma sessão, inicie o Claude Code
+  com os hooks num arquivo próprio, `claude --settings <arquivo>`, como o
+  [docs/app.md](docs/app.md#point-claude-code-at-the-app) (em inglês) mostra.
+- **Desfazer.** O `uvx cc-observatory uninstall` tira o que o `setup` acrescentou e
+  devolve qualquer valor que ele tenha substituído. A stack continua rodando até um
+  `docker compose down`.
+
+## Como rodar a stack de observabilidade (a partir da v0.2.0)
+
+A partir da v0.2.0 você pode rodar a stack de observabilidade com um clone deste
+repositório e ver as métricas e os eventos do Claude Code no Grafana. A partir da v0.3.0
+a stack também roda o app (hooks, sessões e bloqueios; veja "Experimente o app" mais
+abaixo) e, a partir da v0.4.0, a interface web dele.
+
+1. Suba a stack como no início rápido. Para guardar também os traces do Claude Code, um
+   recurso beta, suba a stack com `docker compose --profile traces up -d`, que
+   acrescenta o Tempo, e passe `--profile traces` toda vez que subir ou atualizar a
+   stack.
 
 2. Abra o Grafana em <http://localhost:4330>. Use `localhost`: o Grafana redireciona para
    ele qualquer outro nome de host, inclusive `127.0.0.1`. Não há login. A página inicial
    é o dashboard **Claude Code overview**: custo, tokens, sessões, tempo ativo, mudanças
    de código, erros de API e eventos recentes.
 
-3. Aponte o Claude Code para a stack. Acrescente estas variáveis ao bloco `env` das suas
-   configurações de usuário, `~/.claude/settings.json`, mantendo as entradas que você já
+3. Aponte o Claude Code para a stack. O `ccobs setup` grava estas variáveis no bloco
+   `env` das suas configurações de usuário, `~/.claude/settings.json` (o `--traces`
+   acrescenta as duas variáveis de traces abaixo, o `--otlp-port` muda a porta). Para
+   defini-las manualmente, acrescente-as a esse bloco, mantendo as entradas que você já
    tem, ou exporte-as no shell que inicia o Claude Code. As configurações de projeto
    (`.claude/settings.json` e `.claude/settings.local.json`) não conseguem defini-las.
+
+   <!-- telemetry-env: telemetry_env(), kept equal by tests/test_docs_snippet.py -->
 
    ~~~json
    {
@@ -172,11 +209,12 @@ até lá, você aponta o Claude Code para a stack manualmente.
    - Deixe `OTEL_METRICS_INCLUDE_SESSION_ID` no padrão (`true`): sem os IDs de sessão, as
      séries de sessões simultâneas colidem.
    - Para traces, defina também `CLAUDE_CODE_ENHANCED_TELEMETRY_BETA` como `1` e
-     `OTEL_TRACES_EXPORTER` como `otlp`, e rode a stack com `--profile traces`.
+     `OTEL_TRACES_EXPORTER` como `otlp` (ou rode `ccobs setup --traces`), e rode a stack
+     com `--profile traces`.
 
 4. Reinicie o Claude Code para que as novas sessões carreguem as configurações. As
    métricas chegam a cada 60 segundos e os eventos a cada 5 segundos, e o dashboard se
-   atualiza a cada minuto. Se nada aparecer, veja
+   atualiza a cada minuto. Se nada aparecer, rode `ccobs doctor` ou veja
    [No data in the dashboard](docs/stack.md#no-data-in-the-dashboard) (em inglês).
 
 - **Configurações.** Toda configuração é uma variável de ambiente com um valor padrão,
@@ -186,7 +224,8 @@ até lá, você aponta o Claude Code para a stack manualmente.
   evento e trace; defina-o para dar um nome à máquina. Ele é guardado como você
   escrever, então use o nome de host real da máquina só se quiser que ele seja guardado.
   As portas e a retenção (por padrão, 90 dias de métricas, 30 de eventos e 7 de traces)
-  são definidas do mesmo jeito.
+  são definidas do mesmo jeito. Se você mudar uma porta, passe a mesma porta ao `ccobs`
+  (`--app-port`, `--otlp-port`, `--grafana-port`).
 - **Depois de reiniciar a máquina.** Os serviços reiniciam a menos que você os pare com
   `docker compose stop`, então a stack volta sempre que o Docker inicia
   ([ADR 0019](docs/adr/0019-restart-unless-stopped.md), em inglês). O Docker Desktop só
@@ -207,25 +246,18 @@ somente leitura.
 1. Suba ou atualize a stack como acima. O `docker compose ps` mostra o `app` como
    saudável assim que ele passa a atender requisições.
 
-2. Aponte o Claude Code para o app. Até o `ccobs setup` gravar os hooks por você na
-   v0.5.0, salve o bloco de hooks do
-   [docs/app.md](docs/app.md#point-claude-code-at-the-app) (em inglês) como
-   `ccobs-hooks.json` no seu diretório pessoal (no Windows, troque `/dev/null` por `NUL`
-   nele, como aquela página explica) e inicie o Claude Code com ele:
-
-   ~~~bash
-   claude --settings "$HOME/ccobs-hooks.json"
-   ~~~
-
-   O seu `~/.claude/settings.json` continua como está, e só as sessões que você iniciar
-   assim enviam hooks. A URL dos hooks usa `127.0.0.1`, não `localhost`.
+2. Aponte o Claude Code para o app: o `ccobs setup` grava os hooks (veja o início
+   rápido). A URL dos hooks usa `127.0.0.1`, não `localhost`. Para enviar os hooks de
+   uma sessão só, sem mudar as suas configurações, use o arquivo de hooks e o
+   `claude --settings` do [docs/app.md](docs/app.md#point-claude-code-at-the-app) (em
+   inglês).
 
 3. Abra <http://127.0.0.1:4300> no navegador. A visão geral mostra as suas sessões em
    faixas por estado, primeiro as que esperam por você, e as acompanha ao vivo; clique
    numa sessão para ver os bloqueios, os agentes, os tokens e o custo e a linha do tempo
    dos hooks dela, e os links para os logs e o uso dela no Grafana. Até a primeira
-   sessão chegar, a visão geral mostra as configurações de hooks do passo 2. Os mesmos
-   dados estão na API JSON:
+   sessão chegar, a visão geral mostra o comando `ccobs setup` para a porta dela. Os
+   mesmos dados estão na API JSON:
 
    ~~~bash
    curl -s http://127.0.0.1:4300/api/v1/sessions
@@ -235,56 +267,28 @@ somente leitura.
    `stale`), e `/api/v1/sessions/<session_id>` acrescenta os agentes e os bloqueios
    dela.
 
-- **Stack fora do ar.** Enquanto a stack estiver fora do ar, as sessões iniciadas com
-  esses hooks mostram na transcrição um aviso de erro de hook na maioria dos eventos de
-  hook; inicie o Claude Code sem `--settings` até a stack voltar.
+- **Stack fora do ar.** Enquanto a stack estiver fora do ar, o Claude Code mostra na
+  transcrição um aviso de erro de hook na maioria dos eventos de hook; suba a stack, ou
+  rode `ccobs uninstall` para tirar os hooks até ela voltar.
 - **Negações com Esc, tokens e custo.** Um pedido de permissão negado com Esc não
   dispara nenhum hook; o app o fecha a partir dos eventos do Claude Code no Loki. Os
   tokens e o custo de uma sessão vêm das métricas do Claude Code no Prometheus. Os dois
-  precisam das configurações de telemetria do passo 3 da seção anterior.
+  precisam das configurações de telemetria que o `ccobs setup` grava (passo 3 da seção
+  anterior).
 - **Mais.** O [docs/app.md](docs/app.md) (em inglês) cobre a interface web, a API, as
   métricas do app no Grafana, as configurações e a retenção dele, a privacidade e a
   solução de problemas.
-
-## Início rápido (planejado, disponível a partir da v0.5.0)
-
-**Ainda não disponível.** O passo 1 funciona a partir da v0.2.0 (veja a seção acima);
-os passos 2 a 4 precisam do comando `setup`, que chega na v0.5.0.
-
-1. Suba a stack:
-
-   ~~~bash
-   git clone https://github.com/Luanderson-Dev/cc-observatory
-   cd cc-observatory
-   docker compose up -d
-   ~~~
-
-2. Conecte o Claude Code a ela:
-
-   ~~~bash
-   uvx cc-observatory setup
-   ~~~
-
-   O `setup` faz um backup do `~/.claude/settings.json` e mescla nele o bloco `env` da
-   telemetria e os hooks sem mexer nas entradas que você já tem, marcando o que
-   acrescenta para que o `ccobs uninstall` remova só isso; o `--dry-run` mostra o diff
-   sem gravar nada.
-
-3. Abra o app no endereço que o `setup` mostrar.
-4. Reinicie o Claude Code para que as novas sessões carreguem as novas configurações.
-
-`ccobs` e `cc-observatory` são a mesma CLI; `uvx cc-observatory <comando>` a executa sem
-instalá-la.
 
 ## Privacidade
 
 - **Só metadados por padrão.** O texto dos prompts, as entradas e saídas das
   ferramentas, as mensagens do assistente e os textos de erro não são armazenados.
-- **A captura de conteúdo é opt-in explícito** (prevista para a v0.5.0).
-  O `ccobs setup --capture-content` mostra um aviso e então liga a captura de conteúdo
-  nas configurações de telemetria do Claude Code e na stack (no collector e no app). Sem
-  ele, o collector descarta o conteúdo da telemetria mesmo que o Claude Code tenha sido
-  configurado para enviá-lo.
+- **Ainda sem captura de conteúdo.** O `ccobs setup` nunca liga a captura de conteúdo,
+  e o collector descarta o conteúdo da telemetria mesmo que o Claude Code tenha sido
+  configurado para enviá-lo; o `ccobs doctor` avisa quando as variáveis de conteúdo do
+  Claude Code estão ligadas. O opt-in explícito para guardar conteúdo foi adiado para um
+  release futuro ([ADR 0040](docs/adr/0040-defer-the-capture-content-opt-in.md), em
+  inglês).
 - **Os atributos pessoais são removidos.** O collector apaga da telemetria o seu e-mail,
   os IDs do seu usuário, da sua conta e da sua organização e o nome de host da sua
   máquina antes que qualquer coisa seja armazenada.
@@ -345,8 +349,8 @@ uma página web ainda consegue fazer, e para saber como relatar uma vulnerabilid
 - Testado no Linux e no Windows 11 com o Docker Desktop, ambos em amd64; macOS e arm64
   não foram testados. Os detalhes estão em
   [docs/stack.md](docs/stack.md#requirements) (em inglês).
-- [uv](https://docs.astral.sh/uv/), para a CLI `ccobs` (`uvx cc-observatory`), cujos
-  comandos chegam na v0.5.0.
+- [uv](https://docs.astral.sh/uv/), para a CLI `ccobs` (`uvx cc-observatory`; veja o
+  [docs/cli.md](docs/cli.md), em inglês).
 - Claude Code 2.1.296 ou mais recente. É a versão com que o cc-observatory foi testado
   ([ADR 0012](docs/adr/0012-observed-telemetry-and-hook-contract.md), em inglês);
   versões anteriores não são suportadas até serem testadas.
@@ -359,7 +363,7 @@ uma página web ainda consegue fazer, e para saber como relatar uma vulnerabilid
 | 1         | v0.2.0  | Stack de observabilidade no compose, Grafana provisionado                                        | Lançado      |
 | 2         | v0.3.0  | Ingestão de hooks, máquina de estados da sessão, SQLite, bloqueios, `/metrics`                   | Lançado      |
 | 3         | v0.4.0  | Interface web (HTMX + SSE)                                                                       | Lançado      |
-| 4         | v0.5.0  | `ccobs setup`, `uninstall`, `doctor`, `status`                                                   | Planejado    |
+| 4         | v0.5.0  | `ccobs setup`, `uninstall`, `doctor`, `status`                                                   | Lançado      |
 | 5         | v0.6.0  | Alertas (navegador e Discord)                                                                    | Planejado    |
 | 6         | v0.7.0  | Dashboards do Grafana e acabamento                                                               | Planejado    |
 | 7         | v1.0.0  | Distribuição: imagens multi-arch no GHCR, endurecimento das releases, docs para contribuidores   | Planejado    |

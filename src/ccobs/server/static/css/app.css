@@ -614,17 +614,30 @@ details[open] > .bay__summary .bay__title::before {
 
 .hook-settings-box {
   position: relative;
+  margin-bottom: var(--space-3);
 }
 
 .hook-settings {
   max-height: 24rem;
   margin: 0;
-  padding: var(--space-3) var(--space-4);
+  /* Room on the right for the Copy button, which sits over the box's corner. */
+  padding: var(--space-3) calc(var(--space-4) + 4.5rem) var(--space-3) var(--space-4);
   overflow: auto;
   border-radius: var(--radius-strip);
   background: var(--board);
   font-size: var(--text-sm);
   line-height: var(--leading-tight);
+}
+
+/* The one-line setup command wraps between words on narrow screens instead of running
+   under the Copy button or scrolling; a word such as --app-port never splits at its
+   hyphens. */
+.hook-settings--command {
+  white-space: pre-wrap;
+}
+
+.command-word {
+  white-space: nowrap;
 }
 
 .copy-button {
@@ -641,6 +654,16 @@ details[open] > .bay__summary .bay__title::before {
 
 .copy-button[hidden] {
   display: none;
+}
+
+/* The manual path under the setup command: a native disclosure, collapsed. */
+.manual-setup {
+  margin-top: var(--space-4);
+}
+
+.manual-setup > summary {
+  margin-bottom: var(--space-2);
+  cursor: pointer;
 }
 
 /* Paging. */

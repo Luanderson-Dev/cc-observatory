@@ -1,3 +1,9 @@
+## v0.5.0 (2026-10-20)
+
+### Feat
+
+- add the ccobs setup, uninstall, doctor and status commands (#17)
+
 ## v0.4.0 (2026-10-18)
 
 ### Feat

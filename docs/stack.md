@@ -37,9 +37,9 @@ Windows).
   `docker compose pull` never updates it, and `docker compose up -d` rebuilds it when
   the source changes (`docker compose build app` rebuilds it alone).
 - **Path of the data.** Claude Code sends OTLP to the collector, which deletes identity
-  attributes and content ([ADR 0021](adr/0021-collector-privacy-filters.md); an opt-in
-  to keep content comes with `ccobs setup` in v0.5.0,
-  [ADR 0006](adr/0006-privacy-metadata-only-by-default.md)), then sets the host label
+  attributes and content ([ADR 0021](adr/0021-collector-privacy-filters.md); v0.5.0
+  stores metadata only, and the opt-in to keep content is deferred,
+  [ADR 0040](adr/0040-defer-the-capture-content-opt-in.md)), then sets the host label
   ([ADR 0022](adr/0022-the-host-label.md)). It sends metrics to Prometheus's OTLP
   receiver ([ADR 0013](adr/0013-metrics-through-the-prometheus-otlp-receiver.md)),
   events to Loki's OTLP endpoint ([ADR 0015](adr/0015-loki-through-its-otlp-endpoint.md))
@@ -101,9 +101,10 @@ without Tempo, that datasource shows an error and nothing else is affected.
 
 The app answers at <http://127.0.0.1:4300> (the port is `CCOBS_APP_PORT`): its web UI
 at the root, its hook endpoint, `/healthz` and its JSON API, such as
-`/api/v1/sessions`. Claude Code sends it hooks only once you point Claude Code at it
-([app.md](app.md#point-claude-code-at-the-app)); until then the overview shows the hook
-settings to use. The app's links to Grafana open `http://localhost:<CCOBS_GRAFANA_PORT>`,
+`/api/v1/sessions`. Claude Code sends it hooks only once you point Claude Code at it,
+with `ccobs setup` ([cli.md](cli.md#ccobs-setup)) or by hand
+([app.md](app.md#point-claude-code-at-the-app)); until then the overview shows how to
+connect it. The app's links to Grafana open `http://localhost:<CCOBS_GRAFANA_PORT>`,
 as above.
 
 | Command                            | Effect                                                                                                                                |
@@ -554,9 +555,10 @@ limit, which `uv run python -m tools.stack.memory --samples 12` shows as a peak 
 failed: most often an invalid setting, which it names, or port 4300 taken by another
 program. A hook-error notice in Claude Code's transcript means a hook could not reach
 the app: the stack is down or starting, or the hook URL is wrong (it must use
-`127.0.0.1`). [app.md](app.md#troubleshooting) covers these, an empty overview, a
-session stuck in `working` or `waiting_user`, missing tokens and cost, "Live updates
-paused", a busy database, WAL being off and dropped hooks.
+`127.0.0.1`). `ccobs doctor` checks both ([cli.md](cli.md#ccobs-doctor)).
+[app.md](app.md#troubleshooting) covers these, an empty overview, a session stuck in
+`working` or `waiting_user`, missing tokens and cost, "Live updates paused", a busy
+database, WAL being off and dropped hooks.
 
 ### An edited dashboard does not show on the home page
 
@@ -595,11 +597,15 @@ details.
 
 ### No data in the dashboard
 
+`ccobs doctor` ([cli.md](cli.md#ccobs-doctor)) runs most of these checks for you: the
+stack, the telemetry variables in your user settings, and the policies and per-signal
+variables that override them.
+
 1. `docker compose ps`: every service is running and healthy.
-2. Claude Code's environment, in the `env` block of `~/.claude/settings.json` or in the
-   shell that starts it. Project settings (`.claude/settings.json` and
-   `.claude/settings.local.json`) cannot set the exporter variables, but an exporter set
-   to `none` there turns that signal off
+2. Claude Code's environment, in the `env` block of `~/.claude/settings.json` (which
+   `ccobs setup` writes) or in the shell that starts it. Project settings
+   (`.claude/settings.json` and `.claude/settings.local.json`) cannot set the exporter
+   variables, but an exporter set to `none` there turns that signal off
    ([ADR 0002](adr/0002-native-telemetry-plus-hooks.md)):
 
    | Variable                                            | Value                                                                             |
@@ -659,7 +665,7 @@ With delta, a collector restart also starts every series again from zero, which
 total still comes out low.
 
 - Set `OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE=cumulative` in Claude Code's
-  environment, as `ccobs setup` will from v0.5.0. The running total then lives in Claude
+  environment, as `ccobs setup` does. The running total then lives in Claude
   Code, whose SDK is expected to export every series at each interval, keeping a sample
   within the lookback (ADR 0013 notes that this is still to be confirmed with a real
   session).

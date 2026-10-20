@@ -113,7 +113,7 @@ from starlette.types import Scope
 
 from ccobs.domain.agent_tree import AgentRef, build_agent_tree
 from ccobs.domain.grafana_links import SessionLinks, dashboard_url, session_links, session_range
-from ccobs.domain.hook_config import HOOK_PATH, hook_settings
+from ccobs.domain.hook_config import DEFAULT_APP_PORT, HOOK_PATH, hook_settings
 from ccobs.domain.hooks import is_valid_session_id
 from ccobs.domain.presentation import (
     RECENT_END_WINDOW_MS,
@@ -203,6 +203,10 @@ _SHORT_ID: Final = 8
 _SECOND_MS: Final = 1000
 _SERVICE_UNAVAILABLE: Final = 503
 _BAD_REQUEST: Final = 400
+# How the empty state tells a user to connect Claude Code (the CLI ships in the package).
+_SETUP: Final = "uvx cc-observatory setup"
+# A URL without a port: the app speaks plain http (ADR 0018).
+_HTTP_DEFAULT_PORT: Final = 80
 
 _STATE_LABELS: Final = {
     "waiting_user": "Waiting on you",
@@ -427,6 +431,15 @@ def _hook_json(request: Request) -> str:
     return json.dumps(hook_settings(url, windows=windows), indent=2)
 
 
+def _setup_command(request: Request) -> str:
+    """The setup command for this app as the browser reaches it: ``--app-port`` names
+    the request's port when it is not the default, so setup writes this app's URL. No
+    port in the request means http's 80, which the manual hook JSON uses too."""
+    port = _HTTP_DEFAULT_PORT if request.url.port is None else request.url.port
+    flag = "" if port == DEFAULT_APP_PORT else f" --app-port {port}"
+    return f"{_SETUP}{flag}"
+
+
 def _render(name: str, *, status_code: int = 200, **context: object) -> HTMLResponse:
     body = _environment.get_template(name).render(**context)
     return HTMLResponse(body, status_code=status_code)
@@ -508,10 +521,15 @@ async def _board_context(
     now_ms = _now_ms(request)
     rows = await _read(reads, _board_read, repository, now_ms)
     if isinstance(rows, ErrorView):
-        return {"board": None, "error": rows, "hook_json": ""}
+        return {"board": None, "error": rows, "hook_json": "", "setup_command": ""}
     board = _board_view(rows, now_ms)
-    hook_json = "" if board.any_session else _hook_json(request)
-    return {"board": board, "error": None, "hook_json": hook_json}
+    empty = not board.any_session
+    return {
+        "board": board,
+        "error": None,
+        "hook_json": _hook_json(request) if empty else "",
+        "setup_command": _setup_command(request) if empty else "",
+    }
 
 
 def _status(context: dict[str, object]) -> int:
@@ -575,12 +593,14 @@ async def all_sessions(
             request, status_code=_SERVICE_UNAVAILABLE, paged=cursor is not None, error=rows
         )
     shown = rows[:SESSIONS_PAGE_SIZE]
+    empty = not rows and cursor is None
     return _sessions_page(
         request,
         paged=cursor is not None,
         strips=[_strip(row, now_ms) for row in shown],
         next_href=_next_href(shown) if len(rows) > SESSIONS_PAGE_SIZE else None,
-        hook_json=_hook_json(request) if not rows and cursor is None else "",
+        hook_json=_hook_json(request) if empty else "",
+        setup_command=_setup_command(request) if empty else "",
     )
 
 
@@ -593,6 +613,7 @@ def _sessions_page(
     strips: Sequence[Strip] = (),
     next_href: str | None = None,
     hook_json: str = "",
+    setup_command: str = "",
 ) -> HTMLResponse:
     """The All sessions page; ``paged`` when it is not the first page."""
     return _render(
@@ -605,6 +626,7 @@ def _sessions_page(
         strips=strips,
         next_href=next_href,
         hook_json=hook_json,
+        setup_command=setup_command,
     )
 
 

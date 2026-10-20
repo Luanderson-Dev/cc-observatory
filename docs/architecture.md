@@ -6,10 +6,12 @@ repository holds:
 - the observability stack of milestone 1: `compose.yaml` runs the OpenTelemetry
   Collector, Prometheus, Loki, Grafana and, in an optional profile, Tempo, with their
   configs in `stack/`; [stack.md](stack.md) is the reference for running it;
-- the Python package: a CLI that prints its version, `ccobs.domain` (the stored
+- the Python package: the `ccobs` CLI of milestone 4 (`setup`, `uninstall`, `doctor`
+  and `status`; [cli.md](cli.md) is its reference), `ccobs.domain` (the stored
   telemetry names of [ADR 0014](adr/0014-stored-telemetry-names.md), the hook parser,
-  the session state machine, the hook settings, and the UI's presentation rules, agent
-  tree, Grafana links and usage queries, all free of I/O), and `ccobs.server`, the app
+  the session state machine, the hook and telemetry settings and their merge, the
+  doctor's rules, and the UI's presentation rules, agent tree, Grafana links and usage
+  queries, all free of I/O), and `ccobs.server`, the app
   of milestones 2 and 3 (from v0.3.0, its web UI from v0.4.0), which the stack builds
   and runs as its `app` service; [app.md](app.md) is the reference for operating it;
 - the tooling around them, unit tests, and integration tests that run the stack in an
@@ -19,9 +21,9 @@ repository holds:
   service, an egress check);
 - sanitized fixtures recorded from real Claude Code sessions (`tests/fixtures/`).
 
-The app's alerts and the `ccobs` commands on this page are the planned design, and each
-part names the milestone that brings it (milestones and releases are listed in the
-roadmap in the [README](../README.md)).
+The app's alerts on this page are the planned design, and each part names the
+milestone that brings it (milestones and releases are listed in the roadmap in the
+[README](../README.md)).
 
 Decisions and their reasons are recorded as architecture decision records (ADRs, MADR
 format) in [`docs/adr/`](adr/README.md). When this page and an ADR disagree, the ADR
@@ -65,14 +67,14 @@ and [app.md](app.md) the app's.
 
 | Component               | Responsibility                                                                                                                                                                                                                                                                                                                                                          | Milestone                                                |
 | ----------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------- |
-| Claude Code             | The program being observed. It exports telemetry over OTLP and calls the app's hook endpoint, both configured in the user settings: by hand until `ccobs setup` writes them (milestone 4).                                                                                                                                                                              | (external)                                               |
+| Claude Code             | The program being observed. It exports telemetry over OTLP and calls the app's hook endpoint, both configured in the user settings, which `ccobs setup` writes (or by hand).                                                                                                                                                                                            | (external)                                               |
 | OpenTelemetry Collector | Receives OTLP on 4317 (gRPC) and 4318 (HTTP), deletes personal attributes and, by default, content, sets the `host` label and routes each signal to its backend.                                                                                                                                                                                                        | 1                                                        |
 | Prometheus              | Stores the metrics that the collector pushes to its OTLP receiver. Scrapes its own and the collector's metrics, and the app's metrics listener (from v0.3.0). Answers the app's queries for each session's tokens and cost (from v0.4.0).                                                                                                                               | 1                                                        |
 | Loki                    | Stores Claude Code's events (OpenTelemetry log records). The app reads its `tool_decision` rejects back (from v0.3.0).                                                                                                                                                                                                                                                  | 1                                                        |
 | Tempo                   | Stores traces. Runs only in the optional `traces` compose profile, because tracing is a beta feature in Claude Code and is off by default.                                                                                                                                                                                                                              | 1                                                        |
 | Grafana                 | Deep analysis, with provisioned datasources (Prometheus, Loki, Tempo) and dashboards. No login: whoever opens it is an Editor. The app's pages link to it (from v0.4.0).                                                                                                                                                                                                | 1 (datasources, overview dashboard), 6 (more dashboards) |
 | App (FastAPI, SQLite)   | From v0.3.0: receives hooks, runs the session state machine, stores sessions, agents and blocks, serves a read-only JSON API and its live state as metrics, and reads Claude Code's rejects from Loki. From v0.4.0: serves the web UI with live updates, reads each session's tokens and cost from Prometheus and links to Grafana. Later: stores and sends the alerts. | 2 (ingestion, API, metrics), 3 (UI), 5 (alerts)          |
-| `ccobs` CLI             | `setup`, `uninstall`, `doctor` and `status`: edits `~/.claude/settings.json` and checks the stack. Published on PyPI as `cc-observatory`; it never imports server-only dependencies at import time.                                                                                                                                                                     | 4                                                        |
+| `ccobs` CLI             | `setup` and `uninstall` add and remove the hooks and telemetry variables in the user settings (`~/.claude/settings.json`); `doctor` and `status` check the settings, the policies and the stack. Published on PyPI as `cc-observatory`; standard library only, it never imports server-only dependencies. [cli.md](cli.md) is its reference.                            | 4                                                        |
 
 ## Two data paths
 
@@ -139,9 +141,11 @@ How hooks reach the app is decided in
 because `SessionStart` does not accept `http` hooks. The 15 `http` events and the
 async `SessionStart` that cc-observatory registers, the ones the state machine needs,
 are decided in [ADR 0025](adr/0025-registered-hook-events.md), from the payloads that
-[ADR 0012](adr/0012-observed-telemetry-and-hook-contract.md) records. Until
-`ccobs setup` writes them (milestone 4), [app.md](app.md#point-claude-code-at-the-app)
-shows how to pass them to Claude Code with `--settings`.
+[ADR 0012](adr/0012-observed-telemetry-and-hook-contract.md) records. `ccobs setup`
+writes them into the user settings
+([ADR 0037](adr/0037-how-ccobs-setup-and-uninstall-change-claude-codes-settings.md));
+[app.md](app.md#point-claude-code-at-the-app) also shows how to pass them to one
+session with `--settings`.
 
 ### Live state in `/metrics`
 
@@ -315,10 +319,11 @@ The hook route keeps its empty 204 whatever these headers say.
   so the app creates a session from whichever event arrives first
   ([ADR 0011](adr/0011-hook-delivery-http-plus-async-sessionstart.md)).
 - **OpenTelemetry defaults need explicit settings.** Claude Code has no default OTLP
-  protocol, so one is always set: by hand today, by `ccobs setup` from milestone 4. Its
+  protocol, so one is always set: `ccobs setup` writes `http/protobuf`
+  ([ADR 0036](adr/0036-the-telemetry-env-block-that-ccobs-setup-writes.md)). Its
   default metrics temporality is delta, while Prometheus stores cumulative series: the
   collector's `delta_to_cumulative` processor converts delta, and cumulative
-  temporality, which `ccobs setup` will set, avoids the limits of delta
+  temporality, which `ccobs setup` sets, avoids the limits of delta
   ([ADR 0013](adr/0013-metrics-through-the-prometheus-otlp-receiver.md),
   [stack.md](stack.md#known-limit-delta-temporality)).
 - **Metric names change on the way to Prometheus.** OpenTelemetry names such as
@@ -333,10 +338,12 @@ The hook route keeps its empty 204 whatever these headers say.
   is the identity provider subject, `user.account_uuid`, `user.account_id` and
   `user.groups`), plus `organization.id`, `identity.source` and `host.name`
   ([ADR 0021](adr/0021-collector-privacy-filters.md)).
-- **Metadata only by default.** Without the capture-content opt-in, prompts, tool inputs
-  and outputs, assistant messages and error text are dropped before anything is stored.
-  The opt-in has to be turned on in Claude Code's content variables, the collector and
-  the app; without it, the collector drops content even if Claude Code sends it.
+- **Metadata only by default.** Prompts, tool inputs and outputs, assistant messages and
+  error text are dropped before anything is stored: the app keeps an allowlist of hook
+  metadata, and the collector drops content even if Claude Code sends it. `ccobs setup`
+  never turns Claude Code's content variables on, and the opt-in to keep content, which
+  would have to change Claude Code's settings, the collector and the app together, is
+  deferred ([ADR 0040](adr/0040-defer-the-capture-content-opt-in.md)).
 - **Telemetry settings are ignored in project settings.** Claude Code applies the
   OpenTelemetry exporter variables from the environment it starts in, a `--settings`
   file, the user settings (`~/.claude/settings.json`) and managed settings, but ignores

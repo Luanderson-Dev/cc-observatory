@@ -11,6 +11,13 @@ The project is removed with its volumes at the end of the session, unless
 only returns what they logged since that session started (``service_started`` tells
 whether a container started in this session, so its start-up lines are among them).
 Run with ``uv run pytest -m integration --no-cov``; Docker must be running.
+
+Tests marked ``claude`` (``test_claude_real.py``) run real Claude Code sessions against
+the API with your login, so they cost a little money: they never run by default or in
+CI and skip unless ``CCOBS_IT_CLAUDE=1``. Run them with
+``CCOBS_IT_CLAUDE=1 uv run pytest -m claude --no-cov``, or only the cumulative
+re-export check, which needs this project and Docker, with
+``CCOBS_IT_CLAUDE=1 uv run pytest -m "claude and integration" --no-cov``.
 """
 
 from __future__ import annotations
