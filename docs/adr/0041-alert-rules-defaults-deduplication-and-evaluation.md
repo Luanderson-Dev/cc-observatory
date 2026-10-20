@@ -86,18 +86,43 @@ condition holds for a subject. For `waiting_user`, it runs while the session is
   cooldown.
 - Effects are `AlertFired(rule, subject, fired_at_ms, value, threshold)`, with value and
   threshold in the rule's unit (seconds, failures or US dollars), and
-  `AlertCleared(rule, subject, cleared_at_ms)`, sorted by key.
+  `AlertCleared(rule, subject, cleared_at_ms)`. Each evaluator returns its effects
+  sorted by subject; the writer calls the rules in a fixed order (stage 6 may add a
+  combined evaluation).
 
 **Evaluation.** The rules are pure functions of the current time, the configuration, the
 evaluator's state and the sessions. The writer thread, which already holds every open
 session in memory, evaluates them every 5 s (stage 6 of milestone 5). Two episodes of
-one session less than 5 s apart can therefore count as one.
+one session less than 5 s apart can therefore count as one. A condition that keeps
+coming back fires and clears repeatedly, at most once per cooldown: for example one
+failure every 4 minutes with N = 3 and W = 10 minutes.
 
 **"Repeated" failures** (this narrows ADR 0007). The rule counts `StopFailure` hook
-events only, of every `error` code, in one session within the window. It clears on a
-successful `Stop` in that session, or when the count within the window falls under N.
-Stage 2 of milestone 5 implements this clear rule; it must match this ADR before the
-ADR is accepted.
+events only, of every `error` code, in one session within the window. Each session
+keeps a sliding window of failure times, from the receive time of each hook event, and
+nothing else (no code, no text).
+
+- A failure counts while it is at most W old: at `now - W` it still counts. An episode
+  runs while N or more count, and fires once as above with the count as its value.
+- `StopFailure` counts in any scope: a subagent's API failure is a failure of the
+  session. Only a main-thread `Stop` (no `agent_id`) is a successful turn and drops
+  every failure of the session recorded before it, in processing order
+  ([ADR 0024](0024-session-agent-and-block-state-machine.md)), whatever their times, so
+  a clock that steps back never keeps an alert firing. A real inversion between one
+  turn's `Stop` and another's `StopFailure` cannot happen: a `UserPromptSubmit` and
+  seconds separate them. A subagent's `Stop` or `SubagentStop` proves nothing about the
+  main turn and resets nothing.
+- The episode clears, if it fired, when the count falls under N: failures age out, a
+  successful `Stop` drops them, or `SessionEnd` drops the session's window.
+- A failure that arrives out of order is inserted in time order. The window keeps only
+  the newest N times, since older ones can never complete a streak, so a late failure
+  older than a full window is dropped.
+  A failure timed after `now` (the clock went backwards) counts.
+- Memory stays bounded: at most N times per session, failures leave once they no longer
+  count, and a session with none leaves. A disabled rule records nothing and drops
+  every window. Changing N applies to the next failure recorded: lowering it fires on
+  the failures already in the window and trims the window at the next failure; raising
+  it lets the window grow to the new N.
 ADR 0007's "repeated `StopFailure` hook events or `claude_code.api_error` events" is
 narrowed to `StopFailure` in v0.6.0, because:
 
@@ -142,8 +167,14 @@ channels).
   cooldown (including 0), a clock that goes backwards, a disabled rule, sessions that
   disappear, and a replay of the `interactive-permission-compact` fixture whose dialog
   denied with Esc waits 102.8 s and fires once at the first evaluation past 30 s.
-- Later stages of milestone 5 add the tests of `repeated_failures`, of the cost rules
-  and of the writer's 5 s evaluation.
+- The same file covers `repeated_failures`: N failures within W fire once and spread
+  over more than W do not, a main-thread `Stop` resets (even one timed before the
+  failures) and a subagent's does not, aging out and `SessionEnd` clear, the cooldown,
+  a disabled rule, out-of-order failures, the bound of N times per session, lowering
+  and raising N, and a replay of the `headless-api-error`
+  fixture, whose single `StopFailure` (`model_not_found`) does not fire.
+- Later stages of milestone 5 add the tests of the cost rules and of the writer's 5 s
+  evaluation.
 - `tests/test_domain_telemetry.py` and `tests/test_cli_light.py` keep
   `ccobs.domain.alerts` free of I/O.
 

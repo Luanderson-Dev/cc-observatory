@@ -5,8 +5,8 @@ The unit tests of the reducer (``tests/test_domain_sessions.py``) and of the ale
 repository root on ``sys.path`` makes importable (``pythonpath = ["."]``), so the import
 works in every pytest import mode, unlike an import of one test module from another.
 
-``replay`` takes the receive time from each fixture line's ``offset_ms`` after ``BASE``,
-and the order from the line index.
+``timeline`` and ``replay`` take the receive time from each fixture line's ``offset_ms``
+after ``BASE``, and the order from the line index.
 
 The helpers fail with ``AssertionError``, as a test's ``assert`` would; they raise it
 explicitly because ``assert`` is reserved to test modules (ruff S101).
@@ -33,7 +33,7 @@ from ccobs.domain.sessions import (
     apply,
 )
 
-__all__ = ["BASE", "HOOK_FIXTURES", "SESSION", "Run", "event", "replay", "waited"]
+__all__ = ["BASE", "HOOK_FIXTURES", "SESSION", "Run", "event", "replay", "timeline", "waited"]
 
 HOOK_FIXTURES: Final = Path(__file__).resolve().parents[2] / "tests" / "fixtures" / "hooks"
 SESSION: Final = "00000000-0000-4000-8000-000000000000"
@@ -92,16 +92,20 @@ class Run:
         return found
 
 
+def timeline(name: str) -> list[tuple[int, HookEvent]]:
+    """The events of the hook fixture ``tests/fixtures/hooks/<name>.jsonl``, parsed, each
+    with its receive time, in file order."""
+    lines = (HOOK_FIXTURES / f"{name}.jsonl").read_text(encoding="utf-8").splitlines()
+    documents = [json.loads(line) for line in lines]
+    return [(BASE + d["offset_ms"], parse_hook(d["payload"])) for d in documents]
+
+
 def replay(name: str) -> Run:
     """The hook fixture ``tests/fixtures/hooks/<name>.jsonl`` fed through ``apply``."""
     run = Run()
-    lines = (HOOK_FIXTURES / f"{name}.jsonl").read_text(encoding="utf-8").splitlines()
-    for index, line in enumerate(lines):
-        document = json.loads(line)
+    for index, (at, hook) in enumerate(timeline(name)):
         run.seq = index + 1
-        run.state, run.last = apply(
-            run.state, parse_hook(document["payload"]), BASE + document["offset_ms"], run.seq
-        )
+        run.state, run.last = apply(run.state, hook, at, run.seq)
         run.effects.extend(run.last)
     return run
 
