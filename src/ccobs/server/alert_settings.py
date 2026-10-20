@@ -19,6 +19,13 @@
   change, nothing is written and the fragment says so.
 - ``POST /ui/alerts/settings/reset``: drop the saved value of ``field``, or every saved
   value without it; the settings fall back to the environment, then the defaults.
+- ``POST /ui/alerts/discord/test``: send the Discord test message now, through the
+  Discord sender's client (``DiscordSender.send_connection_test``, ADR 0046), on a worker
+  thread, and answer the button's fragment with a status line: sent, refused with its
+  status, or Discord unreachable with the reason in one word, never the URL. At most one
+  test per 10 s: a click sooner answers 200 with "Wait a few seconds before sending
+  another test." and sends nothing (htmx swaps only 2xx answers). The test is not an
+  alert: nothing is stored. Without a webhook, nothing is sent and the line says so.
 
 A save or reset that took answers with ``HX-Trigger: ccobs:alerts``, the event live.js
 dispatches on each alerts ping (ADR 0044): it bubbles to body, so the alerts page's
@@ -63,17 +70,20 @@ from ccobs.domain.alerts import (
     setting_value,
 )
 from ccobs.server.db.repository import ALERT_SETTING_TYPES, AlertSettingValue, Repository
+from ccobs.server.discord import ConnectionTestResult, connection_test_status
 from ccobs.server.reads import ReadGate
 from ccobs.server.ui import ErrorView, render
 from ccobs.server.writer import AlertSettingsResult, AlertSettingsUnavailableError
 
 __all__ = [
+    "DISCORD_TEST_PATH",
     "FORM_MAX_BYTES",
     "POST_PATHS",
     "RESET_PATH",
     "SETTINGS_PATH",
     "SETTINGS_WRITE_TIMEOUT_S",
     "AlertSettingsTarget",
+    "ConnectionTester",
     "SettingGroup",
     "SettingView",
     "router",
@@ -84,8 +94,9 @@ _log = logging.getLogger(__name__)
 
 SETTINGS_PATH: Final = "/ui/alerts/settings"
 RESET_PATH: Final = "/ui/alerts/settings/reset"
-# The only routes besides the hook route that take a POST (ADR 0045).
-POST_PATHS: Final = frozenset({SETTINGS_PATH, RESET_PATH})
+DISCORD_TEST_PATH: Final = "/ui/alerts/discord/test"
+# The only routes besides the hook route that take a POST (ADRs 0045 and 0046).
+POST_PATHS: Final = frozenset({SETTINGS_PATH, RESET_PATH, DISCORD_TEST_PATH})
 # How long a POST waits for the writer to apply its change (ADR 0045).
 SETTINGS_WRITE_TIMEOUT_S: Final = 5.0
 # The form holds ten short fields; anything much larger is not ours.
@@ -93,6 +104,10 @@ FORM_MAX_BYTES: Final = 4096
 _FORM_MAX_FIELDS: Final = 64
 _RESET_FIELD: Final = "field"
 _TEMPLATE: Final = "_alert_settings.html"
+_DISCORD_TEST_TEMPLATE: Final = "_discord_test.html"
+_DISCORD_OFF_MESSAGE: Final = (
+    "Discord is off. Set CCOBS_DISCORD_WEBHOOK_URL and restart the app to send a test."
+)
 _TRIGGER_HEADER: Final = "HX-Trigger"
 # The event live.js dispatches on each alerts ping (ADR 0044).
 _ALERTS_EVENT: Final = "ccobs:alerts"
@@ -187,6 +202,12 @@ class AlertSettingsTarget(Protocol):
     ) -> Future[AlertSettingsResult]: ...
 
     def submit_alert_settings_reset(self, field: str | None) -> Future[AlertSettingsResult]: ...
+
+
+class ConnectionTester(Protocol):
+    """What the test button needs of the Discord sender (``DiscordSender``)."""
+
+    def send_connection_test(self) -> ConnectionTestResult: ...
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -504,3 +525,20 @@ async def reset_settings(request: Request) -> Response:
     if result is None:
         return _error(_SERVICE_UNAVAILABLE, _NOT_SAVED)
     return _changed(_fragment(request, result.saved, message=_RESET_MESSAGE))
+
+
+@router.post(DISCORD_TEST_PATH, response_class=HTMLResponse)
+async def discord_test(request: Request) -> Response:
+    """Send the Discord test message (see the module's docstring)."""
+    tester: ConnectionTester | None = request.app.state.discord
+    if tester is None:
+        message = _DISCORD_OFF_MESSAGE
+    else:
+        # A blocking POST, bounded by the client's timeouts: off the event loop.
+        message = connection_test_status(await asyncio.to_thread(tester.send_connection_test))
+    return render(
+        _DISCORD_TEST_TEMPLATE,
+        status_code=200,
+        discord_test_path=DISCORD_TEST_PATH,
+        discord_test_message=message,
+    )

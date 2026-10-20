@@ -103,6 +103,8 @@ __all__ = [
     "AlertView",
     "Applied",
     "BoardRows",
+    "DeliveryUpdate",
+    "DueDeliveries",
     "HookEventRow",
     "Repository",
     "SessionCounts",
@@ -152,6 +154,7 @@ DELIVERY_BATCH_MAX: Final = 100
 _DAILY_COST: Final = "daily_cost"
 _PENDING: Final = "pending"
 _NO_DISCORD: Final = "none"
+_EXPIRED: Final = "expired"
 # The values the CHECK constraints allow, typed: a row's rule and delivery state.
 _RULES: Final[Mapping[str, AlertRule]] = {rule: rule for rule in ALERT_RULES}
 _DISCORD_STATES: Final[Mapping[str, DiscordState]] = {state: state for state in DISCORD_STATES}
@@ -315,6 +318,26 @@ class AlertView:
 
     alert: AlertRecord
     cwd: str | None
+
+
+@dataclass(frozen=True, kw_only=True)
+class DueDeliveries:
+    """What the Discord sender gets of one round (ADR 0046): how many pending deliveries
+    it expired, and the deliveries now due, with their sessions' ``cwd``."""
+
+    expired: int
+    alerts: list[AlertView]
+
+
+@dataclass(frozen=True, kw_only=True)
+class DeliveryUpdate:
+    """Where one alert's Discord delivery stands after an attempt: its state, how many
+    attempts were made and, while ``pending``, when the next is due."""
+
+    alert_id: int
+    state: DiscordState
+    attempts: int
+    next_at_ms: int | None = None
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -661,6 +684,68 @@ class Repository:
         )
         with self.engine.connect() as connection:
             return [_alert(row) for row in connection.execute(statement).mappings()]
+
+    def take_due_deliveries(
+        self, host: str, *, now_ms: int, expire_before_ms: int, limit: int
+    ) -> DueDeliveries:
+        """In one transaction on the writer's engine (ADR 0046): expire the host's
+        ``pending`` deliveries of alerts fired before ``expire_before_ms``, never sent,
+        then read the ``pending`` ones due at ``now_ms``, as ``due_deliveries`` orders and
+        caps them (``limit`` may be 0: expire only), with their sessions' ``cwd``."""
+        expire = (
+            update(AlertModel)
+            .where(
+                AlertModel.host == host,
+                AlertModel.discord_state == _PENDING,
+                AlertModel.fired_at_ms < expire_before_ms,
+            )
+            .values(discord_state=_EXPIRED, discord_next_at_ms=None)
+        )
+        session_cwd = SessionModel.cwd.label("session_cwd")
+        due = (
+            select(AlertModel.__table__, session_cwd)
+            .outerjoin(SessionModel, SessionModel.session_id == AlertModel.session_id)
+            .where(
+                AlertModel.host == host,
+                AlertModel.discord_state == _PENDING,
+                AlertModel.discord_next_at_ms <= now_ms,
+            )
+            .order_by(AlertModel.discord_next_at_ms, AlertModel.id)
+            .limit(_capped(limit, DELIVERY_BATCH_MAX))
+        )
+        with self.engine.begin() as connection:
+            expired = connection.execute(expire).rowcount
+            alerts = [
+                AlertView(alert=_alert(row), cwd=row["session_cwd"])
+                for row in connection.execute(due).mappings()
+            ]
+        return DueDeliveries(expired=expired, alerts=alerts)
+
+    def record_deliveries(self, host: str, updates: Sequence[DeliveryUpdate]) -> int:
+        """Record the outcome of one Discord attempt for each alert of ``updates``, in one
+        transaction: all or nothing (``IntegrityError`` for a ``pending`` one without a
+        time). Only deliveries still ``pending`` change; returns how many did. No
+        updates, no transaction."""
+        if not updates:
+            return 0
+        changed = 0
+        with self.engine.begin() as connection:
+            for item in updates:
+                statement = (
+                    update(AlertModel)
+                    .where(
+                        AlertModel.host == host,
+                        AlertModel.id == item.alert_id,
+                        AlertModel.discord_state == _PENDING,
+                    )
+                    .values(
+                        discord_state=item.state,
+                        discord_attempts=item.attempts,
+                        discord_next_at_ms=item.next_at_ms,
+                    )
+                )
+                changed += connection.execute(statement).rowcount
+        return changed
 
     def alert_keys(self, host: str, *, cooldown_since_ms: int) -> dict[AlertKey, KeyState]:
         """The evaluators' ``AlertState.keys`` after a restart (ADR 0041): every key with

@@ -17,6 +17,7 @@ import socket
 import sys
 from collections import Counter
 from collections.abc import Callable, Iterator, Sequence
+from concurrent.futures import Future
 from pathlib import Path
 from typing import Any, Final
 
@@ -34,6 +35,7 @@ import ccobs
 from ccobs.domain.alerts import ALERT_RULES, AlertConfig, CostSample
 from ccobs.domain.app_metrics import (
     AGENTS_RUNNING,
+    ALERT_DELIVERIES,
     ALERTS_FIRED,
     APP_METRICS,
     BLOCK_DURATION,
@@ -42,6 +44,7 @@ from ccobs.domain.app_metrics import (
     BLOCKS_OPEN,
     BUILD_INFO,
     DATABASE_WAL,
+    DELIVERY_RESULTS,
     EVENT_LABELS,
     HOOK_EVENTS_DROPPED,
     HOOK_EVENTS_PROCESSED,
@@ -67,7 +70,7 @@ from ccobs.domain.hook_config import HOOK_PATH
 from ccobs.server import app as server_app
 from ccobs.server.config import Settings
 from ccobs.server.db.models import AgentModel, BlockModel, HookEventModel, SessionModel
-from ccobs.server.db.repository import Repository
+from ccobs.server.db.repository import DeliveryUpdate, DueDeliveries, Repository
 from ccobs.server.ingest import DROP_REASONS, HookQueue
 from ccobs.server.metrics import (
     EXCLUSIVE_BIND_OPTION,
@@ -259,8 +262,9 @@ def test_the_exposition_has_exactly_the_documented_series(client: TestClient) ->
     assert "_created" not in text
     # The fixed total of ADR 0028, plus the two Loki query series of ADR 0029, the two
     # live stream series of ADR 0032, the four Prometheus query series of ADR 0035 and
-    # the four alert series of ADR 0041 (one per rule).
-    assert sum(len(found) for found in samples.values()) == 75
+    # the four alert series of ADR 0041 (one per rule) and the six Discord delivery
+    # series of ADR 0046 (one per result).
+    assert sum(len(found) for found in samples.values()) == 81
     for metric in APP_METRICS:
         assert samples[metric.name], metric.name
         for sample in samples[metric.name]:
@@ -280,6 +284,7 @@ def test_states_kinds_reasons_and_events_are_exported_with_zeros(client: TestCli
     assert by_label(samples, LOKI_QUERIES, "result") == dict.fromkeys(LOKI_RESULTS, 0)
     assert by_label(samples, PROMETHEUS_QUERIES, "result") == dict.fromkeys(PROMETHEUS_RESULTS, 0)
     assert by_label(samples, ALERTS_FIRED, "rule") == dict.fromkeys(ALERT_RULES, 0)
+    assert by_label(samples, ALERT_DELIVERIES, "result") == dict.fromkeys(DELIVERY_RESULTS, 0)
     for metric in (
         AGENTS_RUNNING,
         SESSIONS_ENDED,
@@ -563,6 +568,16 @@ def test_the_listener_stops_before_the_writer(settings: Settings, queue: HookQue
         def submit_cost_sample(self, sample: CostSample) -> None:
             pass
 
+        def submit_discord_round(
+            self, now_ms: int, *, expire_before_ms: int, limit: int
+        ) -> Future[DueDeliveries]:
+            found: Future[DueDeliveries] = Future()
+            found.set_result(DueDeliveries(expired=0, alerts=[]))
+            return found
+
+        def submit_discord_results(self, updates: Sequence[DeliveryUpdate]) -> None:
+            pass
+
         def counts(self) -> WriterCounts:
             return WriterCounts(
                 sessions_by_status={},
@@ -792,6 +807,36 @@ def test_prometheus_queries_are_counted_by_result() -> None:
         "error": 0,
         "timeout": 1,
         "invalid": 1,
+    }
+
+
+def test_discord_deliveries_are_counted_by_result() -> None:
+    # The Discord sender's on_delivery (ADR 0046): per alert, every result exported.
+    metrics = AppMetrics(HOST, HookQueue(1, 1))
+    metrics.count_alert_delivery("sent", 3)
+    metrics.count_alert_delivery("sent", 1)
+    metrics.count_alert_delivery("expired", 2)
+
+    _, samples = parse(generate_latest(metrics.registry).decode())
+
+    assert by_label(samples, ALERT_DELIVERIES, "result") == {
+        **dict.fromkeys(DELIVERY_RESULTS, 0),
+        "sent": 4,
+        "expired": 2,
+    }
+
+
+def test_the_writer_counts_expired_deliveries() -> None:
+    # The writer's on_discord_expired (ADR 0046): the deliveries it marked expired.
+    metrics = AppMetrics(HOST, HookQueue(1, 1))
+    metrics.count_expired_deliveries(3)
+    metrics.count_expired_deliveries(1)
+
+    _, samples = parse(generate_latest(metrics.registry).decode())
+
+    assert by_label(samples, ALERT_DELIVERIES, "result") == {
+        **dict.fromkeys(DELIVERY_RESULTS, 0),
+        "expired": 4,
     }
 
 

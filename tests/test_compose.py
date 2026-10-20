@@ -846,8 +846,12 @@ APP_FIXED_VARIABLES: Final = frozenset(
 )
 # The app's settings that compose derives from another variable instead of passing
 # through: Grafana's URL is Grafana's root URL (ADR 0017), from CCOBS_GRAFANA_PORT, since
-# Grafana redirects every other URL there, so .env does not offer it.
-APP_DERIVED_VARIABLES: Final = {"CCOBS_GRAFANA_URL": "http://localhost:${CCOBS_GRAFANA_PORT:-4330}"}
+# Grafana redirects every other URL there, so .env does not offer it. The app's own URL,
+# for the links of Discord messages (ADR 0046), is the port compose publishes it on.
+APP_DERIVED_VARIABLES: Final = {
+    "CCOBS_GRAFANA_URL": "http://localhost:${CCOBS_GRAFANA_PORT:-4330}",
+    "CCOBS_APP_URL": "http://localhost:${CCOBS_APP_PORT:-4300}",
+}
 # The app's secrets: passed through from the shell or .env with no default (a bare key,
 # null in compose.yaml), so an unset one stays unset in the container instead of being
 # written into compose.yaml, and .env.example offers them only as commented placeholders.
@@ -952,6 +956,13 @@ def test_app_links_to_grafanas_root_url() -> None:
     # redirect (ADR 0017), through the same port variable and default.
     root_url = _environment(_services(COMPOSE)["grafana"])["GF_SERVER_ROOT_URL"]
     assert _environment(_app())["CCOBS_GRAFANA_URL"] == root_url.removesuffix("/")
+
+
+def test_app_links_to_itself_on_its_published_port() -> None:
+    # The links of Discord messages open the app where compose publishes it (ADR 0046).
+    port = Settings.model_fields["port"].default
+    assert _app().get("ports") == [f"127.0.0.1:${{CCOBS_APP_PORT:-{port}}}:{port}"]
+    assert _environment(_app())["CCOBS_APP_URL"] == f"http://localhost:${{CCOBS_APP_PORT:-{port}}}"
 
 
 def test_app_compose_defaults_are_the_settings_defaults(monkeypatch: pytest.MonkeyPatch) -> None:

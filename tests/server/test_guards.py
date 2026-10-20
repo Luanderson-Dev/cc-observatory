@@ -1119,6 +1119,7 @@ def test_the_read_only_check_sees_every_route(app: FastAPI) -> None:
     assert "/ui/board" in paths
     assert "/ui/stream" in paths
     assert "/ui/alerts/settings/reset" in paths
+    assert "/ui/alerts/discord/test" in paths
     assert "/alerts" in paths
     assert "/ui/alerts/history" in paths
     assert "/static" + MOUNTED_FILE in paths
@@ -1164,6 +1165,8 @@ def test_the_only_post_routes_besides_the_hook_route_are_the_alert_settings_ones
         == {
             "/ui/alerts/settings",
             "/ui/alerts/settings/reset",
+            # The Discord test button (ADR 0046).
+            "/ui/alerts/discord/test",
         }
     )
 

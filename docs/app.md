@@ -603,13 +603,19 @@ the alerts counter in
 | `ccobs_ui_streams`                  | gauge     | `host`            | Live update streams open to the web UI.                                              |
 | `ccobs_ui_streams_refused_total`    | counter   | `host`            | Live update streams refused because 16 were already open.                            |
 | `ccobs_alerts_fired_total`          | counter   | `host`, `rule`    | Alerts that fired, by rule (the four rules, below).                                  |
+| `ccobs_alert_deliveries_total`      | counter   | `host`, `result`  | Alert deliveries to the Discord webhook, per alert, by result (below).               |
 
 - Every label takes its values from a closed list, and every value is exported, with 0
-  when empty: 75 series per host, however many sessions there are. No series has a
+  when empty: 81 series per host, however many sessions there are. No series has a
   session ID.
 - The alert rules are `waiting_user`, `repeated_failures`, `session_cost` and
   `daily_cost`; a fire counts once its alert is stored, and a restart in the middle of
   an episode does not fire it again.
+- The Discord delivery results are `sent`, `retried` (no answer, a timeout or a 5xx:
+  tried again later), `rate_limited` (a 429: tried again after Discord's wait),
+  `failed` (given up), `expired` (still unsent an hour after it fired) and `suspended`
+  (the webhook answered 401, 403 or 404: sending stops until the app restarts); all
+  stay at 0 without a webhook (ADR 0046).
 - The Prometheus query results are `ok`, `error` (no connection, a non-2xx status),
   `timeout` (no answer within 3 seconds) and `invalid` (an answer too large, not JSON,
   or with values that are not finite, non-negative numbers). Totals from the app's
@@ -750,6 +756,12 @@ follows `CCOBS_GRAFANA_PORT`. Outside compose it defaults to `http://localhost:4
 and the app accepts only `http` or `https` on the host name `localhost` (not
 `127.0.0.1`, which Grafana redirects), with an optional port and path and no user,
 query or fragment.
+
+Compose passes `CCOBS_APP_URL` the same way, the app as the browser opens it, for the
+session links in Discord messages: `http://localhost:<CCOBS_APP_PORT>`, the port compose
+publishes the app on. Outside compose it defaults to `http://localhost:4300`, and the
+app accepts only `http` on `localhost`, `127.0.0.1` or `[::1]`, with an optional port
+and nothing else (ADR 0046).
 
 The image sets `CCOBS_LISTEN_HOST` and relies on the code's defaults for three more,
 which compose never passes, so that the port mappings, the healthcheck, the scrape

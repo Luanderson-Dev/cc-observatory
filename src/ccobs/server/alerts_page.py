@@ -7,8 +7,9 @@
   it fired, and whether it is still on or cleared, and after how long. It pages by
   alert ``id`` like ``/api/v1/alerts``: ``?before=<id>`` shows the next older alerts.
   The settings are the form of ``ccobs.server.alert_settings`` with the same saved
-  values, a line that says whether alerts also go to Discord, and an empty slot for
-  the browser notifications control.
+  values, a line that says whether alerts also go to Discord, with the "Send test
+  message" button when they do (ADR 0046), and an empty slot for the browser
+  notifications control.
 - ``GET /ui/alerts/history``: the history alone, with the same ``before``. The history
   element refetches it on ``ccobs:alerts``, which live.js dispatches on each alerts ping
   of the stream and each time the stream opens (ADR 0044), and replaces itself.
@@ -42,7 +43,7 @@ from ccobs.domain.presentation import (
     format_duration,
     project_name,
 )
-from ccobs.server.alert_settings import settings_context
+from ccobs.server.alert_settings import DISCORD_TEST_PATH, settings_context
 from ccobs.server.db.repository import AlertSettingValue, AlertView, Repository
 from ccobs.server.reads import ReadGate
 from ccobs.server.ui import ErrorView, Moment, gated_read, grafana_home, moment, render
@@ -101,6 +102,8 @@ class HistoryView:
 class DiscordView:
     configured: bool
     names_project: bool
+    # The test button's route (ADR 0046), shown only when Discord is configured.
+    test_path: str
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -167,6 +170,7 @@ def _discord(request: Request) -> DiscordView:
     return DiscordView(
         configured=request.app.state.discord_configured,
         names_project=request.app.state.discord_include_project,
+        test_path=DISCORD_TEST_PATH,
     )
 
 

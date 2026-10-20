@@ -76,10 +76,12 @@ Windows).
   at three files of 10 MB, and 30 seconds to stop cleanly after SIGTERM (15 for Tempo).
   Every container runs as a non-root user.
 - **The app stops well inside its 30 seconds.** After SIGTERM, uvicorn waits at most 5
-  seconds for open requests; then the app stops its metrics listener, then its Loki
-  reconciler and its sweeper (up to 5 seconds each), and gives its writer up to 5
-  seconds to store the hooks still queued, counting any left as dropped. The worst case
-  is about 20 seconds; measured, `docker compose stop app` took 1.2 seconds and the
+  seconds for open requests; then the app stops its metrics listener, then its
+  background threads (the Loki reconciler, the Discord sender, the cost reader, the
+  alert ticker and the sweeper) together, up to 5 seconds for all of them, and gives its
+  writer up to 5 seconds to store the hooks still queued, counting any left as dropped.
+  The worst case is 15 seconds ([ADR 0046](adr/0046-discord-delivery.md)); measured
+  before the alert threads existed, `docker compose stop app` took 1.2 seconds and the
   container exited with code 0 ([ADR 0030](adr/0030-the-app-container.md)).
 
 ## Start, stop and update

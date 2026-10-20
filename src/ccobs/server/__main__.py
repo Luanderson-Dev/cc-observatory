@@ -23,6 +23,7 @@ from fastapi import FastAPI
 
 from ccobs.server.app import create_app
 from ccobs.server.config import Settings, SettingsError, load_settings
+from ccobs.server.discord import WEBHOOK_URL_FILTER
 
 __all__ = ["AppServer", "build_server", "configure_logging", "load_settings", "main"]
 
@@ -37,11 +38,15 @@ def configure_logging(settings: Settings) -> None:
     SQLAlchemy's engine logs statements and rows at INFO and DEBUG, and rows hold
     ``cwd`` (ADR 0006), so even ``CCOBS_LOG_LEVEL=debug`` must not reach them. Alembic
     is capped at WARNING too, since its INFO lines add nothing an operator needs. uvicorn
-    configures its own loggers.
+    configures its own loggers. The handler drops every record that names a Discord
+    webhook path (``WEBHOOK_URL_FILTER``, ADR 0046), whichever logger it comes from: the
+    filters on httpx's and httpcore's loggers are the first line, this one catches a
+    logger nobody named.
     """
     level = logging.getLevelNamesMapping()[settings.log_level.upper()]
     handler = logging.StreamHandler(sys.stderr)
     handler.setFormatter(logging.Formatter(_FORMAT))
+    handler.addFilter(WEBHOOK_URL_FILTER)
     for name, logger_level in (("ccobs", level), ("alembic", max(level, logging.WARNING))):
         logger = logging.getLogger(name)
         logger.setLevel(logger_level)
@@ -86,10 +91,10 @@ def build_server(settings: Settings, app: FastAPI | None = None) -> AppServer:
         # it reveals nothing.
         date_header=True,
         # After SIGTERM (and once AppServer has ended the live streams), wait at most 5 s
-        # for open requests before the lifespan's shutdown (reconciler, sweeper and
-        # writer, 5 s each), so the whole stop stays well inside compose's 30 s
-        # stop_grace_period (ADR 0030). Without it uvicorn waits for every open
-        # connection, however long.
+        # for open requests before the lifespan's shutdown (the background threads
+        # together, 5 s, then the writer, 5 s), so the whole stop, 15 s at worst, stays
+        # well inside compose's 30 s stop_grace_period (ADRs 0030 and 0046). Without it
+        # uvicorn waits for every open connection, however long.
         timeout_graceful_shutdown=5,
     )
     return AppServer(config, before_shutdown=app.state.live.close)

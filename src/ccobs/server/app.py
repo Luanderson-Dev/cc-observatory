@@ -11,16 +11,19 @@ port of its own (this app has no ``/metrics`` route), then the sweeper
 then the alert ticker (``ccobs.server.sweeps.AlertTicker``, ADR 0041), which submits the
 alert rules to the writer every 5 s, then the cost reader (``ccobs.server.costs``, ADR
 0043), which reads the cost rules' totals from Prometheus for the writer, then the
-reconciler (``ccobs.server.reconcile``, ADR 0029), which closes permission blocks denied
-with Esc from Loki. The usage reader (``ccobs.server.usage``, ADR 0035), which reads a
+Discord sender (``ccobs.server.discord``, ADR 0046), only when a webhook is configured,
+which sends the alerts' Discord deliveries through the writer, then the reconciler
+(``ccobs.server.reconcile``, ADR 0029), which closes permission blocks denied with Esc
+from Loki. The usage reader (``ccobs.server.usage``, ADR 0035), which reads a
 session's tokens and cost from Prometheus for the session page, opens with the metrics
 and closes last, like the hook failures reader of the diagnostics route
 (``ccobs.server.diagnostics``, ADR 0038), which reads Claude Code's hook failure counts
 from Loki. The live updates hub (``ccobs.server.live``, ADR 0032) opens on the event
 loop before the writer starts, and the writer tells it what each commit changed. At
 shutdown it closes the hub, which ends the UI's streams, then stops the listener, then
-the reconciler, then the cost reader, then the alert ticker, then the sweeper, then the
-writer, draining the queue, before it disposes the engines.
+the reconciler, then the Discord sender, then the cost reader, then the alert ticker,
+then the sweeper, all signalled at once and then joined against one deadline
+(``stop_together``), then the writer, draining the queue, before it disposes the engines.
 There are two (ADR 0033): the writer's, with one connection, and the readers',
 query-only, which the API reads through its read gate (``ccobs.server.reads``).
 """
@@ -29,7 +32,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import AsyncIterator, Callable
+import time
+from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Final, Protocol
@@ -47,6 +51,7 @@ from ccobs.server.costs import CostReader, CostTarget
 from ccobs.server.db.engine import create_engine_for, wal_enabled
 from ccobs.server.db.repository import Repository
 from ccobs.server.diagnostics import HookFailuresReader
+from ccobs.server.discord import DiscordSender, DiscordTarget
 from ccobs.server.guards import (
     HOOK_PATHS,
     ClientDisconnectedError,
@@ -78,14 +83,25 @@ from ccobs.server.sweeps import (
 from ccobs.server.usage import UsageReader
 from ccobs.server.writer import Writer, WriterCounts, WriterObservers
 
-__all__ = ["BackgroundWriter", "HookEndpoint", "WriterFactory", "create_app"]
+__all__ = [
+    "BackgroundThread",
+    "BackgroundWriter",
+    "HookEndpoint",
+    "WriterFactory",
+    "create_app",
+    "stop_together",
+]
 
 _log = logging.getLogger("ccobs.server")
 
 _POST: Final = "POST"
 _MS_PER_S: Final = 1000
+# The shutdown budget (ADR 0046, which supersedes ADR 0030's figure): uvicorn's 5 s for
+# open requests, then the background threads below, signalled together and joined
+# against one deadline (the longest of their timeouts, 5 s), then the writer's own 5 s:
+# 15 s at worst, well inside the 30 s stop_grace_period that compose.yaml gives the app.
 # How long shutdown waits for the writer to drain the queue before it counts the rest
-# as dropped; well inside the 30 s stop_grace_period that compose.yaml gives the app.
+# as dropped.
 WRITER_STOP_TIMEOUT_S: Final = 5.0
 # How long shutdown waits for the sweeper thread; its stop interrupts its wait at once.
 SWEEPER_STOP_TIMEOUT_S: Final = 5.0
@@ -99,15 +115,45 @@ RECONCILER_STOP_TIMEOUT_S: Final = 5.0
 # How long shutdown waits for the cost reader thread, like the reconciler's: its stop
 # interrupts its wait at once, and a query in flight is bounded by its 3 s per phase.
 COST_READER_STOP_TIMEOUT_S: Final = 5.0
+# How long shutdown waits for the Discord sender thread, like the cost reader's: its
+# stop interrupts its wait at once; a POST in flight is bounded by its 5 s per phase.
+DISCORD_SENDER_STOP_TIMEOUT_S: Final = 5.0
 
 
-class BackgroundWriter(SweepTarget, AlertTarget, ReconcileTarget, CostTarget, Protocol):
+class BackgroundThread(Protocol):
+    """A background thread the lifespan stops before the writer: ``request_stop``
+    interrupts its wait at once, ``stop`` joins it for at most ``timeout_s``."""
+
+    def request_stop(self) -> None: ...
+
+    def stop(self, timeout_s: float) -> None: ...
+
+
+def stop_together(
+    threads: Sequence[tuple[BackgroundThread, float]],
+    *,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> None:
+    """Signal every thread, then join each, in order, for at most its timeout and never
+    past one shared deadline (the longest timeout from now): threads stuck at once (a
+    Discord POST and a cost query) cost one timeout, not one each (ADR 0046)."""
+    for thread, _ in threads:
+        thread.request_stop()
+    deadline = monotonic() + max((timeout_s for _, timeout_s in threads), default=0.0)
+    for thread, timeout_s in threads:
+        thread.stop(max(0.0, min(timeout_s, deadline - monotonic())))
+
+
+class BackgroundWriter(
+    SweepTarget, AlertTarget, ReconcileTarget, CostTarget, DiscordTarget, Protocol
+):
     """What the app needs of the writer: ``Writer``, or a test double. The sweeper
     submits its ticks and retention through ``SweepTarget``'s methods, the alert ticker
     its alert ticks through ``AlertTarget``'s, the reconciler reads open blocks and
-    submits closes through ``ReconcileTarget``'s, and the cost reader reads the alert
+    submits closes through ``ReconcileTarget``'s, the cost reader reads the alert
     rules and the oldest open session and submits cost samples through
-    ``CostTarget``'s."""
+    ``CostTarget``'s, and the Discord sender submits its rounds and their outcomes
+    through ``DiscordTarget``'s."""
 
     def start(self) -> None: ...
 
@@ -200,6 +246,7 @@ def create_app(
     prometheus_transport: httpx.AsyncBaseTransport | None = None,
     cost_transport: httpx.BaseTransport | None = None,
     diagnostics_transport: httpx.AsyncBaseTransport | None = None,
+    discord_transport: httpx.BaseTransport | None = None,
     read_wait_timeout_s: float = READ_WAIT_TIMEOUT_S,
     stream_timing: StreamTiming | None = None,
     settings_timeout_s: float = alert_settings.SETTINGS_WRITE_TIMEOUT_S,
@@ -220,7 +267,12 @@ def create_app(
     (5 s by default), with that clock too, and the cost reader (``ccobs.server.costs``,
     ADR 0043) reads the cost rules' totals from ``settings.prometheus_url`` every 60 s
     while a cost rule is enabled, with that clock, through ``cost_transport`` (httpx's
-    by default); ``sweeps=False`` leaves all three off. The default
+    by default); ``sweeps=False`` leaves all three off, and the Discord sender's loop
+    too. When a Discord webhook is configured, the Discord sender
+    (``app.state.discord``, ADR 0046) is built in any case, for the settings screen's
+    test button, and its loop runs every 5 s with that clock, through
+    ``discord_transport`` (httpx's by default); without a webhook it is ``None``. The
+    default
     writer takes the alert rules of the settings (``Settings.alert_config``) and whether
     Discord is configured. The reconciler (``ccobs.server.reconcile``, ADR
     0029) polls ``settings.loki_url`` every ``reconcile_interval_s`` (2 s by default)
@@ -256,6 +308,7 @@ def create_app(
             stale_after_ms=stale_after_ms,
             on_block_closed=observers.on_block_closed,
             on_committed=observers.on_committed,
+            on_discord_expired=observers.on_discord_expired,
             alert_config=settings.alert_config,
             discord_configured=settings.discord_configured,
         )
@@ -332,6 +385,7 @@ def create_app(
             observers = WriterObservers(
                 on_block_closed=metrics.observe_block_closed,
                 on_committed=hub.notify_threadsafe,
+                on_discord_expired=metrics.count_expired_deliveries,
             )
             writer = make_writer(hook_queue, repo, observers)
             writer.start()
@@ -348,6 +402,8 @@ def create_app(
             app.state.cost_reader = None
             reconciler: Reconciler | None = None
             app.state.reconciler = None
+            discord: DiscordSender | None = None
+            app.state.discord = None
             try:
                 if sweeps:
                     # After the writer starts, inside the try that stops it.
@@ -377,6 +433,21 @@ def create_app(
                     )
                     costs.start()
                     app.state.cost_reader = costs
+                webhook_url = settings.discord_webhook_url
+                if webhook_url is not None:
+                    discord = DiscordSender(
+                        writer,
+                        webhook_url=webhook_url,
+                        host=settings.host_label,
+                        app_url=settings.app_url,
+                        include_project=settings.discord_include_project,
+                        clock=endpoint.clock,
+                        transport=discord_transport,
+                        on_delivery=metrics.count_alert_delivery,
+                    )
+                    app.state.discord = discord
+                    if sweeps:
+                        discord.start()
                 if reconcile and settings.telemetry_reconcile:
                     reconciler = Reconciler(
                         writer,
@@ -397,22 +468,26 @@ def create_app(
                 if listener is not None:
                     await asyncio.to_thread(listener.stop)
                     app.state.metrics_listener = None
-                # Before the sweeper and the writer: nothing is submitted to a stopping
-                # writer, and no query starts during shutdown.
-                if reconciler is not None:
-                    await asyncio.to_thread(reconciler.stop, RECONCILER_STOP_TIMEOUT_S)
-                    app.state.reconciler = None
-                # Before the ticker and the writer, for the same reasons.
-                if costs is not None:
-                    await asyncio.to_thread(costs.stop, COST_READER_STOP_TIMEOUT_S)
-                    app.state.cost_reader = None
-                # Before the writer stops, so nothing is submitted to a stopping writer.
-                if ticker is not None:
-                    await asyncio.to_thread(ticker.stop, ALERT_TICKER_STOP_TIMEOUT_S)
-                    app.state.alert_ticker = None
-                if sweeper is not None:
-                    await asyncio.to_thread(sweeper.stop, SWEEPER_STOP_TIMEOUT_S)
-                    app.state.sweeper = None
+                # Every background thread before the writer: nothing is submitted to a
+                # stopping writer, and no query or POST starts during shutdown. All are
+                # signalled at once, then joined against one deadline, so a stuck
+                # Discord POST and a stuck cost query cost one timeout, not two (ADR
+                # 0046). The Discord sender is stopped (and its client closed) even
+                # when its loop never ran.
+                background: list[tuple[BackgroundThread, float]] = [
+                    (thread, timeout_s)
+                    for thread, timeout_s in (
+                        (reconciler, RECONCILER_STOP_TIMEOUT_S),
+                        (discord, DISCORD_SENDER_STOP_TIMEOUT_S),
+                        (costs, COST_READER_STOP_TIMEOUT_S),
+                        (ticker, ALERT_TICKER_STOP_TIMEOUT_S),
+                        (sweeper, SWEEPER_STOP_TIMEOUT_S),
+                    )
+                    if thread is not None
+                ]
+                await asyncio.to_thread(stop_together, background)
+                for state in ("reconciler", "discord", "cost_reader", "alert_ticker", "sweeper"):
+                    setattr(app.state, state, None)
                 # No new hook enters the queue while the writer drains it.
                 endpoint.seq = None
                 # Off the event loop: the drain can take up to the timeout.

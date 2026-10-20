@@ -16,12 +16,14 @@ import pytest
 from ccobs.domain import app_metrics
 from ccobs.domain.alerts import ALERT_RULES
 from ccobs.domain.app_metrics import (
+    ALERT_DELIVERIES,
     ALERTS_FIRED,
     APP_METRICS,
     BLOCK_DURATION,
     BLOCK_DURATION_BUCKETS,
     BLOCK_KINDS,
     BUILD_INFO,
+    DELIVERY_RESULTS,
     EVENT_LABELS,
     HOOK_EVENTS_DROPPED,
     HOOK_EVENTS_RECEIVED,
@@ -68,6 +70,7 @@ def test_the_proposed_series_are_all_there() -> None:
         "ccobs_ui_streams": ("gauge", ("host",)),
         "ccobs_ui_streams_refused_total": ("counter", ("host",)),
         "ccobs_alerts_fired_total": ("counter", ("host", "rule")),
+        "ccobs_alert_deliveries_total": ("counter", ("host", "result")),
     }
 
 
@@ -160,3 +163,15 @@ def test_the_rules_are_the_alert_rules() -> None:
     # One series per rule of ADR 0041, exported with zeros (ADR 0028).
     assert ALERTS_FIRED.labels == (HOST_LABEL, "rule")
     assert ALERT_RULES == ("waiting_user", "repeated_failures", "session_cost", "daily_cost")
+
+
+def test_the_delivery_results_are_a_closed_set() -> None:
+    assert DELIVERY_RESULTS == (
+        "sent",
+        "retried",
+        "rate_limited",
+        "failed",
+        "expired",
+        "suspended",
+    )
+    assert ALERT_DELIVERIES.labels == (HOST_LABEL, "result")

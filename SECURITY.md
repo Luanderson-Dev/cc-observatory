@@ -216,8 +216,13 @@ to each part from the release that ships it.
       Loki to close permission prompts denied with Esc and for the diagnostics of
       `ccobs doctor` and `status`, and Prometheus for a session page's tokens and
       cost and, from v0.6.0, for the cost alerts' totals, at most once a minute and
-      only while a cost alert is enabled. The optional Discord webhook above will be
-      its only connection that leaves your machine.
+      only while a cost alert is enabled. The optional Discord webhook above is its
+      only connection that leaves your machine: a message per alert (up to ten
+      together) with the rule in words, the host label, the short session ID and a
+      local link, and the project name only with `CCOBS_DISCORD_INCLUDE_PROJECT=true`;
+      never a path, a prompt or error text. That connection alone follows the
+      container's `HTTPS_PROXY` and `NO_PROXY`, and stops at the first 401, 403 or 404
+      until the app restarts ([ADR 0046](docs/adr/0046-discord-delivery.md)).
 
   Tests check these settings in the configs and in the running stack, and
   [docs/stack.md](docs/stack.md#checking-that-nothing-leaves-the-machine) describes a
@@ -228,7 +233,8 @@ to each part from the release that ships it.
   DNS resolvers; the query carries only that name (with your network's search domain,
   if any).
 - **Secrets.** Secrets such as `CCOBS_DISCORD_WEBHOOK_URL` are read from the environment
-  and never logged.
+  and never logged: the app logs only status codes and error types for Discord, and drops
+  the HTTP client's own log lines that name the webhook.
 - **Settings backup.** `ccobs setup` backs up `~/.claude/settings.json` before changing
   it. The backup holds everything that file holds, including any secrets in its `env`
   block.

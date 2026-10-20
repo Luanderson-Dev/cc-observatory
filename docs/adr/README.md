@@ -74,3 +74,4 @@ the ADR wins.
 | [0043](0043-background-cost-queries-to-prometheus.md)                         | A background reader sends the cost alerts' queries to Prometheus once a minute        | Proposed |
 | [0044](0044-alerts-reach-the-browser.md)                                      | Alerts reach the browser: an alerts ping on every stream and an API to refetch        | Proposed |
 | [0045](0045-state-changing-routes-and-csrf.md)                                | Alert settings change over a POST guarded by Fetch Metadata, Origin and HX-Request    | Proposed |
+| [0046](0046-discord-delivery.md)                                              | Discord delivery: an outbox in the alerts table, sent by a thread through the writer  | Proposed |

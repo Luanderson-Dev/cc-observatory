@@ -17,6 +17,7 @@
       environment holds (P7). -#}
   {% if discord.configured %}
   <p class="alerts-discord">Alerts also go to your Discord webhook.{% if discord.names_project %} Messages name the project.{% endif %}</p>
+  {% with discord_test_path=discord.test_path, discord_test_message=None %}{% include "_discord_test.html" %}{% endwith %}
   {% else %}
   <p class="alerts-discord">Discord is off. Set <code>CCOBS_DISCORD_WEBHOOK_URL</code> in the stack's <code>.env</code> and restart the app to send alerts there too.</p>
   {% endif %}

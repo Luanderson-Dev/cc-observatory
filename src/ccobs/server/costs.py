@@ -190,6 +190,10 @@ class CostReader:
     def is_alive(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
 
+    def request_stop(self) -> None:
+        """Tell the loop to end, interrupting its wait; ``stop`` then joins it."""
+        self._stopping.set()
+
     def stop(self, timeout_s: float) -> None:
         """Stop the loop, interrupting its wait, join the thread for ``timeout_s`` and
         close the HTTP client."""

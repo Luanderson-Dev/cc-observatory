@@ -68,6 +68,7 @@ from ccobs.server.db.repository import (
     AlertSettingValue,
     AlertView,
     Applied,
+    DeliveryUpdate,
     HookEventRow,
     Repository,
     hook_event_row,
@@ -1358,6 +1359,130 @@ def test_set_delivery_moves_an_alert_through_its_states(repo: Repository) -> Non
     # A pending delivery needs a time.
     with pytest.raises(IntegrityError):
         repo.set_delivery(HOST, alert_id, state="pending", attempts=3)
+
+
+# The Discord sender's reads and writes, through the writer (ADR 0046).
+
+
+CWD: Final = "/home/someone/work/project"
+
+
+def test_taking_due_deliveries_expires_old_pending_ones_first(repo: Repository) -> None:
+    write = Writer(repo)
+    for session_id in (SESSION, OTHER):
+        write(event("UserPromptSubmit", session_id=session_id, cwd=CWD), BASE)
+
+    def pending(at: int, next_at: int, host: str = HOST, subject: str = SESSION) -> int:
+        return repo.insert_alert(
+            host, fired(subject, at=at), discord_state="pending", discord_next_at_ms=next_at
+        )
+
+    old = pending(BASE, BASE + 10**6)
+    edge = pending(BASE + 100, BASE + 100)
+    later = pending(BASE + 200, BASE + 150, subject=OTHER)
+    not_due = pending(BASE + 300, BASE + 10**6)
+    other_host = pending(BASE, BASE, host="other-host")
+    sent = repo.insert_alert(HOST, fired(at=BASE), discord_state="sent")
+
+    taken = repo.take_due_deliveries(HOST, now_ms=BASE + 200, expire_before_ms=BASE + 100, limit=10)
+
+    assert taken.expired == 1
+    assert [view.alert.id for view in taken.alerts] == [edge, later]
+    # With the session's cwd, which only the formatter turns into a project name.
+    assert [view.cwd for view in taken.alerts] == [CWD, CWD]
+    states = {a.id: (a.discord_state, a.discord_next_at_ms) for a in repo.list_alerts(HOST, 10)}
+    assert states[old] == ("expired", None)
+    assert states[edge][0] == states[later][0] == states[not_due][0] == "pending"
+    assert states[sent] == ("sent", None)
+    (other,) = repo.list_alerts("other-host", 10)
+    assert (other.id, other.discord_state) == (other_host, "pending")
+
+
+def test_taking_no_deliveries_still_expires(repo: Repository) -> None:
+    with_sessions(repo)
+    repo.insert_alert(HOST, daily(BASE), discord_state="pending", discord_next_at_ms=BASE)
+    due = repo.insert_alert(HOST, fired(at=BASE + 5), discord_state="pending", discord_next_at_ms=0)
+
+    taken = repo.take_due_deliveries(HOST, now_ms=BASE + 9, expire_before_ms=BASE + 1, limit=0)
+
+    assert (taken.expired, taken.alerts) == (1, [])
+    assert [a.id for a in repo.due_deliveries(HOST, BASE + 9, 10)] == [due]
+
+
+def test_taken_deliveries_are_capped(repo: Repository) -> None:
+    with_sessions(repo)
+    for _ in range(3):
+        repo.insert_alert(HOST, daily(BASE), discord_state="pending", discord_next_at_ms=BASE)
+
+    taken = repo.take_due_deliveries(HOST, now_ms=BASE, expire_before_ms=0, limit=2)
+    assert len(taken.alerts) == 2
+    (view, _) = taken.alerts
+    assert (view.alert.rule, view.cwd) == ("daily_cost", None)
+    capped = repo.take_due_deliveries(HOST, now_ms=BASE, expire_before_ms=0, limit=10**6)
+    assert len(capped.alerts) == 3
+
+
+def test_recorded_deliveries_change_only_pending_alerts_in_one_transaction(
+    repo: Repository,
+) -> None:
+    with_sessions(repo)
+    first = repo.insert_alert(HOST, fired(), discord_state="pending", discord_next_at_ms=BASE)
+    second = repo.insert_alert(HOST, daily(), discord_state="pending", discord_next_at_ms=BASE)
+    expired = repo.insert_alert(HOST, fired(OTHER), discord_state="expired")
+    begun: list[object] = []
+    record = begun.append
+    sa_event.listen(repo.engine, "begin", record)
+    try:
+        changed = repo.record_deliveries(
+            HOST,
+            [
+                DeliveryUpdate(alert_id=first, state="sent", attempts=1),
+                DeliveryUpdate(alert_id=second, state="pending", attempts=2, next_at_ms=BASE + 5),
+                DeliveryUpdate(alert_id=expired, state="sent", attempts=1),
+            ],
+        )
+    finally:
+        sa_event.remove(repo.engine, "begin", record)
+
+    assert changed == 2
+    assert len(begun) == 1
+    states = {
+        a.id: (a.discord_state, a.discord_attempts, a.discord_next_at_ms)
+        for a in repo.list_alerts(HOST, 10)
+    }
+    assert states == {
+        first: ("sent", 1, None),
+        second: ("pending", 2, BASE + 5),
+        expired: ("expired", 0, None),
+    }
+    # Another host's alerts are left alone; no updates, no transaction.
+    update_other = DeliveryUpdate(alert_id=second, state="failed", attempts=5)
+    assert repo.record_deliveries("other-host", [update_other]) == 0
+    begun.clear()
+    sa_event.listen(repo.engine, "begin", record)
+    try:
+        assert repo.record_deliveries(HOST, []) == 0
+    finally:
+        sa_event.remove(repo.engine, "begin", record)
+    assert begun == []
+
+
+def test_a_failed_record_changes_no_delivery(repo: Repository) -> None:
+    with_sessions(repo)
+    first = repo.insert_alert(HOST, fired(), discord_state="pending", discord_next_at_ms=BASE)
+    second = repo.insert_alert(HOST, daily(), discord_state="pending", discord_next_at_ms=BASE)
+
+    # A pending delivery needs a time: the second update breaks the CHECK.
+    with pytest.raises(IntegrityError):
+        repo.record_deliveries(
+            HOST,
+            [
+                DeliveryUpdate(alert_id=first, state="sent", attempts=1),
+                DeliveryUpdate(alert_id=second, state="pending", attempts=1),
+            ],
+        )
+
+    assert {a.discord_state for a in repo.list_alerts(HOST, 10)} == {"pending"}
 
 
 def test_alert_keys_rebuild_firing_keys_and_running_cooldowns(repo: Repository) -> None:

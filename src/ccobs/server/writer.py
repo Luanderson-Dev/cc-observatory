@@ -50,6 +50,19 @@ whose request gave up (its future cancelled) is skipped, and one still queued at
 settled with ``AlertSettingsUnavailableError``. A failed tick changes nothing in memory,
 so the next one tries again.
 
+The Discord sender (``ccobs.server.discord``, ADR 0046) never touches the database
+either. Each of its rounds is a ``DiscordRound`` with a future, which this thread
+settles with ``Repository.take_due_deliveries``: the deliveries pending too long
+expired and the ones now due read, in one transaction. Each attempt's outcome comes
+back as ``DiscordResults``, written in one transaction (``record_deliveries``). Both run
+in queue order, so a round never reads a delivery whose last outcome is still queued. A
+round whose sender gave up (its future cancelled) is skipped; one still queued at stop,
+or whose read fails, is settled with ``DiscordUnavailableError``; a failed record is
+logged by type and changes nothing, so those alerts are sent again (ADR 0046's
+at-least-once). The writer logs and counts the deliveries a round expires
+(``on_discord_expired``) itself: a sender that stopped waiting cannot cancel a round
+already running, and would never see them.
+
 Hooks still queued when ``stop`` runs out of time are counted ``internal``: ADR 0027
 already accepts that a stop loses what is still in memory and counts losses there, and
 ``internal`` is its reason for an app-side loss, so the drop reasons stay as recorded.
@@ -102,6 +115,8 @@ from ccobs.server.changes import ALERTS, ALL, HubEvent
 from ccobs.server.db.repository import (
     AlertSettingValue,
     Applied,
+    DeliveryUpdate,
+    DueDeliveries,
     Repository,
     hook_event_row,
 )
@@ -116,6 +131,9 @@ __all__ = [
     "BlockClosedCallback",
     "CommittedCallback",
     "Control",
+    "DiscordResults",
+    "DiscordRound",
+    "DiscordUnavailableError",
     "ResetAlertSettings",
     "Retention",
     "SaveAlertSettings",
@@ -143,15 +161,19 @@ type BlockClosedCallback = Callable[[BlockKind, float], None]
 # Receives the sessions each commit changed, or ALL (ADR 0032), or ALERTS after a tick
 # that wrote alert effects (ADR 0041).
 type CommittedCallback = Callable[[HubEvent], None]
+# Receives how many Discord deliveries a round just marked expired (ADR 0046).
+type DiscordExpiredCallback = Callable[[int], None]
 
 
 @dataclass(frozen=True, kw_only=True)
 class WriterObservers:
     """The callbacks the app gives the writer it builds: the block-duration histogram
-    (ADR 0028) and the live updates hub (ADR 0032)."""
+    (ADR 0028), the live updates hub (ADR 0032) and the count of expired Discord
+    deliveries (ADR 0046)."""
 
     on_block_closed: BlockClosedCallback
     on_committed: CommittedCallback
+    on_discord_expired: DiscordExpiredCallback | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -222,6 +244,29 @@ class ResetAlertSettings:
     result: Future[AlertSettingsResult]
 
 
+class DiscordUnavailableError(Exception):
+    """A Discord round got no deliveries: the writer stopped first, or the read failed.
+    The message never holds a value."""
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class DiscordRound:
+    """Expire the pending deliveries of alerts fired before ``expire_before_ms``, then
+    read up to ``limit`` deliveries due at ``now_ms``; ``result`` gets them."""
+
+    now_ms: int
+    expire_before_ms: int
+    limit: int
+    result: Future[DueDeliveries]
+
+
+@dataclass(frozen=True, slots=True)
+class DiscordResults:
+    """Record where each delivery of one Discord attempt stands."""
+
+    updates: tuple[DeliveryUpdate, ...]
+
+
 # A CostSample, the cost reader's latest answer, is stored for the next AlertTick.
 type Control = (
     Tick
@@ -231,6 +276,8 @@ type Control = (
     | AlertSettingsChanged
     | SaveAlertSettings
     | ResetAlertSettings
+    | DiscordRound
+    | DiscordResults
     | CostSample
 )
 
@@ -314,7 +361,8 @@ class Writer:
     A write that nothing in a batch survives makes the thread wait ``backoff_initial_s``,
     doubling up to ``backoff_max_s``, until a write succeeds. ``monotonic`` and ``sleep``
     are injectable for tests; the default sleep returns early when ``stop`` is called.
-    ``on_block_closed`` and ``on_committed`` are the observers (``WriterObservers``).
+    ``on_block_closed``, ``on_committed`` and ``on_discord_expired`` are the observers
+    (``WriterObservers``).
     ``alert_config`` is the alert rules the environment gives (``Settings.alert_config``,
     the defaults when ``None``), which saved settings override; ``discord_configured``
     whether a fired alert waits to be sent to Discord (``pending``) or never is
@@ -337,6 +385,7 @@ class Writer:
         on_committed: CommittedCallback | None = None,
         alert_config: AlertConfig | None = None,
         discord_configured: bool = False,
+        on_discord_expired: DiscordExpiredCallback | None = None,
         monotonic: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], object] | None = None,
     ) -> None:
@@ -353,6 +402,7 @@ class Writer:
         self._backoff_s = backoff_initial_s
         self._on_block_closed = on_block_closed
         self._on_committed = on_committed
+        self._on_discord_expired = on_discord_expired
         # The alert rules: the environment's, the effective ones (saved settings on top,
         # loaded at the first tick), and the evaluators' state, None until the first
         # tick rebuilds it from the database.
@@ -427,6 +477,10 @@ class Writer:
         for control in left:
             if isinstance(control, SaveAlertSettings | ResetAlertSettings):
                 self._settle_unavailable(control, "the writer stopped")
+            elif isinstance(control, DiscordRound) and (
+                control.result.set_running_or_notify_cancel()
+            ):
+                control.result.set_exception(DiscordUnavailableError("the writer stopped"))
         controls = len(left)
         if hooks or controls:
             _log.warning(
@@ -473,6 +527,18 @@ class Writer:
         result: Future[AlertSettingsResult] = Future()
         self._controls.put(ResetAlertSettings(field, result))
         return result
+
+    def submit_discord_round(
+        self, now_ms: int, *, expire_before_ms: int, limit: int
+    ) -> Future[DueDeliveries]:
+        """Queue a Discord round (ADR 0046); the future gets the deliveries due."""
+        result: Future[DueDeliveries] = Future()
+        self._controls.put(DiscordRound(now_ms, expire_before_ms, limit, result))
+        return result
+
+    def submit_discord_results(self, updates: Sequence[DeliveryUpdate]) -> None:
+        """Queue the outcome of one Discord attempt, written in one transaction."""
+        self._controls.put(DiscordResults(tuple(updates)))
 
     def _reserve_settings_change(self) -> None:
         with self._lock:
@@ -611,6 +677,10 @@ class Writer:
                 self._reload_alert_settings()
             elif isinstance(control, SaveAlertSettings | ResetAlertSettings):
                 self._change_alert_settings(control)
+            elif isinstance(control, DiscordRound):
+                self._discord_round(control)
+            elif isinstance(control, DiscordResults):
+                self._discord_results(control.updates)
             else:
                 self._cost_sample = control
         self._write(ops)
@@ -945,6 +1015,46 @@ class Writer:
             self._alerts = None
             return
         self._alerts = replace(state, failures=failures)
+
+    # The Discord sender's rounds (ADR 0046).
+
+    def _discord_round(self, control: DiscordRound) -> None:
+        """Expire and read the deliveries due, and settle the round's future; skipped if
+        the sender gave up first."""
+        if not control.result.set_running_or_notify_cancel():
+            return
+        try:
+            due = self._repository.take_due_deliveries(
+                self.host,
+                now_ms=control.now_ms,
+                expire_before_ms=control.expire_before_ms,
+                limit=control.limit,
+            )
+        except Exception as error:
+            _log.error("discord deliveries not read (%s)", type(error).__name__)
+            control.result.set_exception(DiscordUnavailableError("the read failed"))
+            return
+        # Counted here, where the rows changed: the sender may have given up on this
+        # round already (its cancel() fails once the round runs) and never read it.
+        if due.expired:
+            _log.warning("discord: %d alerts expired unsent", due.expired)
+            self._count_expired(due.expired)
+        control.result.set_result(due)
+
+    def _count_expired(self, count: int) -> None:
+        callback = self._on_discord_expired
+        if callback is None:
+            return
+        try:
+            callback(count)
+        except Exception as error:
+            _log.error("discord expiries not counted (%s)", type(error).__name__)
+
+    def _discord_results(self, updates: Sequence[DeliveryUpdate]) -> None:
+        try:
+            self._repository.record_deliveries(self.host, updates)
+        except Exception as error:
+            _log.error("discord deliveries not recorded (%s)", type(error).__name__)
 
     def _settle_unavailable(self, change: SaveAlertSettings | ResetAlertSettings, why: str) -> None:
         """Settle a change the writer will never apply, unless its request gave up."""

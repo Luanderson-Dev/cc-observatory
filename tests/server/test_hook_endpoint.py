@@ -20,6 +20,7 @@ import statistics
 import threading
 import time
 from collections.abc import Iterator, Sequence
+from concurrent.futures import Future
 from pathlib import Path
 from typing import Final
 
@@ -38,7 +39,12 @@ from ccobs.domain.sessions import apply
 from ccobs.server import app as server_app
 from ccobs.server.config import Settings
 from ccobs.server.db.engine import create_engine_for
-from ccobs.server.db.repository import Repository, hook_event_row
+from ccobs.server.db.repository import (
+    DeliveryUpdate,
+    DueDeliveries,
+    Repository,
+    hook_event_row,
+)
 from ccobs.server.ingest import (
     DROP_REASONS,
     HookQueue,
@@ -108,6 +114,16 @@ class IdleWriter:
         return None
 
     def submit_cost_sample(self, sample: CostSample) -> None:
+        pass
+
+    def submit_discord_round(
+        self, now_ms: int, *, expire_before_ms: int, limit: int
+    ) -> Future[DueDeliveries]:
+        found: Future[DueDeliveries] = Future()
+        found.set_result(DueDeliveries(expired=0, alerts=[]))
+        return found
+
+    def submit_discord_results(self, updates: Sequence[DeliveryUpdate]) -> None:
         pass
 
     def counts(self) -> WriterCounts:

@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
+import io
 import logging
 import os
+import pkgutil
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -15,6 +18,7 @@ from fastapi import FastAPI
 
 from ccobs.server import __main__ as server_main
 from ccobs.server import app as server_app
+from ccobs.server.discord import WEBHOOK_URL_FILTER, hide_webhook_urls
 
 
 @pytest.fixture(autouse=True)
@@ -120,21 +124,34 @@ def test_graceful_shutdown_fits_the_compose_stop_grace_period(
     runs: list[tuple[Any, dict[str, Any]]],
 ) -> None:
     # After SIGTERM the server ends the UI's live streams, then uvicorn waits at most this
-    # long for open requests, then runs the lifespan's shutdown: the reconciler, the
-    # sweeper and the writer get 5 s each. The sum stays well inside compose's 30 s
-    # stop_grace_period (ADR 0030), so Docker never has to kill the app (exit 137) with
-    # hooks still queued.
+    # long for open requests, then runs the lifespan's shutdown: the background threads
+    # (reconciler, Discord sender, cost reader, alert ticker, sweeper) are stopped
+    # together against one deadline, then the writer drains the queue with a budget of
+    # its own. The worst case (every thread stuck, say a Discord POST and a cost query at
+    # once) stays well inside compose's 30 s stop_grace_period (ADR 0030, ADR 0046), so
+    # Docker never has to kill the app (exit 137) with hooks still queued.
     server_main.main()
 
     ((_, kwargs),) = runs
-    budget = (
-        kwargs["timeout_graceful_shutdown"]
-        + server_app.RECONCILER_STOP_TIMEOUT_S
-        + server_app.SWEEPER_STOP_TIMEOUT_S
-        + server_app.WRITER_STOP_TIMEOUT_S
-    )
+    timeouts = {
+        name: value for name, value in vars(server_app).items() if name.endswith("_STOP_TIMEOUT_S")
+    }
+    writer = timeouts.pop("WRITER_STOP_TIMEOUT_S")
+    # Every other stop timeout belongs to a thread of the group stopped together
+    # (test_app_shutdown checks that the lifespan signals them all before it joins any);
+    # a new one fails here until it is placed in the group or the budget.
+    together = timeouts
+    assert set(together) == {
+        "RECONCILER_STOP_TIMEOUT_S",
+        "DISCORD_SENDER_STOP_TIMEOUT_S",
+        "COST_READER_STOP_TIMEOUT_S",
+        "ALERT_TICKER_STOP_TIMEOUT_S",
+        "SWEEPER_STOP_TIMEOUT_S",
+    }
+    worst_case = kwargs["timeout_graceful_shutdown"] + max(together.values()) + writer
     assert kwargs["timeout_graceful_shutdown"] == 5
-    assert budget <= 30 * 2 / 3
+    assert worst_case == 15
+    assert worst_case <= 30 * 2 / 3
 
 
 def test_listen_host_comes_from_the_settings(
@@ -211,3 +228,60 @@ def test_the_server_closes_the_live_streams_before_uvicorn_waits_for_connections
     asyncio.run(server.shutdown())
 
     assert order == ["close streams", "uvicorn shutdown"]
+
+
+# The webhook URL never reaches a log line (ADR 0046).
+
+WEBHOOK_URL = "https://discord.invalid/api/webhooks/123/CANARY-not-a-real-token"
+
+
+def _import_every_module(package: str) -> None:
+    """Import ``package`` and every submodule whose dependencies are installed, so each
+    logger they define exists."""
+    root = importlib.import_module(package)
+    for module in pkgutil.walk_packages(root.__path__, f"{package}."):
+        try:
+            importlib.import_module(module.name)
+        except ImportError:
+            continue  # an optional dependency (h2, socksio, trio, click) is missing
+
+
+def test_every_httpx_and_httpcore_logger_drops_webhook_records() -> None:
+    # A future httpx or httpcore that adds a logger fails here until it is named.
+    _import_every_module("httpx")
+    _import_every_module("httpcore")
+    hide_webhook_urls()
+
+    names = [
+        name
+        for name in logging.root.manager.loggerDict
+        if name.split(".")[0] in ("httpx", "httpcore")
+    ]
+    assert {"httpx", "httpcore", "httpcore.connection", "httpcore.http11"} <= set(names)
+    for name in names:
+        assert WEBHOOK_URL_FILTER in logging.getLogger(name).filters, name
+
+
+def test_the_app_handler_drops_webhook_records_from_any_logger(
+    runs: list[tuple[Any, dict[str, Any]]],
+) -> None:
+    server_main.main()
+    (handler,) = logging.getLogger("ccobs").handlers
+    assert isinstance(handler, logging.StreamHandler)
+    assert WEBHOOK_URL_FILTER in handler.filters
+    stream = io.StringIO()
+    handler.setStream(stream)
+
+    # A logger nobody put a filter on, whose records reach the app's handler.
+    fresh = logging.getLogger("ccobs.some.future.module")
+    fresh.warning("POST %s", WEBHOOK_URL)
+    fresh.warning("kept line")
+    # Any logger's record, handed to the handler directly.
+    record = logging.LogRecord(
+        "somelib.client", logging.ERROR, __file__, 1, "GET %s", (WEBHOOK_URL,), None
+    )
+    handler.handle(record)
+
+    assert "CANARY" not in stream.getvalue()
+    assert "/webhooks/" not in stream.getvalue()
+    assert "kept line" in stream.getvalue()

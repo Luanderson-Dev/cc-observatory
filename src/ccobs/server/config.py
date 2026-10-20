@@ -92,6 +92,15 @@ _USD_ALERTS: Final[dict[str, Callable[[float], AlertConfig]]] = {
         _ALERTS, daily_cost=replace(_ALERTS.daily_cost, limit_usd=value)
     ),
 }
+# The app as the browser opens it, for the links in Discord messages (ADR 0046): http on
+# one of the host names the Host guard allows (ADR 0034), with an optional port (1 to
+# 65535, no leading zero) and nothing else, matched whole in ASCII.
+_APP_URL: Final = re.compile(
+    r"http://(?:localhost|127\.0\.0\.1|\[::1\])"
+    r"(?::(?:[1-9][0-9]{0,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}"
+    r"|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5]))?/?",
+    re.ASCII,
+)
 # A Discord webhook URL, as Discord shows it to a channel's admin: https, one of
 # Discord's API hosts (discord.com, the API's documented host; discordapp.com, its
 # former domain; canary. and ptb., the hosts of Discord's test clients, whose "Copy
@@ -165,6 +174,11 @@ class Settings(BaseSettings):
     # fragment. Trailing slashes are stripped. compose derives it from
     # CCOBS_GRAFANA_PORT, as Grafana's own root URL.
     grafana_url: str = "http://localhost:4330"
+    # The app as the browser opens it, for the session links of Discord messages (ADR
+    # 0046): http on localhost, 127.0.0.1 or [::1] with an optional port, and nothing
+    # else; a trailing slash is stripped. compose derives it from CCOBS_APP_PORT, the
+    # port it publishes the app on, which the app cannot see from inside the container.
+    app_url: str = "http://localhost:4300"
     # Whether the app reads Claude Code's events back from Loki to complete hook data.
     telemetry_reconcile: bool = True
     log_level: Literal["debug", "info", "warning", "error"] = "info"
@@ -277,6 +291,17 @@ class Settings(BaseSettings):
         # accepts port 0.
         if parts.netloc.endswith(":") or (port is not None and not 1 <= port <= _MAX_PORT):
             raise ValueError(error)
+        return value.rstrip("/")
+
+    @field_validator("app_url")
+    @classmethod
+    def _check_app_url(cls, value: str) -> str:
+        if not _APP_URL.fullmatch(value):
+            raise ValueError(
+                "must be the app's URL as the browser opens it: http on localhost,"
+                " 127.0.0.1 or [::1], with an optional port and no user, path, query or"
+                " fragment"
+            )
         return value.rstrip("/")
 
     @field_validator(*_WHOLE_ALERTS, *_USD_ALERTS, mode="before")

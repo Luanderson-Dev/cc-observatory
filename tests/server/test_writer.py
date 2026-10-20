@@ -19,6 +19,7 @@ import threading
 import time
 from collections import Counter
 from collections.abc import Callable, Iterator, Sequence
+from concurrent.futures import Future
 from contextlib import contextmanager
 from datetime import timedelta
 from pathlib import Path
@@ -46,7 +47,14 @@ from ccobs.server.db.models import (
     SessionModel,
     SessionStateModel,
 )
-from ccobs.server.db.repository import Applied, HookEventRow, Repository, hook_event_row
+from ccobs.server.db.repository import (
+    Applied,
+    DeliveryUpdate,
+    DueDeliveries,
+    HookEventRow,
+    Repository,
+    hook_event_row,
+)
 from ccobs.server.ingest import DROP_REASONS, HookQueue, RawHook
 from ccobs.server.live import ChangeHub
 from ccobs.server.migrations import upgrade_to_head
@@ -414,6 +422,16 @@ def test_the_lifespan_uses_an_injected_writer_factory(settings: Settings) -> Non
             return None
 
         def submit_cost_sample(self, sample: CostSample) -> None:
+            pass
+
+        def submit_discord_round(
+            self, now_ms: int, *, expire_before_ms: int, limit: int
+        ) -> Future[DueDeliveries]:
+            found: Future[DueDeliveries] = Future()
+            found.set_result(DueDeliveries(expired=0, alerts=[]))
+            return found
+
+        def submit_discord_results(self, updates: Sequence[DeliveryUpdate]) -> None:
             pass
 
         def counts(self) -> WriterCounts:
