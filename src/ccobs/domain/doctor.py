@@ -40,7 +40,7 @@ from typing import Final, Literal, cast
 
 from ccobs.domain.diagnostics import UncountedHookFailures, parse_diagnostics
 from ccobs.domain.durations import parse_duration
-from ccobs.domain.hook_config import HOOK_PATH, hook_settings
+from ccobs.domain.hook_config import DEFAULT_APP_PORT, HOOK_PATH, hook_settings
 from ccobs.domain.settings_merge import is_ccobs_handler
 from ccobs.domain.telemetry import HOST_VALUE_PATTERN
 from ccobs.domain.telemetry_settings import (
@@ -105,8 +105,8 @@ __all__ = [
 type Status = Literal["ok", "warn", "fail", "info"]
 STATUSES: Final[tuple[Status, ...]] = ("ok", "warn", "fail", "info")
 
-# The stack's port block (ADR 0018); every URL is on IPv4 loopback.
-DEFAULT_APP_PORT: Final = 4300
+# The stack's port block (ADR 0018); every URL is on IPv4 loopback. DEFAULT_APP_PORT
+# comes from ccobs.domain.hook_config.
 DEFAULT_OTLP_PORT: Final = 4318
 DEFAULT_GRAFANA_PORT: Final = 4330
 _HOST: Final = "127.0.0.1"

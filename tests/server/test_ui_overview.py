@@ -666,10 +666,128 @@ def test_stored_values_are_escaped_everywhere(client: TestClient) -> None:
 # The empty state (P8).
 
 
+# What the strict CSP (ADR 0034) refuses in markup; test_static.py scans the templates,
+# these scan the rendered empty state.
+CSP_REFUSED: Final = (
+    re.compile(r"<script\b(?![^>]*\bsrc\s*=)[^>]*>", re.IGNORECASE),
+    re.compile(r"<style\b", re.IGNORECASE),
+    re.compile(r"\sstyle\s*=", re.IGNORECASE),
+    re.compile(r"\son[a-z]+\s*=", re.IGNORECASE),
+    re.compile(r"\shx-on", re.IGNORECASE),
+)
+
+
+def empty_state(body: str) -> str:
+    found = re.search(r'<div class="empty-state">.*?</details>\s*</div>', body, re.DOTALL)
+    assert found is not None
+    return found.group(0)
+
+
+def manual_path(body: str) -> str:
+    found = re.search(r"<details\b[^>]*>(.*?)</details>", empty_state(body), re.DOTALL)
+    assert found is not None
+    return found.group(1)
+
+
+def setup_command(body: str) -> str:
+    """The command as the Copy button copies it (the code element's textContent)."""
+    found = re.search(r'<code id="setup-command">(.*?)</code>', empty_state(body), re.DOTALL)
+    assert found is not None
+    return html.unescape(re.sub(r"<[^>]+>", "", found.group(1)))
+
+
+def test_each_word_of_the_setup_command_stays_whole_when_it_wraps(client: TestClient) -> None:
+    # On a phone the command wraps; a word such as --app-port must not split at its
+    # hyphens, so each word is a nowrap span and the spaces between them are the breaks.
+    body = page(client, "/", headers={"host": "localhost:4555"})
+
+    found = re.search(r'<code id="setup-command">(.*?)</code>', empty_state(body), re.DOTALL)
+    assert found is not None
+    assert found.group(1) == " ".join(
+        f'<span class="command-word">{word}</span>'
+        for word in ("uvx", "cc-observatory", "setup", "--app-port", "4555")
+    )
+
+
 def hook_json(body: str) -> Any:
-    found = re.search(r'<pre class="hook-settings"><code[^>]*>(.*?)</code></pre>', body, re.DOTALL)
+    """The hook settings, which only the collapsed manual path shows."""
+    found = re.search(
+        r'<pre class="hook-settings"><code id="hook-settings">(.*?)</code></pre>',
+        manual_path(body),
+        re.DOTALL,
+    )
     assert found is not None
     return json.loads(html.unescape(found.group(1)))
+
+
+@pytest.mark.parametrize("url", ["/", "/ui/board", "/sessions"])
+def test_an_empty_page_leads_with_ccobs_setup(client: TestClient, url: str) -> None:
+    body = page(client, url)
+    state = empty_state(body)
+
+    assert "<h2>No sessions yet</h2>" in state
+    assert setup_command(body) == "uvx cc-observatory setup"
+    assert "ccobs doctor" in state
+    # The command comes first; the manual path is collapsed after it.
+    assert state.index('id="setup-command"') < state.index("<details")
+    assert "<details open" not in state
+    assert re.search(r"<summary[^>]*>Connect one session without changing your settings<", state)
+
+
+@pytest.mark.parametrize(
+    ("host", "command"),
+    [
+        ("localhost:4300", "uvx cc-observatory setup"),
+        # No port in the Host header means http's 80, as the manual hook JSON says.
+        ("localhost", "uvx cc-observatory setup --app-port 80"),
+        ("localhost:4555", "uvx cc-observatory setup --app-port 4555"),
+        ("127.0.0.1:5300", "uvx cc-observatory setup --app-port 5300"),
+    ],
+)
+def test_the_setup_command_names_the_request_port_unless_it_is_the_default(
+    client: TestClient, host: str, command: str
+) -> None:
+    for url in ("/", "/sessions"):
+        assert setup_command(page(client, url, headers={"host": host})) == command
+
+
+def test_the_manual_path_explains_claude_settings(client: TestClient) -> None:
+    manual = manual_path(page(client, "/"))
+
+    assert "claude --settings" in manual
+    assert "docs/app.md" in manual
+
+
+def test_both_copy_buttons_target_an_element_of_the_empty_state(client: TestClient) -> None:
+    state = empty_state(page(client, "/ui/board"))
+
+    targets = re.findall(
+        r'<button type="button" class="copy-button" data-copy-target="([^"]+)"', state
+    )
+    assert targets == ["setup-command", "hook-settings"]
+    for target in targets:
+        assert state.count(f'id="{target}"') == 1
+
+
+@pytest.mark.parametrize("scan", CSP_REFUSED, ids=lambda scan: scan.pattern)
+def test_the_empty_state_holds_nothing_the_csp_refuses(
+    client: TestClient, scan: re.Pattern[str]
+) -> None:
+    for url in ("/ui/board", "/sessions"):
+        assert not scan.search(empty_state(page(client, url)))
+
+
+def test_the_csp_scans_of_the_empty_state_catch_what_they_must() -> None:
+    caught = [
+        "<script>x</script>",
+        "<style>",
+        '<p style="x">',
+        '<p onclick="x">',
+        '<a hx-on:click="x">',
+    ]
+    for scan, markup in zip(CSP_REFUSED, caught, strict=True):
+        assert scan.search(markup)
+    assert not any(scan.search('<script src="/static/js/app.js" defer>') for scan in CSP_REFUSED)
 
 
 def test_the_empty_board_shows_the_hook_settings_for_the_request_port(
@@ -677,8 +795,6 @@ def test_the_empty_board_shows_the_hook_settings_for_the_request_port(
 ) -> None:
     body = page(client, "/")
 
-    assert "No sessions yet" in body
-    assert "docs/app.md" in body
     assert hook_json(body) == hook_settings(f"http://127.0.0.1:4300{HOOK_PATH}", windows=False)
     assert hook_json(page(client, "/", headers={"host": "localhost:4555"})) == hook_settings(
         f"http://127.0.0.1:4555{HOOK_PATH}", windows=False

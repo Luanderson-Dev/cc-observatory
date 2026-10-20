@@ -29,7 +29,7 @@ from ccobs.cli.settings_file import (
     SettingsFileError,
 )
 from ccobs.cli.streams import tolerate_unencodable
-from ccobs.domain.hook_config import HOOK_PATH, hook_settings
+from ccobs.domain.hook_config import DEFAULT_APP_PORT, HOOK_PATH, hook_settings
 from ccobs.domain.settings_merge import SettingsShapeError, SetupState, merge
 from ccobs.domain.telemetry_settings import telemetry_env
 
@@ -45,8 +45,8 @@ __all__ = [
     "run_setup",
 ]
 
-# The stack's port block (ADR 0018); every URL is on IPv4 loopback.
-DEFAULT_APP_PORT: Final = 4300
+# The stack's port block (ADR 0018); every URL is on IPv4 loopback. DEFAULT_APP_PORT
+# comes from ccobs.domain.hook_config.
 DEFAULT_OTLP_PORT: Final = 4318
 PROBE_TIMEOUT_S: Final = 1.0
 _HOST: Final = "127.0.0.1"

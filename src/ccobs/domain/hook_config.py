@@ -26,6 +26,7 @@ __all__ = [
     "ASYNC_COMMAND_EVENTS",
     "ASYNC_COMMAND_TIMEOUT_S",
     "CURL_MAX_TIME_S",
+    "DEFAULT_APP_PORT",
     "DEFAULT_HOOK_URL",
     "FORBIDDEN_EVENTS",
     "HOOK_PATH",
@@ -37,8 +38,10 @@ __all__ = [
 ]
 
 HOOK_PATH: Final = "/hooks"
-# The app's port in the stack's port block (ADR 0018).
-DEFAULT_HOOK_URL: Final = "http://127.0.0.1:4300" + HOOK_PATH
+# The app's port in the stack's port block (ADR 0018): the one place the CLI, the
+# domain and the UI take it from.
+DEFAULT_APP_PORT: Final = 4300
+DEFAULT_HOOK_URL: Final = f"http://127.0.0.1:{DEFAULT_APP_PORT}{HOOK_PATH}"
 
 # Seconds. An http hook is cancelled after HTTP_TIMEOUT_S, which bounds what a hung app
 # costs each event. Claude Code does not enforce the timeout of an async command hook,
