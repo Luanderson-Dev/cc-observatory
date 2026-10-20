@@ -613,6 +613,10 @@ you; going back to an older app image after a migration is not supported
   60 seconds after the app starts, so it catches up after downtime, then every hour. A
   session that has not ended or gone stale is never deleted.
 - Both intervals are fixed in the code; they have no setting.
+- Alerts are stored too, without content, paths or project names
+  ([ADR 0042](adr/0042-alert-tables-settings-precedence-and-retention.md)): a session's
+  alerts go with the session, and the cleared daily-cost alerts go once they fired
+  longer ago than `CCOBS_APP_RETENTION`.
 
 ## Privacy
 
