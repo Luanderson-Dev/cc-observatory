@@ -1681,3 +1681,40 @@ def test_reset_deletes_one_setting_or_all_of_a_host(repo: Repository) -> None:
     assert repo.reset_alert_settings(HOST) == 0
     # Another host's settings are its own.
     assert repo.alert_settings("other-host") == {"alert_cooldown_s": 30}
+
+
+def test_several_settings_are_saved_in_one_call(repo: Repository) -> None:
+    repo.save_alert_setting(HOST, "alert_cooldown_s", 60, updated_at_ms=BASE)
+
+    repo.save_alert_settings(
+        HOST, {"alert_cooldown_s": 120, "alert_waiting_enabled": False}, updated_at_ms=BASE + 1
+    )
+
+    assert repo.alert_settings(HOST) == {"alert_cooldown_s": 120, "alert_waiting_enabled": False}
+    with repo.engine.connect() as connection:
+        rows = connection.execute(select(AlertSettingModel.__table__)).all()
+    assert {row.updated_at_ms for row in rows} == {BASE + 1}
+
+
+def test_saving_no_settings_writes_nothing(repo: Repository) -> None:
+    repo.save_alert_settings(HOST, {}, updated_at_ms=BASE)
+
+    assert repo.alert_settings(HOST) == {}
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("alert_cooldown_s", True, "^alert_cooldown_s must be a whole number$"),
+        ("CANARY-9e1d", 1, "^not an alert setting$"),
+    ],
+)
+def test_one_bad_setting_saves_none_of_them(
+    repo: Repository, field: str, value: object, message: str
+) -> None:
+    values = {"alert_failures_count": 4, field: cast("AlertSettingValue", value)}
+
+    with pytest.raises(ValueError, match=message):
+        repo.save_alert_settings(HOST, values, updated_at_ms=BASE)
+
+    assert repo.alert_settings(HOST) == {}

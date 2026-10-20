@@ -40,7 +40,8 @@ from fastapi.exceptions import RequestValidationError
 from starlette.routing import Route
 from starlette.types import Receive, Scope, Send
 
-from ccobs.server import api, diagnostics, live, ui
+from ccobs.domain.alerts import ALERT_SETTINGS
+from ccobs.server import alert_settings, api, diagnostics, live, ui
 from ccobs.server.config import Settings
 from ccobs.server.costs import CostReader, CostTarget
 from ccobs.server.db.engine import create_engine_for, wal_enabled
@@ -52,6 +53,7 @@ from ccobs.server.guards import (
     FetchMetadataGuard,
     HostGuard,
     SecurityHeaders,
+    UnsafeMethodGuard,
     declared_length,
     header_values,
     is_json_media_type,
@@ -200,6 +202,7 @@ def create_app(
     diagnostics_transport: httpx.AsyncBaseTransport | None = None,
     read_wait_timeout_s: float = READ_WAIT_TIMEOUT_S,
     stream_timing: StreamTiming | None = None,
+    settings_timeout_s: float = alert_settings.SETTINGS_WRITE_TIMEOUT_S,
 ) -> FastAPI:
     """The app, not started: its lifespan migrates the database, seeds ``seq``, runs the
     writer thread and the metrics listener.
@@ -234,6 +237,8 @@ def create_app(
     connection answers 503. The live updates hub is ``app.state.live``, built here so
     that the server can close it before uvicorn waits for open connections
     (``ccobs.server.__main__``); ``stream_timing`` sets its streams' intervals (tests).
+    The alert settings routes (``ccobs.server.alert_settings``, ADR 0045) wait
+    ``settings_timeout_s`` for the writer to apply a change before they answer 503.
     """
     hook_queue = queue or HookQueue(settings.hook_queue_max_items, settings.hook_queue_max_bytes)
     endpoint = HookEndpoint(
@@ -450,6 +455,11 @@ def create_app(
     app.state.grafana_url = settings.grafana_url
     app.state.host_label = settings.host_label
     app.state.stream_timing = stream_timing or StreamTiming()
+    # The alert settings routes (ADR 0045): the environment's rules, which settings it
+    # set (the others are the built-in defaults), and how long a change may take.
+    app.state.alert_env_config = settings.alert_config
+    app.state.alert_env_fields = frozenset(settings.model_fields_set & set(ALERT_SETTINGS))
+    app.state.settings_timeout_s = settings_timeout_s
     for path in sorted(HOOK_PATHS):
         app.router.routes.append(Route(path, endpoint, include_in_schema=False))
 
@@ -465,10 +475,14 @@ def create_app(
     app.include_router(ui.router)
     # The UI's live updates stream (ADR 0032).
     app.include_router(live.router)
+    # The alert settings fragment and its POST routes (ADR 0045).
+    app.include_router(alert_settings.router)
     app.mount("/static", ui.StaticAssets(), name="static")
     # The last one added is the outermost (ADR 0034): the Host guard, then the response
-    # headers (so that a 403 carries them), then Fetch Metadata. The hook route passes
-    # through the inner two untouched.
+    # headers (so that a 403 carries them), then Fetch Metadata, then the checks of the
+    # state-changing POST routes (ADR 0045), which need the Host the first one allowed.
+    # The hook route passes through the inner three untouched.
+    app.add_middleware(UnsafeMethodGuard, paths=alert_settings.POST_PATHS)
     app.add_middleware(FetchMetadataGuard)
     app.add_middleware(SecurityHeaders)
     app.add_middleware(HostGuard, queue=hook_queue)

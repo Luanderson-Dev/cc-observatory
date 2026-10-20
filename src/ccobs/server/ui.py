@@ -162,7 +162,9 @@ __all__ = [
     "SESSIONS_PAGE_SIZE",
     "STATIC_DIR",
     "TEMPLATES_DIR",
+    "ErrorView",
     "StaticAssets",
+    "render",
     "router",
 ]
 
@@ -445,6 +447,12 @@ def _setup_command(request: Request) -> str:
 def _render(name: str, *, status_code: int = 200, **context: object) -> HTMLResponse:
     body = _environment.get_template(name).render(**context)
     return HTMLResponse(body, status_code=status_code)
+
+
+def render(name: str, *, status_code: int = 200, **context: object) -> HTMLResponse:
+    """The template ``name`` rendered with the UI's environment (autoescape, an undefined
+    name fails), for the UI's other routers (``ccobs.server.alert_settings``)."""
+    return _render(name, status_code=status_code, **context)
 
 
 # Reads: one call on the gate per request.

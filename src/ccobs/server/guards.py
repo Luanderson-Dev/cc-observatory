@@ -1,4 +1,4 @@
-"""The app's browser defences (ADRs 0001, 0027 and 0034).
+"""The app's browser defences (ADRs 0001, 0027, 0034 and 0045).
 
 Any web page open in the user's browser can send requests to localhost, so:
 
@@ -19,9 +19,13 @@ Any web page open in the user's browser can send requests to localhost, so:
   same-site included (other ``localhost`` ports, such as Grafana's), unless it is a
   top-level ``GET`` navigation, and closes such websockets. Clients that send no
   ``Sec-Fetch-Site`` (curl, Prometheus, tests) pass.
+- ``UnsafeMethodGuard`` checks every ``POST`` to the state-changing routes it is given
+  (the alert settings routes, ADR 0045) with ``post_refusal``: same-origin Fetch
+  Metadata when sent, an ``Origin`` equal to ``<scheme>://<Host>``, ``HX-Request:
+  true`` and a urlencoded form; a short 403 (or 415 for the media type) otherwise.
 
-The hook route (``HOOK_PATHS``) is outside both: its answer stays the neutral empty 204
-with no headers, whatever the request says (CLAUDE.md, ADR 0011).
+The hook route (``HOOK_PATHS``) is outside all of them: its answer stays the neutral
+empty 204 with no headers, whatever the request says (CLAUDE.md, ADR 0011).
 
 Pure ASGI: Starlette's ``BaseHTTPMiddleware`` adds a task and a stream per request,
 which the hook route's latency budget (< 50 ms, CLAUDE.md) does not need.
@@ -49,11 +53,13 @@ __all__ = [
     "FetchMetadataGuard",
     "HostGuard",
     "SecurityHeaders",
+    "UnsafeMethodGuard",
     "declared_length",
     "fetch_allowed",
     "header_values",
     "host_allowed",
     "is_json_media_type",
+    "post_refusal",
     "read_body",
     "send_empty",
 ]
@@ -96,6 +102,12 @@ _NO_STORE: Final = (b"cache-control", b"no-store")
 # ``cwd`` or IDs, so the browser never stores it.
 STATIC_PREFIX: Final = "/static/"
 _FORBIDDEN_BODY: Final = b"forbidden\n"
+_UNSUPPORTED_BODY: Final = b"unsupported media type\n"
+_FORBIDDEN: Final = 403
+_UNSUPPORTED: Final = 415
+_POST: Final = "POST"
+_FORM: Final = "application/x-www-form-urlencoded"
+_SAME_ORIGIN: Final = b"same-origin"
 # Sec-Fetch-Site values of requests started by our own pages or by the user.
 _OWN_SITES: Final = frozenset({b"same-origin", b"none"})
 # Another site, or another port or scheme of ours: ``localhost:4330`` (Grafana) is
@@ -127,8 +139,12 @@ def host_allowed(value: str) -> bool:
 def is_json_media_type(value: bytes) -> bool:
     """Whether a ``Content-Type`` value is ``application/json``, with or without
     parameters such as ``charset``, in any case."""
+    return _is_media_type(value, _JSON)
+
+
+def _is_media_type(value: bytes, expected: str) -> bool:
     media_type = value.split(b";", 1)[0].strip()
-    return media_type.lower() == _JSON.encode()
+    return media_type.lower() == expected.encode()
 
 
 def declared_length(headers: Iterable[tuple[bytes, bytes]]) -> int | None:
@@ -306,3 +322,64 @@ class FetchMetadataGuard:
         else:
             _log.debug("request refused: Fetch Metadata")
             await _send_text(send, 403, _FORBIDDEN_BODY)
+
+
+def post_refusal(headers: Iterable[tuple[bytes, bytes]], scheme: str) -> int | None:
+    """Why a ``POST`` to a state-changing route is refused (ADR 0045), or None when it
+    passes. Each check takes exactly one value of its header, in this order:
+
+    1. ``Sec-Fetch-Site``, when sent, is ``same-origin`` (any case): never another
+       site, another port of ours or a typed URL;
+    2. ``Origin`` is ``<scheme>://<Host>`` (any case), with ``Host`` already on the
+       allowlist (``HostGuard``): never ``null``, missing, another port or scheme;
+    3. ``HX-Request`` is ``true``: a custom header that a page of another origin can
+       only send after a CORS preflight, which fails here (no CORS headers at all);
+    4. ``Content-Type`` is ``application/x-www-form-urlencoded``, parameters allowed:
+       what htmx's ``hx-post`` sends.
+
+    The first three failing answer 403; the last, 415.
+    """
+    headers = list(headers)
+    sites = header_values(headers, b"sec-fetch-site")
+    if sites and [site.lower() for site in sites] != [_SAME_ORIGIN]:
+        return _FORBIDDEN
+    hosts = header_values(headers, b"host")
+    origins = header_values(headers, b"origin")
+    if len(hosts) != 1 or len(origins) != 1:
+        return _FORBIDDEN
+    expected = f"{scheme}://{hosts[0].decode('latin-1')}".lower()
+    if origins[0].decode("latin-1").lower() != expected:
+        return _FORBIDDEN
+    if header_values(headers, b"hx-request") != [b"true"]:
+        return _FORBIDDEN
+    content_types = header_values(headers, b"content-type")
+    if len(content_types) != 1 or not _is_media_type(content_types[0], _FORM):
+        return _UNSUPPORTED
+    return None
+
+
+class UnsafeMethodGuard:
+    """Checks every ``POST`` to ``paths``, the state-changing routes, with
+    ``post_refusal`` (ADR 0045), and answers a refusal with a short 403 or 415 whose
+    body never quotes the request, without reading the body. Every other request, the
+    lifespan and websockets pass through: other methods on those paths, and any method
+    elsewhere, get the routes' own answers (405 where only ``GET`` is served).
+    """
+
+    def __init__(self, app: ASGIApp, *, paths: frozenset[str]) -> None:
+        self.app = app
+        self.paths = paths
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if (
+            scope["type"] != "http"
+            or scope["method"] != _POST
+            or scope["path"] not in self.paths
+            or (status := post_refusal(scope["headers"], scope["scheme"])) is None
+        ):
+            await self.app(scope, receive, send)
+            return
+        # Neither the headers nor the path are logged: both come from the request.
+        _log.debug("state-changing request refused (%d)", status)
+        body = _FORBIDDEN_BODY if status == _FORBIDDEN else _UNSUPPORTED_BODY
+        await _send_text(send, status, body)

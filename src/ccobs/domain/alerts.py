@@ -69,6 +69,7 @@ __all__ = [
     "SessionCostRule",
     "WaitingUserRule",
     "apply_saved_settings",
+    "apply_settings",
     "daily_cost_query",
     "evaluate_daily_cost",
     "evaluate_repeated_failures",
@@ -79,6 +80,8 @@ __all__ = [
     "record_failure_event",
     "session_cost_query",
     "session_cost_since",
+    "setting_error",
+    "setting_value",
     "validate_config",
     "waiting_since",
 ]
@@ -309,6 +312,77 @@ def validate_config(config: AlertConfig) -> tuple[FieldError, ...]:
     return tuple(
         _error(name, bounds) for name, bounds, value in checks if not _valid(value, bounds)
     )
+
+
+# The settings screen (ADR 0045): changes by flat name, with errors by flat name too.
+# Each number's bounds, and the flat name of each field validate_config names.
+_SETTING_BOUNDS: Final[Mapping[str, Bounds]] = {
+    "alert_waiting_threshold_s": WAITING_BOUNDS,
+    "alert_failures_count": FAILURE_COUNT_BOUNDS,
+    "alert_failures_window_s": FAILURE_WINDOW_BOUNDS,
+    "alert_session_cost_usd": COST_BOUNDS,
+    "alert_daily_cost_usd": COST_BOUNDS,
+    "alert_cooldown_s": COOLDOWN_BOUNDS,
+}
+_FLAT_NAMES: Final[Mapping[str, str]] = {
+    "waiting_user.threshold_s": "alert_waiting_threshold_s",
+    "repeated_failures.count": "alert_failures_count",
+    "repeated_failures.window_s": "alert_failures_window_s",
+    "session_cost.limit_usd": "alert_session_cost_usd",
+    "daily_cost.limit_usd": "alert_daily_cost_usd",
+    "cooldown_s": "alert_cooldown_s",
+}
+_VALUES: Final[Mapping[str, Callable[[AlertConfig], bool | int | float]]] = {
+    "alert_waiting_enabled": lambda c: c.waiting_user.enabled,
+    "alert_waiting_threshold_s": lambda c: c.waiting_user.threshold_s,
+    "alert_failures_enabled": lambda c: c.repeated_failures.enabled,
+    "alert_failures_count": lambda c: c.repeated_failures.count,
+    "alert_failures_window_s": lambda c: c.repeated_failures.window_s,
+    "alert_session_cost_enabled": lambda c: c.session_cost.enabled,
+    "alert_session_cost_usd": lambda c: c.session_cost.limit_usd,
+    "alert_daily_cost_enabled": lambda c: c.daily_cost.enabled,
+    "alert_daily_cost_usd": lambda c: c.daily_cost.limit_usd,
+    "alert_cooldown_s": lambda c: c.cooldown_s,
+}
+
+
+def setting_error(name: str) -> FieldError:
+    """The error of setting ``name`` (in ``ALERT_SETTINGS``): its name and what it takes,
+    a range for a number, never a value."""
+    bounds = _SETTING_BOUNDS.get(name)
+    if bounds is None:
+        return FieldError(field=name, message=f"{name} must be true or false")
+    return _error(name, bounds)
+
+
+def setting_value(config: AlertConfig, name: str) -> bool | int | float:
+    """The value of setting ``name`` (in ``ALERT_SETTINGS``) in ``config``."""
+    return _VALUES[name](config)
+
+
+def apply_settings(
+    base: AlertConfig, values: Mapping[str, object]
+) -> tuple[AlertConfig, tuple[FieldError, ...]]:
+    """``base`` with every setting of ``values`` replaced, and the errors of the ones of
+    the wrong type or out of bounds (``validate_config``), by flat name, in
+    ``ALERT_SETTINGS`` order; with any error, ``base`` itself. A name outside
+    ``ALERT_SETTINGS`` is skipped. The bounds of one setting never depend on another, so
+    each error belongs to the setting it names.
+    """
+    config = base
+    bad: set[str] = set()
+    for name in ALERT_SETTINGS:
+        if name not in values:
+            continue
+        candidate = _with_setting(config, name, values[name])
+        if candidate is None:
+            bad.add(name)
+        else:
+            config = candidate
+    bad.update(_FLAT_NAMES[error.field] for error in validate_config(config))
+    if not bad:
+        return config, ()
+    return base, tuple(setting_error(name) for name in ALERT_SETTINGS if name in bad)
 
 
 # State and effects.

@@ -57,9 +57,9 @@ behind another, and keeps the settings to one interval. The rules live in
 
 The cooldown, the minimum interval between two alerts with the same key, is 300 s by
 default, from 0 to 24 h. The global 300 s cooldown, and the choice of both channels for
-every rule, were set by the main context of milestone 5 on the architect's
-recommendation, not by the maintainer; the maintainer may still change them before this
-ADR is accepted. A disabled rule keeps a valid value, so turning it on never meets a bad
+every rule, were set during milestone 5's planning on the architect's recommendation,
+not by the maintainer; the maintainer may still change them before this ADR is
+accepted. A disabled rule keeps a valid value, so turning it on never meets a bad
 one. Seconds and failures take a whole number (an `int`) only, and dollar limits a whole
 or finite decimal number; a `bool` or any other type is invalid. A value out of bounds,
 or of the wrong type, is an error that names the field and the allowed range, never the
@@ -97,8 +97,8 @@ one session less than 5 s apart can therefore count as one. A condition that kee
 coming back fires and clears repeatedly, at most once per cooldown: for example one
 failure every 4 minutes with N = 3 and W = 10 minutes.
 
-How the writer runs them (stage 6 of milestone 5, set by its implementer on the main
-context's brief):
+How the writer runs them (set during the implementation of stage 6 of milestone 5,
+pending the maintainer's review):
 
 - **Cadence.** An alert ticker (`ccobs.server.sweeps.AlertTicker`), a daemon thread like
   the sweeper, submits an `AlertTick` to the writer's control channel every 5 s, with
@@ -227,8 +227,7 @@ queries ran) and evaluates it.
   limit as its threshold. **Hysteresis:** once fired, it lasts while the total stays at
   or above 90 % of the limit, and clears below it, so a rolling day that loses an old
   request and gains a new one around the limit does not clear and fire again. This 90 %
-  was set by the implementer of stage 3 on the main context's brief, pending the
-  maintainer's objection.
+  was set during stage 3's implementation, pending the maintainer's objection.
 - **Staleness:** a sample more than 180 s old at the evaluation (three of Claude Code's
   one-minute exports), or no sample at all (Prometheus down or its answer invalid),
   neither fires nor clears: an alert never clears because Prometheus stopped answering.

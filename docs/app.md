@@ -707,7 +707,10 @@ which has no login, defends itself
   `/static/`. A header a route sets itself is kept. An unhandled 500 from Starlette's
   error middleware carries none of them; its body is generic.
 - **Read-only.** Every route but the hook route serves only `GET`; any other method gets
-  a 405.
+  a 405. The only exception is the alert settings routes, `POST /ui/alerts/settings`
+  and `POST /ui/alerts/settings/reset` (ADR 0045), which answer 403 unless the request
+  is a same-origin htmx request (`Sec-Fetch-Site: same-origin` when sent, an `Origin`
+  equal to the app's, `HX-Request: true`) and 415 unless its body is a urlencoded form.
 - **The hook route is outside all of this.** It answers its empty 204 with no added
   header, whatever `Sec-Fetch-*` headers say (Claude Code sends none).
 - **Nothing extra.** No `/docs`, `/redoc` or `/openapi.json`, no access log, no

@@ -169,8 +169,9 @@ a new ADR supersedes it, and only the old one's status line changes.
   `cross-site` or `same-site` gets a 403 unless it is a top-level `GET` navigation), a
   strict CSP, `Cross-Origin-Resource-Policy` and `Cross-Origin-Opener-Policy`
   `same-origin`, `nosniff`, `no-referrer` and `Cache-Control: no-store` outside
-  `/static/` (ADR 0034). Every route but the hook route is `GET`-only. The hook route
-  is exempt and keeps its empty 2xx with no added header.
+  `/static/` (ADR 0034). Every route but the hook route is `GET`-only, except the alert
+  settings routes (`POST`, guarded as ADR 0045). The hook route is exempt and keeps its
+  empty 2xx with no added header.
 - Keep a `host` label on stored data for a future central mode, without implementing it.
 
 ### Code

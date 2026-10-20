@@ -785,19 +785,27 @@ class Repository:
         """Save one override, replacing the one saved before. ``ValueError`` for a name
         outside ``ALERT_SETTING_TYPES`` or a value of the wrong type; the message never
         holds the value, nor an unknown name."""
-        kind = ALERT_SETTING_TYPES.get(field)
-        if kind is None:
-            raise ValueError("not an alert setting")
-        if not _typed(kind, value):
-            raise ValueError(f"{field} must be {_KIND_NAMES[kind]}")
-        row = {
-            "host": host,
-            "field": field,
-            "value": json.dumps(value, allow_nan=False),
-            "updated_at_ms": updated_at_ms,
-        }
+        self.save_alert_settings(host, {field: value}, updated_at_ms=updated_at_ms)
+
+    def save_alert_settings(
+        self, host: str, values: Mapping[str, AlertSettingValue], *, updated_at_ms: int
+    ) -> None:
+        """Save several overrides in one transaction (the settings screen, ADR 0045):
+        all of them or, on any error, none. Each is checked as ``save_alert_setting``
+        checks one, before anything is written."""
+        rows = [
+            {
+                "host": host,
+                "field": field,
+                "value": _encoded_setting(field, value),
+                "updated_at_ms": updated_at_ms,
+            }
+            for field, value in values.items()
+        ]
+        if not rows:
+            return
         with self.engine.begin() as connection:
-            _upsert(connection, AlertSettingModel, ("host", "field"), [row])
+            _upsert(connection, AlertSettingModel, ("host", "field"), rows)
 
     def reset_alert_setting(self, host: str, field: str) -> bool:
         """Delete one override (Reset): the setting falls back to the environment's
@@ -1231,6 +1239,18 @@ def _typed(kind: type, value: object) -> bool:
     if kind is int:
         return isinstance(value, int)
     return isinstance(value, int) or (isinstance(value, float) and math.isfinite(value))
+
+
+def _encoded_setting(field: str, value: AlertSettingValue) -> str:
+    """A setting's value as stored (JSON keeps ``true``, ``30`` and ``30.0`` apart).
+    ``ValueError`` for a name outside ``ALERT_SETTING_TYPES`` or a value of the wrong
+    type; the message never holds the value, nor an unknown name."""
+    kind = ALERT_SETTING_TYPES.get(field)
+    if kind is None:
+        raise ValueError("not an alert setting")
+    if not _typed(kind, value):
+        raise ValueError(f"{field} must be {_KIND_NAMES[kind]}")
+    return json.dumps(value, allow_nan=False)
 
 
 def _decoded_setting(field: str, stored: str) -> AlertSettingValue | None:

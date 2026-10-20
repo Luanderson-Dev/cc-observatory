@@ -1,0 +1,32 @@
+{#- The alert settings form (alert_settings.py, ADR 0045): each setting's value in force
+    and where it comes from. htmx posts it to the guarded POST routes and swaps the answer
+    in its place; a switch sends a hidden false before its checkbox's true, so an
+    unchecked box still says false. -#}
+<form id="alert-settings" class="alert-settings" hx-post="{{ settings_path }}" hx-target="this" hx-swap="outerHTML">
+  {% if message %}
+  <p class="alert-settings__message" role="status">{{ message }}</p>
+  {% endif %}
+  {% for setting in settings %}
+  <div class="alert-settings__field">
+    {% if setting.kind == "switch" %}
+    <input type="hidden" name="{{ setting.name }}" value="false">
+    <input type="checkbox" id="{{ setting.name }}" name="{{ setting.name }}" value="true" aria-describedby="{{ setting.name }}-source{% if setting.error %} {{ setting.name }}-error{% endif %}"{% if setting.error %} aria-invalid="true"{% endif %}{% if setting.on %} checked{% endif %}>
+    <label for="{{ setting.name }}">{{ setting.label }}</label>
+    {% else %}
+    <label for="{{ setting.name }}">{{ setting.label }}</label>
+    <input type="text" id="{{ setting.name }}" name="{{ setting.name }}" value="{{ setting.value }}" inputmode="{{ 'numeric' if setting.kind == 'whole' else 'decimal' }}" aria-describedby="{{ setting.name }}-source{% if setting.error %} {{ setting.name }}-error{% endif %}"{% if setting.error %} aria-invalid="true"{% endif %}>
+    {% endif %}
+    <span id="{{ setting.name }}-source" class="alert-settings__source">{{ setting.source_label }}</span>
+    {% if setting.error %}
+    <span id="{{ setting.name }}-error" class="alert-settings__error">{{ setting.error }}</span>
+    {% endif %}
+    {% if setting.source == "saved" %}
+    <button type="button" name="field" value="{{ setting.name }}" hx-post="{{ reset_path }}" hx-target="closest form" hx-swap="outerHTML">Reset</button>
+    {% endif %}
+  </div>
+  {% endfor %}
+  <div class="alert-settings__actions">
+    <button type="submit">Save</button>
+    <button type="button" hx-post="{{ reset_path }}" hx-target="closest form" hx-swap="outerHTML">Reset all</button>
+  </div>
+</form>

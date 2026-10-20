@@ -26,7 +26,7 @@ from starlette.routing import Mount
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from ccobs.domain.hook_config import HOOK_PATH
-from ccobs.server import api, diagnostics, live, ui
+from ccobs.server import alert_settings, api, diagnostics, live, ui
 from ccobs.server import app as server_app
 from ccobs.server.config import Settings
 from ccobs.server.guards import (
@@ -36,10 +36,12 @@ from ccobs.server.guards import (
     FetchMetadataGuard,
     HostGuard,
     SecurityHeaders,
+    UnsafeMethodGuard,
     declared_length,
     header_values,
     host_allowed,
     is_json_media_type,
+    post_refusal,
     read_body,
 )
 from ccobs.server.ingest import HookQueue
@@ -863,22 +865,230 @@ def test_a_same_origin_websocket_reaches_the_app(app: FastAPI) -> None:
 
 def test_the_middlewares_wrap_in_order(app: FastAPI) -> None:
     # Outermost first: the Host guard, then the headers (so that a 403 carries them),
-    # then Fetch Metadata.
+    # then Fetch Metadata, then the state-changing routes' checks (ADR 0045).
     classes: list[object] = [middleware.cls for middleware in app.user_middleware]
 
     assert classes == [
         HostGuard,
         SecurityHeaders,
         FetchMetadataGuard,
+        UnsafeMethodGuard,
     ]
+    guard = app.user_middleware[classes.index(UnsafeMethodGuard)]
+    assert guard.kwargs == {"paths": alert_settings.POST_PATHS}
 
 
-# Read-only (ADR 0034): every route but the hook route answers only GET.
+# State-changing POST routes (ADR 0045): Fetch Metadata, Origin, HX-Request and the
+# form media type, in that order.
+
+FORM: Final = b"application/x-www-form-urlencoded"
+ORIGIN: Final = f"http://{GOOD_HOST}".encode()
+HTMX_POST: Final = (
+    (b"host", GOOD_HOST.encode()),
+    (b"origin", ORIGIN),
+    (b"sec-fetch-site", b"same-origin"),
+    (b"sec-fetch-mode", b"cors"),
+    (b"sec-fetch-dest", b"empty"),
+    (b"hx-request", b"true"),
+    (b"content-type", FORM),
+)
+
+
+def _with(
+    headers: Sequence[tuple[bytes, bytes]], **changes: bytes | None
+) -> list[tuple[bytes, bytes]]:
+    """``headers`` with each named header (``_`` for ``-``) replaced, or removed by None."""
+    names = {name.replace("_", "-").encode(): value for name, value in changes.items()}
+    kept = [(name, value) for name, value in headers if name not in names]
+    return kept + [(name, value) for name, value in names.items() if value is not None]
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        HTMX_POST,
+        # A browser without Fetch Metadata: Origin and HX-Request still hold.
+        _with(HTMX_POST, sec_fetch_site=None, sec_fetch_mode=None, sec_fetch_dest=None),
+        # htmx's XHR may carry a charset; case does not matter in a media type, nor in
+        # the host.
+        _with(HTMX_POST, content_type=b"application/x-www-form-urlencoded; charset=UTF-8"),
+        _with(HTMX_POST, content_type=b"Application/X-WWW-Form-Urlencoded"),
+        _with(HTMX_POST, sec_fetch_site=b"Same-Origin"),
+        _with(HTMX_POST, host=b"localhost:4300", origin=b"http://localhost:4300"),
+        _with(HTMX_POST, host=b"LocalHost:4300", origin=b"http://localhost:4300"),
+        _with(HTMX_POST, host=b"[::1]:4300", origin=b"http://[::1]:4300"),
+        # No port: http's default, which the browser leaves out of both.
+        _with(HTMX_POST, host=b"localhost", origin=b"http://localhost"),
+    ],
+    ids=[
+        "htmx",
+        "no-fetch-metadata",
+        "charset",
+        "media-type-case",
+        "site-case",
+        "localhost",
+        "host-case",
+        "ipv6",
+        "no-port",
+    ],
+)
+def test_a_same_origin_htmx_post_passes(headers: Sequence[tuple[bytes, bytes]]) -> None:
+    assert post_refusal(headers, "http") is None
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        _with(HTMX_POST, sec_fetch_site=b"cross-site"),
+        _with(HTMX_POST, sec_fetch_site=b"same-site"),
+        # A typed URL or a bookmark never posts.
+        _with(HTMX_POST, sec_fetch_site=b"none"),
+        _with(HTMX_POST, sec_fetch_site=b"evil"),
+        [*HTMX_POST, (b"sec-fetch-site", b"same-origin")],
+        _with(HTMX_POST, origin=None),
+        _with(HTMX_POST, origin=b"null"),
+        _with(HTMX_POST, origin=b""),
+        # Another port of the same host: Grafana, say.
+        _with(HTMX_POST, origin=b"http://127.0.0.1:4330"),
+        _with(HTMX_POST, origin=b"http://localhost:4300"),
+        _with(HTMX_POST, origin=b"https://127.0.0.1:4300"),
+        _with(HTMX_POST, origin=b"http://evil.example"),
+        _with(HTMX_POST, origin=ORIGIN + b"/"),
+        [*HTMX_POST, (b"origin", ORIGIN)],
+        _with(HTMX_POST, host=None),
+        [*HTMX_POST, (b"host", GOOD_HOST.encode())],
+        _with(HTMX_POST, hx_request=None),
+        _with(HTMX_POST, hx_request=b"false"),
+        _with(HTMX_POST, hx_request=b"1"),
+        [*HTMX_POST, (b"hx-request", b"true")],
+        # A form posted by a page of our own: a navigation, without HX-Request.
+        _with(HTMX_POST, sec_fetch_mode=b"navigate", sec_fetch_dest=b"document", hx_request=None),
+    ],
+    ids=[
+        "cross-site",
+        "same-site",
+        "site-none",
+        "site-unknown",
+        "two-sites",
+        "no-origin",
+        "origin-null",
+        "origin-empty",
+        "origin-other-port",
+        "origin-other-name",
+        "origin-https",
+        "origin-foreign",
+        "origin-slash",
+        "two-origins",
+        "no-host",
+        "two-hosts",
+        "no-hx-request",
+        "hx-request-false",
+        "hx-request-1",
+        "two-hx-requests",
+        "plain-form",
+    ],
+)
+def test_a_post_that_may_come_from_another_page_is_forbidden(
+    headers: Sequence[tuple[bytes, bytes]],
+) -> None:
+    assert post_refusal(headers, "http") == 403
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        _with(HTMX_POST, content_type=None),
+        _with(HTMX_POST, content_type=b"text/plain"),
+        _with(HTMX_POST, content_type=b"multipart/form-data; boundary=x"),
+        _with(HTMX_POST, content_type=b"application/json"),
+        [*HTMX_POST, (b"content-type", FORM)],
+    ],
+    ids=["none", "text-plain", "multipart", "json", "two"],
+)
+def test_a_same_origin_post_of_another_media_type_is_unsupported(
+    headers: Sequence[tuple[bytes, bytes]],
+) -> None:
+    assert post_refusal(headers, "http") == 415
+
+
+def test_the_origin_checks_come_before_the_media_type() -> None:
+    headers = _with(HTMX_POST, origin=b"null", content_type=b"text/plain")
+
+    assert post_refusal(headers, "http") == 403
+
+
+GUARDED: Final = "/guarded"
+
+
+async def _ok_app(scope: Scope, receive: Receive, send: Send) -> None:
+    await send({"type": "http.response.start", "status": 200, "headers": []})
+    await send({"type": "http.response.body", "body": b"ok"})
+
+
+def _guarded(method: str, path: str, headers: Sequence[tuple[bytes, bytes]]) -> Exchange:
+    guard = UnsafeMethodGuard(_ok_app, paths=frozenset({GUARDED}))
+    return asyncio.run(
+        _exchange(guard, method=method, path=path, headers=headers, chunks=(b"a=1",))
+    )
+
+
+def test_the_unsafe_method_guard_lets_a_good_post_through() -> None:
+    exchange = _guarded("POST", GUARDED, HTMX_POST)
+
+    assert (exchange.status, exchange.body) == (200, b"ok")
+
+
+@pytest.mark.parametrize(
+    ("headers", "status", "body"),
+    [
+        (_with(HTMX_POST, origin=b"null"), 403, b"forbidden\n"),
+        (_with(HTMX_POST, content_type=b"text/plain"), 415, b"unsupported media type\n"),
+    ],
+)
+def test_the_unsafe_method_guard_refuses_without_reading_the_body(
+    headers: Sequence[tuple[bytes, bytes]], status: int, body: bytes
+) -> None:
+    exchange = _guarded("POST", GUARDED, headers)
+
+    assert (exchange.status, exchange.body) == (status, body)
+    assert exchange.receive_calls == 0
+    assert exchange.headers[b"content-type"] == b"text/plain; charset=utf-8"
+
+
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [("GET", GUARDED), ("PUT", GUARDED), ("DELETE", GUARDED), ("POST", "/elsewhere")],
+)
+def test_the_unsafe_method_guard_checks_only_posts_to_its_paths(method: str, path: str) -> None:
+    assert _guarded(method, path, [(b"host", GOOD_HOST.encode())]).status == 200
+
+
+def test_the_unsafe_method_guard_lets_the_lifespan_and_websockets_through() -> None:
+    seen: list[str] = []
+
+    async def inner(scope: Scope, receive: Receive, send: Send) -> None:
+        seen.append(scope["type"])
+
+    guard = UnsafeMethodGuard(inner, paths=frozenset({GUARDED}))
+    for kind in ("lifespan", "websocket"):
+        asyncio.run(guard({"type": kind, "path": GUARDED, "headers": []}, _nothing, _nothing_sent))
+
+    assert seen == ["lifespan", "websocket"]
+
+
+# Read-only (ADR 0034): every route but the hook route answers only GET, except the
+# alert settings routes, which also take a guarded POST (ADR 0045).
 
 
 # The routers that create_app includes: FastAPI lists an included router in app.routes
 # as one entry without a path, so their routes are read from the routers themselves.
-INCLUDED_ROUTERS: Final = (api.router, diagnostics.router, ui.router, live.router)
+INCLUDED_ROUTERS: Final = (
+    api.router,
+    diagnostics.router,
+    ui.router,
+    live.router,
+    alert_settings.router,
+)
 # A file under a mount: the mount's own path matches nothing.
 MOUNTED_FILE: Final = "/x"
 
@@ -905,6 +1115,7 @@ def test_the_read_only_check_sees_every_route(app: FastAPI) -> None:
     assert "/" in paths
     assert "/ui/board" in paths
     assert "/ui/stream" in paths
+    assert "/ui/alerts/settings/reset" in paths
     assert "/static" + MOUNTED_FILE in paths
     assert not any("{" in path for path in paths)
     # A router included without being added to INCLUDED_ROUTERS fails here.
@@ -917,6 +1128,8 @@ def test_every_route_but_the_hook_route_is_read_only(
     client: TestClient, app: FastAPI, method: str
 ) -> None:
     for path in _route_paths(app):
+        if method == "POST" and path in alert_settings.POST_PATHS:
+            continue  # below
         response = client.request(method, path)
 
         assert response.status_code == 405, path
@@ -927,3 +1140,50 @@ def test_every_route_but_the_hook_route_is_read_only(
             assert "no-store" not in response.headers.get("cache-control", "")
         else:
             assert_security_headers(response.headers)
+
+
+def test_the_only_post_routes_besides_the_hook_route_are_the_alert_settings_ones(
+    app: FastAPI,
+) -> None:
+    posts = {
+        path
+        for router in INCLUDED_ROUTERS
+        for route in router.routes
+        if "POST" in getattr(route, "methods", set())
+        and (path := getattr(route, "path", None)) is not None
+    }
+
+    assert (
+        posts
+        == alert_settings.POST_PATHS
+        == {
+            "/ui/alerts/settings",
+            "/ui/alerts/settings/reset",
+        }
+    )
+
+
+@pytest.mark.parametrize("path", sorted(alert_settings.POST_PATHS))
+def test_a_post_to_the_alert_settings_routes_without_the_headers_is_forbidden(
+    client: TestClient, path: str
+) -> None:
+    response = client.post(path, data={"field": "alert_cooldown_s"})
+
+    assert response.status_code == 403
+    assert response.content == b"forbidden\n"
+    assert_security_headers(response.headers)
+    assert_no_cors(response.headers)
+
+
+@pytest.mark.parametrize("path", sorted(HOOK_PATHS))
+def test_the_hook_route_ignores_the_post_guard(
+    client: TestClient, queue: HookQueue, path: str
+) -> None:
+    # A request as a foreign page could send it: the hook route still drops it as a
+    # bad content type, with its neutral answer and no added header.
+    headers = {"origin": "null", "content-type": "text/plain", "sec-fetch-site": "cross-site"}
+    response = client.post(path, content=b"{}", headers=headers)
+
+    assert_neutral(response)
+    assert_no_added_headers(response.headers)
+    assert queue.depth == 0

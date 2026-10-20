@@ -464,7 +464,7 @@ def test_a_restart_rebuilds_the_failure_windows(
     assert summary(repo) == [("repeated_failures", SESSION, BASE + 4 * MINUTE, None)]
 
 
-def test_a_restart_with_the_failures_rule_off_drops_the_rebuilt_windows(
+def test_a_restart_with_the_failures_rule_off_drops_the_windows_until_it_is_back_on(
     make_writer: Callable[..., Writer], feed: Feeder, repo: AlertRepository
 ) -> None:
     writer = make_writer()
@@ -476,16 +476,21 @@ def test_a_restart_with_the_failures_rule_off_drops_the_rebuilt_windows(
     off = AlertConfig(repeated_failures=RepeatedFailuresRule(enabled=False))
     restarted = make_writer(alert_config=off)
     tick(restarted, BASE + 3 * MINUTE)
-    # The rule comes back on (a saved setting), and one more failure arrives: the two
-    # before it were dropped with the rule off (ADR 0042), so three never count.
+    fail(feed, BASE + 3 * MINUTE + SECOND)
+    run_all(restarted)
+    tick(restarted, BASE + 3 * MINUTE + 2 * SECOND)
+    assert alerts(repo) == []  # the windows were dropped with the rule off (ADR 0042)
+
+    # The rule comes back on (a saved setting): its windows are reloaded from the
+    # database, as a restart with the rule on would rebuild them (ADR 0045), so the
+    # three failures count at the next tick.
     repo.save_alert_setting(HOST, "alert_failures_enabled", True, updated_at_ms=BASE)
     restarted.submit_alert_settings_changed()
-    fail(feed, BASE + 4 * MINUTE)
     run_all(restarted)
     tick(restarted, BASE + 4 * MINUTE)
 
     assert restarted.alert_config().repeated_failures.enabled
-    assert alerts(repo) == []
+    assert summary(repo) == [("repeated_failures", SESSION, BASE + 4 * MINUTE, None)]
 
 
 # The effective configuration.

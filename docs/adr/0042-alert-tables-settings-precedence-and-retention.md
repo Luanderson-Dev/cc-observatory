@@ -56,9 +56,9 @@ Chosen options: "one row per overridden field, its value as JSON text" and "rebu
 from the alert rows and the hook events", because they store only what the user chose,
 round-trip each type exactly, and add no copy of state that other rows already hold.
 This ADR extends ADR 0005 and ADR 0026, which stay in force. The table and column names,
-the delivery states and the precedence rule below were set by the implementer of stage
-5 of milestone 5 on the main context's brief; precedence itself is the maintainer's
-decision P3.
+the delivery states and the precedence rule below were set during the implementation of
+stage 5 of milestone 5, pending the maintainer's review; precedence itself is the
+maintainer's decision P3.
 
 **Tables** (revision `0002`, `ccobs.server.db.models`). Times are UTC milliseconds.
 
