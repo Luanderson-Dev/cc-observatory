@@ -25,6 +25,19 @@ a batch that failed. Like the block observer, the callback must be quick and mus
 block (the hub only schedules work on the event loop); its errors are logged and never
 reach the writer.
 
+The alert rules (ADR 0041) run here too, over the sessions this thread holds. Every hook
+event a commit stores is recorded in the failure windows (``record_failure_event``), in
+the order it was applied. Every ``AlertTick`` (``submit_alert_tick``, every 5 s from
+``ccobs.server.sweeps.AlertTicker``) runs the rules in a fixed order, ``waiting_user``,
+``repeated_failures``, ``session_cost`` and ``daily_cost``, the cost rules on the last
+``CostSample`` submitted (``submit_cost_sample``), and writes their effects in one
+transaction (``Repository.apply_alert_effects``); then ``on_committed`` gets
+``ALERTS``. A tick without effects writes nothing. The evaluators' state is rebuilt from
+the database at the first tick (ADR 0042: the open and cooling keys, and the failure
+windows, dropped while ``repeated_failures`` is off), with the saved settings applied
+over the environment's (``apply_saved_settings``); ``submit_alert_settings_changed``
+reloads them. A failed tick changes nothing in memory, so the next one tries again.
+
 Hooks still queued when ``stop`` runs out of time are counted ``internal``: ADR 0027
 already accepts that a stop loses what is still in memory and counts losses there, and
 ``internal`` is its reason for an app-side loss, so the drop reasons stay as recorded.
@@ -42,6 +55,20 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Final
 
+from ccobs.domain.alerts import (
+    AlertConfig,
+    AlertEffect,
+    AlertFired,
+    AlertState,
+    CostSample,
+    apply_saved_settings,
+    evaluate_daily_cost,
+    evaluate_repeated_failures,
+    evaluate_session_cost,
+    evaluate_waiting_user,
+    forget_sessions,
+    record_failure_event,
+)
 from ccobs.domain.app_metrics import event_label
 from ccobs.domain.denials import OpenBlock
 from ccobs.domain.hooks import HookEvent, parse_hook
@@ -54,11 +81,13 @@ from ccobs.domain.sessions import (
     close_block_denied,
     mark_stale,
 )
-from ccobs.server.changes import ALL, Change
+from ccobs.server.changes import ALERTS, ALL, HubEvent
 from ccobs.server.db.repository import Applied, Repository, hook_event_row
 from ccobs.server.ingest import HookQueue, RawHook
 
 __all__ = [
+    "AlertSettingsChanged",
+    "AlertTick",
     "BlockClosedCallback",
     "CommittedCallback",
     "Control",
@@ -81,8 +110,9 @@ _MS_PER_S: Final = 1000
 
 # Receives each closed block's kind and how long it was open, in seconds.
 type BlockClosedCallback = Callable[[BlockKind, float], None]
-# Receives the sessions each commit changed, or ALL (ADR 0032).
-type CommittedCallback = Callable[[Change], None]
+# Receives the sessions each commit changed, or ALL (ADR 0032), or ALERTS after a tick
+# that wrote alert effects (ADR 0041).
+type CommittedCallback = Callable[[HubEvent], None]
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -117,7 +147,20 @@ class Retention:
     cutoff_ms: int
 
 
-type Control = Tick | TelemetryClose | Retention
+@dataclass(frozen=True, slots=True)
+class AlertTick:
+    """Run the alert rules at ``now_ms`` and write their effects (ADR 0041)."""
+
+    now_ms: int
+
+
+@dataclass(frozen=True, slots=True)
+class AlertSettingsChanged:
+    """Reload the saved alert settings: the settings screen saved or reset one."""
+
+
+# A CostSample, the cost reader's latest answer, is stored for the next AlertTick.
+type Control = Tick | TelemetryClose | Retention | AlertTick | AlertSettingsChanged | CostSample
 
 
 @dataclass(frozen=True, slots=True)
@@ -153,6 +196,7 @@ class WriterCounts:
     events_processed: int
     sessions_ended: int
     events_received: dict[str, int] = field(default_factory=dict)
+    alerts_fired: dict[str, int] = field(default_factory=dict)
 
 
 class _LoadError(Exception):
@@ -199,6 +243,10 @@ class Writer:
     doubling up to ``backoff_max_s``, until a write succeeds. ``monotonic`` and ``sleep``
     are injectable for tests; the default sleep returns early when ``stop`` is called.
     ``on_block_closed`` and ``on_committed`` are the observers (``WriterObservers``).
+    ``alert_config`` is the alert rules the environment gives (``Settings.alert_config``,
+    the defaults when ``None``), which saved settings override; ``discord_configured``
+    whether a fired alert waits to be sent to Discord (``pending``) or never is
+    (``none``).
     """
 
     def __init__(
@@ -215,11 +263,14 @@ class Writer:
         backoff_max_s: float = 30.0,
         on_block_closed: BlockClosedCallback | None = None,
         on_committed: CommittedCallback | None = None,
+        alert_config: AlertConfig | None = None,
+        discord_configured: bool = False,
         monotonic: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], object] | None = None,
     ) -> None:
         self.host: Final = host
         self.stale_after_ms: Final = stale_after_ms
+        self.discord_configured: Final = discord_configured
         self._queue = hook_queue
         self._repository = repository
         self._batch_max = batch_max
@@ -230,6 +281,13 @@ class Writer:
         self._backoff_s = backoff_initial_s
         self._on_block_closed = on_block_closed
         self._on_committed = on_committed
+        # The alert rules: the environment's, the effective ones (saved settings on top,
+        # loaded at the first tick), and the evaluators' state, None until the first
+        # tick rebuilds it from the database.
+        self._env_alerts = alert_config or AlertConfig()
+        self._alert_config = self._env_alerts
+        self._alerts: AlertState | None = None
+        self._cost_sample: CostSample | None = None
         self._monotonic = monotonic
         self._stopping = threading.Event()
         self._sleep: Callable[[float], object] = sleep or self._stopping.wait
@@ -243,6 +301,7 @@ class Writer:
         self._events = 0
         self._ended = 0
         self._received: Counter[str] = Counter()
+        self._fired: Counter[str] = Counter()
         # Per run_once: whether to back off, and the seqs already persisted or counted.
         self._failing = False
         self._settled: set[int] = set()
@@ -308,6 +367,15 @@ class Writer:
     def submit_retention(self, cutoff_ms: int) -> None:
         self._controls.put(Retention(cutoff_ms))
 
+    def submit_alert_tick(self, now_ms: int) -> None:
+        self._controls.put(AlertTick(now_ms))
+
+    def submit_cost_sample(self, sample: CostSample) -> None:
+        self._controls.put(sample)
+
+    def submit_alert_settings_changed(self) -> None:
+        self._controls.put(AlertSettingsChanged())
+
     # Reads, from any thread.
 
     def counts(self) -> WriterCounts:
@@ -316,6 +384,7 @@ class Writer:
             events = self._events
             ended = self._ended
             received = dict(self._received)
+            fired = dict(self._fired)
         return WriterCounts(
             sessions_by_status=dict(Counter(state.session.status for state in states)),
             open_blocks_by_kind=dict(
@@ -331,7 +400,13 @@ class Writer:
             events_processed=events,
             sessions_ended=ended,
             events_received=received,
+            alerts_fired=fired,
         )
+
+    def alert_config(self) -> AlertConfig:
+        """The alert rules in force: the environment's, with the saved settings on top
+        once the first tick has loaded them."""
+        return self._alert_config
 
     def open_permission_blocks(self) -> list[OpenBlock]:
         """The committed open permission blocks that have a ``tool_use_id``, which the
@@ -408,13 +483,20 @@ class Writer:
                 self._received.update(received)
         ops: list[_Op] = list(parsed)
         for control in controls:
-            if isinstance(control, Retention):
-                # After the writes queued before it, so it sees their effects.
-                self._write(ops)
-                ops = []
-                self._retain(control.cutoff_ms)
-            else:
+            if isinstance(control, Tick | TelemetryClose):
                 ops.append(control)
+                continue
+            # After the writes queued before it, so it sees their effects.
+            self._write(ops)
+            ops = []
+            if isinstance(control, Retention):
+                self._retain(control.cutoff_ms)
+            elif isinstance(control, AlertTick):
+                self._evaluate_alerts(control.now_ms)
+            elif isinstance(control, AlertSettingsChanged):
+                self._reload_alert_settings()
+            else:
+                self._cost_sample = control
         self._write(ops)
 
     def _parse(self, item: RawHook) -> _HookOp | None:
@@ -460,7 +542,7 @@ class Writer:
             )
             self._retry(planned)
             return
-        self._commit(view, applied)
+        self._commit(view, applied, planned)
 
     def _retry(self, ops: Sequence[_Op]) -> None:
         attempted = persisted = 0
@@ -475,7 +557,7 @@ class Writer:
             except Exception as error:
                 self._drop(op, "write failed", type(error).__name__)
                 continue
-            self._commit(view, applied)
+            self._commit(view, applied, [op])
             persisted += 1
         if attempted and not persisted:
             # Nothing could be written: likely the database itself (a full disk, a lock).
@@ -533,8 +615,9 @@ class Writer:
         else:
             _log.error("%s skipped: %s (%s)", type(op).__name__, what, error_type)
 
-    def _commit(self, view: _View, applied: Sequence[Applied]) -> None:
-        """The batch is in the database: make its states the committed ones."""
+    def _commit(self, view: _View, applied: Sequence[Applied], ops: Sequence[_Op]) -> None:
+        """The batch is in the database: make its states the committed ones, and record
+        its hook events in the failure windows, in the order they were applied."""
         ended = sum(
             1
             for item in applied
@@ -552,6 +635,7 @@ class Writer:
             self._events += sum(item.event_row is not None for item in applied)
             self._ended += ended
         self._settled.update(item.event_row.seq for item in applied if item.event_row)
+        self._record_failures(ops)
         self._backoff_s = self._backoff_initial_s
         callback = self._on_block_closed
         if callback is not None:
@@ -567,20 +651,108 @@ class Writer:
         except Exception as error:
             _log.error("retention failed (%s)", type(error).__name__)
             return
-        # The same rule as delete_older_than, so memory forgets exactly what went.
+        # Memory forgets exactly the sessions that went, alert state included: a
+        # failure window left behind would fire an alert for a session no longer
+        # stored, whose insert fails the whole tick.
         with self._lock:
-            gone = [
-                session_id
-                for session_id, state in self._states.items()
-                if state.session.status in _CLOSED and state.session.last_event_at_ms < cutoff_ms
-            ]
-            for session_id in gone:
-                del self._states[session_id]
-        _log.info("retention deleted %d sessions", deleted)
+            for session_id in deleted:
+                self._states.pop(session_id, None)
+        if self._alerts is not None:
+            self._alerts = forget_sessions(self._alerts, deleted)
+        _log.info("retention deleted %d sessions", len(deleted))
         if deleted:
             self._notify(ALL)
 
-    def _notify(self, change: Change) -> None:
+    # The alert rules (ADR 0041).
+
+    def _record_failures(self, ops: Sequence[_Op]) -> None:
+        """Feed committed hook events to ``record_failure_event``. Before the first tick
+        there is no state yet: it is rebuilt from the database, which holds them."""
+        state = self._alerts
+        if state is None:
+            return
+        for op in ops:
+            if isinstance(op, _HookOp):
+                state = record_failure_event(
+                    state, op.event, op.received_at_ms, config=self._alert_config
+                )
+        self._alerts = state
+
+    def _evaluate_alerts(self, now_ms: int) -> None:
+        """Run the rules at ``now_ms`` and write their effects in one transaction. On
+        any error nothing changes in memory: the next tick tries again."""
+        try:
+            state = self._alerts if self._alerts is not None else self._rebuild_alerts(now_ms)
+            state, effects = self._run_rules(state, now_ms)
+            if effects:
+                self._repository.apply_alert_effects(
+                    self.host, effects, discord_configured=self.discord_configured
+                )
+        except Exception as error:
+            _log.error("alert evaluation failed (%s)", type(error).__name__)
+            return
+        self._alerts = state
+        if not effects:
+            return
+        fired = Counter(effect.rule for effect in effects if isinstance(effect, AlertFired))
+        with self._lock:
+            self._fired.update(fired)
+        self._notify(ALERTS)
+
+    def _run_rules(self, state: AlertState, now_ms: int) -> tuple[AlertState, list[AlertEffect]]:
+        """Every rule, in a fixed order, over the committed sessions (O(sessions held))."""
+        config = self._alert_config
+        sample = self._cost_sample
+        sessions = list(self._states.values())
+        state, waiting = evaluate_waiting_user(state, sessions, config=config, now_ms=now_ms)
+        state, failures = evaluate_repeated_failures(state, config=config, now_ms=now_ms)
+        state, session_cost = evaluate_session_cost(
+            state, sample, sessions, config=config, now_ms=now_ms
+        )
+        state, daily_cost = evaluate_daily_cost(state, sample, config=config, now_ms=now_ms)
+        return state, [*waiting, *failures, *session_cost, *daily_cost]
+
+    def _rebuild_alerts(self, now_ms: int) -> AlertState:
+        """The evaluators' state after a start (ADR 0042), with the saved settings
+        loaded: the keys still firing or cooling down, and the failure windows, dropped
+        while ``repeated_failures`` is off."""
+        config = self._load_alert_config()
+        keys = self._repository.alert_keys(
+            self.host, cooldown_since_ms=now_ms - config.cooldown_s * _MS_PER_S
+        )
+        rule = config.repeated_failures
+        failures = (
+            self._repository.failure_windows(
+                self.host, since_ms=now_ms - rule.window_s * _MS_PER_S, count=rule.count
+            )
+            if rule.enabled
+            else {}
+        )
+        self._alert_config = config
+        _log.info("alerts rebuilt: %d keys, %d failure windows", len(keys), len(failures))
+        return AlertState(keys=keys, failures=failures)
+
+    def _load_alert_config(self) -> AlertConfig:
+        """The environment's rules with the saved settings on top; a saved value out of
+        bounds or of the wrong type is ignored, and logged by its name only."""
+        saved = self._repository.alert_settings(self.host)
+        config, ignored = apply_saved_settings(self._env_alerts, saved)
+        if ignored:
+            _log.warning(
+                "ignored saved alert settings out of bounds or of the wrong type: %s",
+                ", ".join(ignored),
+            )
+        return config
+
+    def _reload_alert_settings(self) -> None:
+        if self._alerts is None:
+            return  # the first tick loads them
+        try:
+            self._alert_config = self._load_alert_config()
+        except Exception as error:
+            _log.error("alert settings not reloaded (%s)", type(error).__name__)
+
+    def _notify(self, change: HubEvent) -> None:
         """Tell ``on_committed`` what a commit changed; an error is logged, not raised."""
         callback = self._on_committed
         if callback is None:

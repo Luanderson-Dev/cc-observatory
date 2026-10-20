@@ -14,7 +14,9 @@ from typing import Final, get_args
 import pytest
 
 from ccobs.domain import app_metrics
+from ccobs.domain.alerts import ALERT_RULES
 from ccobs.domain.app_metrics import (
+    ALERTS_FIRED,
     APP_METRICS,
     BLOCK_DURATION,
     BLOCK_DURATION_BUCKETS,
@@ -65,6 +67,7 @@ def test_the_proposed_series_are_all_there() -> None:
         "ccobs_prometheus_queries_total": ("counter", ("host", "result")),
         "ccobs_ui_streams": ("gauge", ("host",)),
         "ccobs_ui_streams_refused_total": ("counter", ("host",)),
+        "ccobs_alerts_fired_total": ("counter", ("host", "rule")),
     }
 
 
@@ -151,3 +154,9 @@ def test_build_info_and_the_listener_constants() -> None:
     assert BUILD_INFO.labels == (HOST_LABEL, "version")
     assert METRICS_PATH == "/metrics"
     assert SCRAPE_JOB == "ccobs-app"
+
+
+def test_the_rules_are_the_alert_rules() -> None:
+    # One series per rule of ADR 0041, exported with zeros (ADR 0028).
+    assert ALERTS_FIRED.labels == (HOST_LABEL, "rule")
+    assert ALERT_RULES == ("waiting_user", "repeated_failures", "session_cost", "daily_cost")

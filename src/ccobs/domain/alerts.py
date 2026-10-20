@@ -31,7 +31,7 @@ Standard library only, and no I/O: the CLI imports the domain (tests/test_cli_li
 from __future__ import annotations
 
 import math
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from typing import Final, Literal
 
@@ -43,6 +43,7 @@ from ccobs.domain.usage import parse_vector, usage_window
 
 __all__ = [
     "ALERT_RULES",
+    "ALERT_SETTINGS",
     "COOLDOWN_BOUNDS",
     "COST_BOUNDS",
     "COST_CLEAR_RATIO",
@@ -67,11 +68,13 @@ __all__ = [
     "RepeatedFailuresRule",
     "SessionCostRule",
     "WaitingUserRule",
+    "apply_saved_settings",
     "daily_cost_query",
     "evaluate_daily_cost",
     "evaluate_repeated_failures",
     "evaluate_session_cost",
     "evaluate_waiting_user",
+    "forget_sessions",
     "parse_cost_sample",
     "record_failure_event",
     "session_cost_query",
@@ -200,6 +203,93 @@ def _valid(value: object, bounds: Bounds) -> bool:
     else:
         return False
     return bounds.minimum <= number <= bounds.maximum
+
+
+# Saved settings (ADR 0042): each setting by its flat name, the Settings field behind
+# CCOBS_<NAME> and the field of its alert_settings row, with how it replaces its value
+# in a config. Switches take a bool, seconds and counts an int, and dollar limits an int
+# or a float.
+_SWITCHES: Final[Mapping[str, Callable[[AlertConfig, bool], AlertConfig]]] = {
+    "alert_waiting_enabled": lambda c, v: replace(
+        c, waiting_user=replace(c.waiting_user, enabled=v)
+    ),
+    "alert_failures_enabled": lambda c, v: replace(
+        c, repeated_failures=replace(c.repeated_failures, enabled=v)
+    ),
+    "alert_session_cost_enabled": lambda c, v: replace(
+        c, session_cost=replace(c.session_cost, enabled=v)
+    ),
+    "alert_daily_cost_enabled": lambda c, v: replace(
+        c, daily_cost=replace(c.daily_cost, enabled=v)
+    ),
+}
+_WHOLE: Final[Mapping[str, Callable[[AlertConfig, int], AlertConfig]]] = {
+    "alert_waiting_threshold_s": lambda c, v: replace(
+        c, waiting_user=replace(c.waiting_user, threshold_s=v)
+    ),
+    "alert_failures_count": lambda c, v: replace(
+        c, repeated_failures=replace(c.repeated_failures, count=v)
+    ),
+    "alert_failures_window_s": lambda c, v: replace(
+        c, repeated_failures=replace(c.repeated_failures, window_s=v)
+    ),
+    "alert_cooldown_s": lambda c, v: replace(c, cooldown_s=v),
+}
+_AMOUNTS: Final[Mapping[str, Callable[[AlertConfig, float], AlertConfig]]] = {
+    "alert_session_cost_usd": lambda c, v: replace(
+        c, session_cost=replace(c.session_cost, limit_usd=v)
+    ),
+    "alert_daily_cost_usd": lambda c, v: replace(c, daily_cost=replace(c.daily_cost, limit_usd=v)),
+}
+ALERT_SETTINGS: Final[tuple[str, ...]] = (
+    "alert_waiting_enabled",
+    "alert_waiting_threshold_s",
+    "alert_failures_enabled",
+    "alert_failures_count",
+    "alert_failures_window_s",
+    "alert_session_cost_enabled",
+    "alert_session_cost_usd",
+    "alert_daily_cost_enabled",
+    "alert_daily_cost_usd",
+    "alert_cooldown_s",
+)
+
+
+def _with_setting(config: AlertConfig, name: str, value: object) -> AlertConfig | None:
+    """``config`` with setting ``name`` set to ``value``; ``None`` for a value of the
+    wrong type (a ``bool`` is never a number, a number never a switch)."""
+    if name in _SWITCHES:
+        return _SWITCHES[name](config, value) if isinstance(value, bool) else None
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    if name in _WHOLE:
+        return _WHOLE[name](config, value) if isinstance(value, int) else None
+    return _AMOUNTS[name](config, float(value))
+
+
+def apply_saved_settings(
+    base: AlertConfig, saved: Mapping[str, object]
+) -> tuple[AlertConfig, tuple[str, ...]]:
+    """The effective configuration: ``base`` (the environment's, valid) with the saved
+    overrides on top, and the names of the overrides it ignored (ADR 0042).
+
+    Each override in ``ALERT_SETTINGS`` order replaces its setting unless its value has
+    the wrong type or leaves the configuration invalid (``validate_config``): then it is
+    ignored, and the setting keeps ``base``'s value. A name outside ``ALERT_SETTINGS``
+    is skipped and never reported, since it may be any text. The ignored names never
+    come with their values.
+    """
+    config = base
+    ignored: list[str] = []
+    for name in ALERT_SETTINGS:
+        if name not in saved:
+            continue
+        candidate = _with_setting(config, name, saved[name])
+        if candidate is None or validate_config(candidate):
+            ignored.append(name)
+        else:
+            config = candidate
+    return config, tuple(ignored)
 
 
 def validate_config(config: AlertConfig) -> tuple[FieldError, ...]:
@@ -431,6 +521,22 @@ def record_failure_event(
     if times:
         failures[session_id] = times
     return replace(state, failures=failures)
+
+
+def forget_sessions(state: AlertState, session_ids: frozenset[str]) -> AlertState:
+    """Forget the sessions retention deleted: their failure windows and the keys whose
+    subject they are. Their alerts went with them (cascade), so none can fire or clear
+    again; ``daily_cost``, about no session, is kept. Returns ``state`` itself when it
+    holds none of them."""
+    keys = {
+        key: value
+        for key, value in state.keys.items()
+        if key.rule == "daily_cost" or key.subject not in session_ids
+    }
+    failures = {k: v for k, v in state.failures.items() if k not in session_ids}
+    if len(keys) == len(state.keys) and len(failures) == len(state.failures):
+        return state
+    return replace(state, keys=keys, failures=failures)
 
 
 def evaluate_repeated_failures(

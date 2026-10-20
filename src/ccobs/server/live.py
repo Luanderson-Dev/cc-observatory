@@ -41,7 +41,7 @@ from starlette.responses import PlainTextResponse, Response, StreamingResponse
 from starlette.types import Receive, Scope, Send
 
 from ccobs.domain.hooks import is_valid_session_id
-from ccobs.server.changes import ALL, Change, Everything
+from ccobs.server.changes import ALL, AlertsChanged, Change, Everything, HubEvent
 
 __all__ = [
     "ALL",
@@ -208,11 +208,15 @@ class ChangeHub:
         self._subscriptions.add(subscription)
         return subscription
 
-    def publish(self, change: Change) -> None:
+    def publish(self, change: HubEvent) -> None:
+        if isinstance(change, AlertsChanged):
+            # No stream event for the alerts yet: the alerts API brings it (stage 8 of
+            # milestone 5). It is no session change, so no stream is marked.
+            return
         for subscription in list(self._subscriptions):
             subscription.offer(change)
 
-    def notify_threadsafe(self, change: Change) -> None:
+    def notify_threadsafe(self, change: HubEvent) -> None:
         """The writer's ``on_committed``: schedule ``publish`` on the event loop. From
         any thread; never blocks, never raises for a closed loop."""
         loop = self._loop

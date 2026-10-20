@@ -18,6 +18,7 @@ from typing import Any, Final, cast
 
 import pytest
 from sqlalchemy import Engine, func, insert, select, text, update
+from sqlalchemy import event as sa_event
 from sqlalchemy.exc import IntegrityError
 
 from ccobs.domain.alerts import (
@@ -397,8 +398,8 @@ def test_retention_deletes_old_closed_sessions_and_cascades(repo: Repository) ->
         assert count(repo, model, SESSION) > 0, model
 
     # Strictly older: a session whose last event is at the cutoff stays.
-    assert repo.delete_older_than(BASE + 1) == 0
-    assert repo.delete_older_than(BASE + 3) == 2
+    assert repo.delete_older_than(BASE + 1) == frozenset()
+    assert repo.delete_older_than(BASE + 3) == {SESSION, ended}
 
     for model in TABLES:
         assert count(repo, model, SESSION) == 0, model
@@ -1136,6 +1137,66 @@ def test_a_clear_is_never_earlier_than_its_fire(repo: Repository) -> None:
     assert alert.cleared_at_ms == BASE + 100
 
 
+def test_a_ticks_alert_effects_are_written_in_order_in_one_transaction(
+    repo: Repository,
+) -> None:
+    with_sessions(repo)
+    repo.insert_alert(HOST, fired(OTHER), discord_state="none")
+    cleared = AlertCleared(rule="waiting_user", subject=OTHER, cleared_at_ms=BASE + 5)
+
+    repo.apply_alert_effects(
+        HOST, [fired(at=BASE + 5), cleared, daily(BASE + 5)], discord_configured=False
+    )
+
+    newest, middle, oldest = repo.list_alerts(HOST, 10)
+    assert (oldest.subject, oldest.cleared_at_ms) == (OTHER, BASE + 5)
+    assert (middle.subject, middle.rule, middle.fired_at_ms) == (SESSION, "waiting_user", BASE + 5)
+    assert (newest.subject, newest.rule) == (DAY_SUBJECT, "daily_cost")
+    # Discord was not configured: never sent.
+    assert {(a.discord_state, a.discord_next_at_ms) for a in (middle, newest)} == {("none", None)}
+
+
+def test_with_discord_configured_a_fired_alert_is_due_at_once(repo: Repository) -> None:
+    with_sessions(repo)
+
+    repo.apply_alert_effects(HOST, [fired(at=BASE + 7)], discord_configured=True)
+
+    (alert,) = repo.list_alerts(HOST, 10)
+    assert (alert.discord_state, alert.discord_next_at_ms, alert.discord_attempts) == (
+        "pending",
+        BASE + 7,
+        0,
+    )
+    assert repo.due_deliveries(HOST, BASE + 7, 10) == [alert]
+
+
+def test_a_failed_effect_rolls_back_the_whole_tick(repo: Repository) -> None:
+    with_sessions(repo, SESSION)
+    repo.insert_alert(HOST, fired(), discord_state="none")
+    cleared = AlertCleared(rule="waiting_user", subject=SESSION, cleared_at_ms=BASE + 5)
+
+    # The second write refers to a session that is not stored.
+    with pytest.raises(IntegrityError):
+        repo.apply_alert_effects(
+            HOST, [cleared, fired(OTHER, at=BASE + 5), daily()], discord_configured=False
+        )
+
+    (alert,) = repo.list_alerts(HOST, 10)
+    assert alert.subject == SESSION
+    assert alert.cleared_at_ms is None
+
+
+def test_no_alert_effects_open_no_transaction(repo: Repository) -> None:
+    begun: list[object] = []
+    record = begun.append
+    sa_event.listen(repo.engine, "begin", record)
+    try:
+        repo.apply_alert_effects(HOST, [], discord_configured=True)
+    finally:
+        sa_event.remove(repo.engine, "begin", record)
+    assert begun == []
+
+
 def test_alert_pages_by_id_cover_every_alert_once(repo: Repository) -> None:
     with_sessions(repo)
     ids = [repo.insert_alert(HOST, fired(at=BASE + i), discord_state="none") for i in range(8)]
@@ -1414,7 +1475,7 @@ def test_retention_deletes_old_cleared_daily_alerts_and_cascades_session_alerts(
     # Still firing: kept whatever its age, so a restart still knows the key fires.
     still_firing = repo.insert_alert("other-host", daily(BASE), discord_state="sent")
 
-    assert repo.delete_older_than(BASE + 10) == 1  # one session: SESSION, ended
+    assert repo.delete_older_than(BASE + 10) == {SESSION}  # ended; OTHER is open
 
     left = {a.id for a in repo.list_alerts(HOST, 10)}
     assert left == {open_session_alert, at_cutoff}

@@ -192,7 +192,7 @@ class FlakyRepository(Repository):
             )
         super().apply_batch(host, items)
 
-    def delete_older_than(self, cutoff_ms: int) -> int:
+    def delete_older_than(self, cutoff_ms: int) -> frozenset[str]:
         if self.fail_retention:
             raise OperationalError("DELETE FROM sessions", None, Exception(PRIVATE_PATH))
         return super().delete_older_than(cutoff_ms)
@@ -396,6 +396,9 @@ def test_the_lifespan_uses_an_injected_writer_factory(settings: Settings) -> Non
 
         def submit_retention(self, cutoff_ms: int) -> None:
             calls.append(("retention", cutoff_ms))
+
+        def submit_alert_tick(self, now_ms: int) -> None:
+            calls.append(("alert tick", now_ms))
 
         def submit_telemetry_close(self, session_id: str, tool_use_id: str, at_ms: int) -> None:
             calls.append(("close", at_ms))

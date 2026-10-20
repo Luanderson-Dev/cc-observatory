@@ -23,6 +23,7 @@ from ccobs.domain.telemetry import HOST_LABEL
 
 __all__ = [
     "AGENTS_RUNNING",
+    "ALERTS_FIRED",
     "APP_METRICS",
     "BLOCKS_OPEN",
     "BLOCK_DURATION",
@@ -47,6 +48,7 @@ __all__ = [
     "REASON_LABEL",
     "RECEIVED_EVENTS",
     "RESULT_LABEL",
+    "RULE_LABEL",
     "SCRAPE_JOB",
     "SESSIONS",
     "SESSIONS_ENDED",
@@ -73,6 +75,7 @@ EVENT_LABEL: Final = "event"
 REASON_LABEL: Final = "reason"
 VERSION_LABEL: Final = "version"
 RESULT_LABEL: Final = "result"
+RULE_LABEL: Final = "rule"
 
 # Every status but ended, the values of the state label: ended sessions leave the
 # writer's memory, and the counter of sessions ended stands for them.
@@ -243,6 +246,15 @@ UI_STREAMS_REFUSED: Final = AppMetric(
     (HOST_LABEL,),
 )
 
+# The alerts that fired since the app started (ADR 0041), by rule: every rule of
+# ALERT_RULES is exported, with zeros. A fire is counted once its row is committed.
+ALERTS_FIRED: Final = AppMetric(
+    "ccobs_alerts_fired_total",
+    "counter",
+    "Alerts that fired since the app started, by rule.",
+    (HOST_LABEL, RULE_LABEL),
+)
+
 APP_METRICS: Final = (
     SESSIONS,
     SESSIONS_ENDED,
@@ -260,6 +272,7 @@ APP_METRICS: Final = (
     PROMETHEUS_QUERIES,
     UI_STREAMS,
     UI_STREAMS_REFUSED,
+    ALERTS_FIRED,
 )
 
 

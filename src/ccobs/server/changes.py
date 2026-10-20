@@ -8,7 +8,7 @@ from __future__ import annotations
 from enum import Enum
 from typing import Final
 
-__all__ = ["ALL", "Change", "Everything"]
+__all__ = ["ALERTS", "ALL", "AlertsChanged", "Change", "Everything", "HubEvent"]
 
 
 class Everything(Enum):
@@ -17,7 +17,17 @@ class Everything(Enum):
     ALL = "all"
 
 
+class AlertsChanged(Enum):
+    """An alert fired or cleared (ADR 0041): the alerts changed, not a session."""
+
+    ALERTS = "alerts"
+
+
 ALL: Final = Everything.ALL
+ALERTS: Final = AlertsChanged.ALERTS
 
 # The sessions a commit changed, or ALL.
 type Change = frozenset[str] | Everything
+# What the writer tells the hub after a commit: the sessions it changed, or that the
+# alerts did.
+type HubEvent = Change | AlertsChanged

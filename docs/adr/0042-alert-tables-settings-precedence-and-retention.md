@@ -166,7 +166,11 @@ back.
 also deletes, in the same transaction, the `daily_cost` alerts that are cleared and
 fired before the cutoff. A session's alerts go with the session, by the cascade. A daily
 alert still open is kept, whatever its age, so the evaluator still knows the key fires
-after a restart; it goes once it clears and ages out.
+after a restart; it goes once it clears and ages out. `delete_older_than` returns the ids
+of the sessions it deleted (`DELETE ... RETURNING`, SQLite 3.35 or later), and the writer
+forgets exactly those in memory: their session state, their failure windows and their
+alert keys. Otherwise a window kept in memory could fire an alert for a session that is no
+longer in the table, and the foreign key would fail the whole tick.
 
 ### Consequences
 

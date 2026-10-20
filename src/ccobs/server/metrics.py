@@ -4,12 +4,13 @@
 one, so that several apps (in tests) never share series. Live state is read at scrape
 time, not pushed: a collector asks the writer for its counts, the queue for its depth,
 bytes and drop counters and the live updates hub (ADR 0032) for its open and refused
-streams, so a gauge never goes stale. Only the block-duration histogram
-and the Loki and Prometheus query counters keep state of their own, fed by the writer's
-``on_block_closed`` callback, the reconciler's ``on_query`` (ADR 0029) and the usage
-reader's ``on_query`` (ADR 0035). Every label
-value comes from a closed list (``ccobs.domain.app_metrics``), states, kinds, reasons and
-events are exported with zeros, and there is no ``_created`` series.
+streams, so a gauge never goes stale; the counter of alerts fired (ADR 0041) is one of
+the writer's counts. Only the block-duration histogram and the Loki and Prometheus query
+counters keep state of their own, fed by the writer's ``on_block_closed`` callback, the
+reconciler's ``on_query`` (ADR 0029) and the usage reader's ``on_query`` (ADR 0035).
+Every label value comes from a closed list (``ccobs.domain.app_metrics``), states,
+kinds, reasons, events and rules are exported with zeros, and there is no ``_created``
+series.
 
 ``MetricsListener`` serves the registry on ``CCOBS_METRICS_PORT`` from a thread of its
 own: ``/metrics`` only, and a 404 for anything else. It has no Host check: compose never
@@ -40,8 +41,10 @@ from prometheus_client.metrics_core import CounterMetricFamily, GaugeMetricFamil
 from prometheus_client.registry import Collector
 
 import ccobs
+from ccobs.domain.alerts import ALERT_RULES
 from ccobs.domain.app_metrics import (
     AGENTS_RUNNING,
+    ALERTS_FIRED,
     BLOCK_DURATION,
     BLOCK_DURATION_BUCKETS,
     BLOCK_KINDS,
@@ -226,6 +229,10 @@ class _StateCollector(Collector):
         for event in EVENT_LABELS:
             received.add_metric([host, event], counts.events_received.get(event, 0))
         yield received
+        fired = _counter(ALERTS_FIRED)
+        for rule in ALERT_RULES:
+            fired.add_metric([host, rule], counts.alerts_fired.get(rule, 0))
+        yield fired
 
 
 class AppMetrics:

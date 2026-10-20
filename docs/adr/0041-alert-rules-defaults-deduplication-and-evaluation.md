@@ -97,6 +97,50 @@ one session less than 5 s apart can therefore count as one. A condition that kee
 coming back fires and clears repeatedly, at most once per cooldown: for example one
 failure every 4 minutes with N = 3 and W = 10 minutes.
 
+How the writer runs them (stage 6 of milestone 5, set by its implementer on the main
+context's brief):
+
+- **Cadence.** An alert ticker (`ccobs.server.sweeps.AlertTicker`), a daemon thread like
+  the sweeper, submits an `AlertTick` to the writer's control channel every 5 s, with
+  the hook route's clock. It never writes; the evaluation and its writes run on the
+  writer thread (ADR 0026, one writer), off the hook route, and read no network: a
+  tick is a walk over the sessions in memory plus the keys and failure windows.
+- **Order.** Each tick runs the rules in a fixed order, `waiting_user`,
+  `repeated_failures`, `session_cost` and `daily_cost`, over the committed sessions the
+  writer holds and the last `CostSample` it was given (the cost reader of stage 7
+  submits one; until then there is none, and the cost rules neither fire nor clear).
+  Hooks queued before a tick are written first, so it sees them.
+- **One transaction per tick.** The tick's effects are written in that order in one
+  transaction (`Repository.apply_alert_effects`): an `AlertFired` becomes an `alerts`
+  row whose Discord delivery is `pending`, due at once, when a webhook is configured,
+  else `none`; an `AlertCleared` clears its key's open row. A tick without effects
+  writes nothing. If the write fails, nothing changes in memory and the next tick
+  computes the same effects again; nothing fires twice, since memory only moves once
+  the rows are in.
+- **Failure windows.** Every hook event a commit stores is recorded with
+  `record_failure_event`, in the order the writer applied it; an event the writer did
+  not store (a duplicate `seq`) is not.
+- **State after a start.** The first tick rebuilds the evaluators' state from the
+  database (ADR 0042's `alert_keys` and `failure_windows`, the windows dropped while
+  `repeated_failures` is off) with that tick's time as now, and loads the saved
+  settings over the environment's. Until then no failure is recorded in memory: the
+  rebuild reads every committed one. A rebuild that fails is tried again at the next
+  tick. A key that was firing before a restart stays firing, so its episode does not
+  fire again, and its clear updates the same row.
+- **Configuration.** The effective rules are the environment's (`CCOBS_ALERT_*`) with
+  the saved settings on top (`apply_saved_settings`, ADR 0042): a saved value of the
+  wrong type or out of bounds is ignored, logged by its setting's name only, and the
+  environment's value stays. The writer reloads the saved settings when the settings
+  screen tells it one changed (an `AlertSettingsChanged` control); the next tick uses
+  them.
+- **After a write.** The writer tells the live updates hub (ADR 0032) that the alerts
+  changed (`ALERTS`) once the tick's transaction has committed, and only when it wrote
+  something; the stream event and the API that refetch on it come with stage 8.
+- **Metric.** `ccobs_alerts_fired_total{host, rule}` counts the alerts that fired since
+  the app started, once their rows are committed, with a series for each of the four
+  rules from the start at 0 (ADR 0028's closed label values). The fixed total of the
+  app's series goes from 71 to 75 per host.
+
 **"Repeated" failures** (this narrows ADR 0007). The rule counts `StopFailure` hook
 events only, of every `error` code, in one session within the window. Each session
 keeps a sliding window of failure times, from the receive time of each hook event, and
@@ -247,8 +291,22 @@ channels).
   that end, turn stale or leave the answer, sessions the writer does not hold, and the
   start of the session query's range (`session_cost_since`: the oldest open session,
   none when every session is ended or stale).
-- A later stage of milestone 5 adds the tests of the writer's 5 s evaluation and of the
-  cost reader.
+- `tests/server/test_writer_alerts.py` covers the writer's evaluation with a fake clock:
+  a replay of `interactive-permission-compact` that fires once at the first tick past
+  30 s and clears, three `StopFailure` events that fire once and a successful `Stop`
+  that clears, the `headless-api-error` fixture that fires nothing, failures committed
+  before the first tick, restarts in the middle of an episode (no second fire, the same
+  row cleared), within a cooldown and with a failure streak, the failures rule off at a
+  restart, saved settings applied and an invalid one ignored by name, a settings
+  reload and its failure, a cost sample stored and evaluated (and a stale one), disabled
+  rules, the fixed order in one write per tick, a failed write that changes nothing and
+  is retried, a failed rebuild, the Discord delivery states, the hub event only after a
+  write, and the metric. `tests/server/test_sweeps.py` covers the ticker (cadence,
+  errors, stop, the app's lifespan) and an alert fired end to end from it;
+  `tests/test_domain_alerts_settings.py` the merge of saved settings;
+  `tests/server/test_repository.py` the one-transaction write and its rollback; and
+  `tests/server/test_metrics.py` the new series.
+- A later stage of milestone 5 adds the tests of the cost reader.
 - `tests/test_domain_telemetry.py` and `tests/test_cli_light.py` keep
   `ccobs.domain.alerts` free of I/O.
 

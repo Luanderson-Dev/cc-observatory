@@ -37,6 +37,7 @@ from ccobs.domain.alerts import (
     WaitingUserRule,
     evaluate_repeated_failures,
     evaluate_waiting_user,
+    forget_sessions,
     record_failure_event,
     validate_config,
     waiting_since,
@@ -598,6 +599,40 @@ def failure_fired(at: int, count: int = 3, subject: str = SESSION) -> AlertFired
 
 def failure_cleared(at: int, subject: str = SESSION) -> AlertCleared:
     return AlertCleared(rule="repeated_failures", subject=subject, cleared_at_ms=at)
+
+
+# Retention deleted some sessions: the writer forgets them.
+
+
+def test_forget_sessions_drops_their_windows_and_keys_only() -> None:
+    firing = KeyState(last_fired_at_ms=T0, firing=True)
+    state = AlertState(
+        keys={
+            AlertKey(rule="repeated_failures", subject="gone"): firing,
+            AlertKey(rule="waiting_user", subject="gone"): firing,
+            AlertKey(rule="session_cost", subject="kept"): firing,
+            AlertKey(rule="daily_cost", subject=DAY_SUBJECT): firing,
+        },
+        failures={"gone": (T0, T0 + 1), "kept": (T0,)},
+    )
+
+    # Even a session_id equal to the day's subject never drops daily_cost's key.
+    forgotten = forget_sessions(state, frozenset({"gone", DAY_SUBJECT}))
+
+    assert forgotten == AlertState(
+        keys={
+            AlertKey(rule="session_cost", subject="kept"): firing,
+            AlertKey(rule="daily_cost", subject=DAY_SUBJECT): firing,
+        },
+        failures={"kept": (T0,)},
+    )
+    assert state.failures.keys() == {"gone", "kept"}  # the given state is unchanged
+
+
+def test_forget_sessions_it_does_not_hold_returns_the_state_itself() -> None:
+    state = AlertState(failures={"kept": (T0,)})
+    assert forget_sessions(state, frozenset({"gone"})) is state
+    assert forget_sessions(state, frozenset()) is state
 
 
 def failure_key(subject: str = SESSION) -> AlertKey:

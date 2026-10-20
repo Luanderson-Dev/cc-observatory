@@ -556,7 +556,9 @@ in [ADR 0028](adr/0028-app-metrics-and-their-listener.md); the Loki counter is i
 [ADR 0029](adr/0029-closing-esc-denials-from-loki.md), the live stream series in
 [ADR 0032](adr/0032-live-updates-change-hub-sse-pings-and-refetch.md), the Prometheus
 counter in
-[ADR 0035](adr/0035-per-session-tokens-and-cost-from-prometheus-and-grafana-links.md).
+[ADR 0035](adr/0035-per-session-tokens-and-cost-from-prometheus-and-grafana-links.md),
+the alerts counter in
+[ADR 0041](adr/0041-alert-rules-defaults-deduplication-and-evaluation.md).
 
 | Series                              | Type      | Labels            | Meaning                                                                              |
 | ----------------------------------- | --------- | ----------------- | ------------------------------------------------------------------------------------ |
@@ -576,10 +578,14 @@ counter in
 | `ccobs_prometheus_queries_total`    | counter   | `host`, `result`  | Queries sent to Prometheus for tokens and cost, by result (see below).               |
 | `ccobs_ui_streams`                  | gauge     | `host`            | Live update streams open to the web UI.                                              |
 | `ccobs_ui_streams_refused_total`    | counter   | `host`            | Live update streams refused because 16 were already open.                            |
+| `ccobs_alerts_fired_total`          | counter   | `host`, `rule`    | Alerts that fired, by rule (the four rules, below).                                  |
 
 - Every label takes its values from a closed list, and every value is exported, with 0
-  when empty: 71 series per host, however many sessions there are. No series has a
+  when empty: 75 series per host, however many sessions there are. No series has a
   session ID.
+- The alert rules are `waiting_user`, `repeated_failures`, `session_cost` and
+  `daily_cost`; a fire counts once its alert is stored, and a restart in the middle of
+  an episode does not fire it again.
 - The Prometheus query results are `ok`, `error` (no connection, a non-2xx status),
   `timeout` (no answer within 3 seconds) and `invalid` (an answer too large, not JSON,
   or with values that are not finite, non-negative numbers). Totals from the app's

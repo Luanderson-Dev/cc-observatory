@@ -31,8 +31,10 @@ from prometheus_client.samples import Sample
 from sqlalchemy import Engine, func, select
 
 import ccobs
+from ccobs.domain.alerts import ALERT_RULES
 from ccobs.domain.app_metrics import (
     AGENTS_RUNNING,
+    ALERTS_FIRED,
     APP_METRICS,
     BLOCK_DURATION,
     BLOCK_DURATION_BUCKETS,
@@ -256,8 +258,9 @@ def test_the_exposition_has_exactly_the_documented_series(client: TestClient) ->
     assert types == {metric.name: metric.type for metric in APP_METRICS}
     assert "_created" not in text
     # The fixed total of ADR 0028, plus the two Loki query series of ADR 0029, the two
-    # live stream series of ADR 0032 and the four Prometheus query series of ADR 0035.
-    assert sum(len(found) for found in samples.values()) == 71
+    # live stream series of ADR 0032, the four Prometheus query series of ADR 0035 and
+    # the four alert series of ADR 0041 (one per rule).
+    assert sum(len(found) for found in samples.values()) == 75
     for metric in APP_METRICS:
         assert samples[metric.name], metric.name
         for sample in samples[metric.name]:
@@ -276,6 +279,7 @@ def test_states_kinds_reasons_and_events_are_exported_with_zeros(client: TestCli
     assert by_label(samples, HOOK_EVENTS_RECEIVED, "event") == dict.fromkeys(EVENT_LABELS, 0)
     assert by_label(samples, LOKI_QUERIES, "result") == dict.fromkeys(LOKI_RESULTS, 0)
     assert by_label(samples, PROMETHEUS_QUERIES, "result") == dict.fromkeys(PROMETHEUS_RESULTS, 0)
+    assert by_label(samples, ALERTS_FIRED, "rule") == dict.fromkeys(ALERT_RULES, 0)
     for metric in (
         AGENTS_RUNNING,
         SESSIONS_ENDED,
@@ -541,6 +545,9 @@ def test_the_listener_stops_before_the_writer(settings: Settings, queue: HookQue
         def submit_retention(self, cutoff_ms: int) -> None:
             pass
 
+        def submit_alert_tick(self, now_ms: int) -> None:
+            pass
+
         def submit_telemetry_close(self, session_id: str, tool_use_id: str, at_ms: int) -> None:
             pass
 
@@ -733,6 +740,7 @@ def test_before_the_writer_is_attached_only_its_series_are_missing() -> None:
         HOOK_EVENTS_PROCESSED,
         HOOK_EVENTS_RECEIVED,
         DATABASE_WAL,
+        ALERTS_FIRED,
     }
     assert set(types) == {metric.name for metric in APP_METRICS if metric not in from_writer}
 
@@ -776,3 +784,22 @@ def test_prometheus_queries_are_counted_by_result() -> None:
         "timeout": 1,
         "invalid": 1,
     }
+
+
+def test_fired_alerts_are_counted_by_rule_once_committed(
+    replayed: TestClient, clock: Clock
+) -> None:
+    # The replay leaves a session waiting on a permission prompt; 30 s later the alert
+    # tick fires waiting_user once, and later ticks of the same episode fire nothing.
+    writer = app_of(replayed).state.writer
+    assert isinstance(writer, ManualWriter)
+    state = writer.state(WAITING)
+    assert state is not None
+    assert state.session.status == "waiting_user"
+    since = min(block.opened_at_ms for block in state.open_blocks)
+    for now in (since + 30_000, since + 35_000):
+        writer.submit_alert_tick(now)
+        persist(replayed)
+
+    fired = by_label(scrape(replayed), ALERTS_FIRED, "rule")
+    assert fired == {**dict.fromkeys(ALERT_RULES, 0), "waiting_user": 1}

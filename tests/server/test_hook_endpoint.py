@@ -91,6 +91,9 @@ class IdleWriter:
     def submit_retention(self, cutoff_ms: int) -> None:
         pass
 
+    def submit_alert_tick(self, now_ms: int) -> None:
+        pass
+
     def submit_telemetry_close(self, session_id: str, tool_use_id: str, at_ms: int) -> None:
         pass
 

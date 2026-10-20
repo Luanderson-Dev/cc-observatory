@@ -33,7 +33,7 @@ from ccobs.domain.app_metrics import UI_STREAMS, UI_STREAMS_REFUSED
 from ccobs.server import __main__ as server_main
 from ccobs.server import live
 from ccobs.server.app import create_app
-from ccobs.server.changes import ALL
+from ccobs.server.changes import ALERTS, ALL
 from ccobs.server.config import Settings
 from ccobs.server.live import ChangeHub, StreamTiming, Subscription, encode_change
 from ccobs.server.metrics import AppMetrics
@@ -263,6 +263,25 @@ def test_notify_threadsafe_reaches_subscribers_from_another_thread() -> None:
         return subscription.take()
 
     assert run(body) == frozenset({SID})
+
+
+def test_an_alerts_change_marks_no_stream_until_the_alerts_have_an_event() -> None:
+    # The writer publishes ALERTS after a fire or a clear (ADR 0041); the streams'
+    # event for it comes with the alerts API (stage 8 of milestone 5), and until then
+    # it must neither reach nor break a session stream.
+    hub = ChangeHub()
+
+    async def body() -> tuple[bool, object]:
+        hub.open(asyncio.get_running_loop())
+        subscription = hub.subscribe(None)
+        assert subscription is not None
+        hub.publish(ALERTS)
+        quiet = not await subscription.wait(0.05)
+        hub.publish(frozenset({SID}))
+        assert await subscription.wait(2.0)
+        return quiet, subscription.take()
+
+    assert run(body) == (True, frozenset({SID}))
 
 
 def test_notify_threadsafe_schedules_nothing_without_subscribers_or_a_loop() -> None:

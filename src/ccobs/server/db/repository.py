@@ -25,7 +25,9 @@ from sqlalchemy import (
     ColumnElement,
     Connection,
     Engine,
+    Insert,
     RowMapping,
+    Update,
     and_,
     case,
     delete,
@@ -42,6 +44,7 @@ from sqlalchemy.orm import InstrumentedAttribute, aliased
 from ccobs.domain.alerts import (
     ALERT_RULES,
     AlertCleared,
+    AlertEffect,
     AlertFired,
     AlertKey,
     AlertRule,
@@ -146,6 +149,7 @@ ALERT_PAGE_MAX: Final = 500
 DELIVERY_BATCH_MAX: Final = 100
 _DAILY_COST: Final = "daily_cost"
 _PENDING: Final = "pending"
+_NO_DISCORD: Final = "none"
 # The values the CHECK constraints allow, typed: a row's rule and delivery state.
 _RULES: Final[Mapping[str, AlertRule]] = {rule: rule for rule in ALERT_RULES}
 _DISCORD_STATES: Final[Mapping[str, DiscordState]] = {state: state for state in DISCORD_STATES}
@@ -487,11 +491,12 @@ class Repository:
             _upsert(connection, BlockModel, ("session_id", "block_id"), blocks.values())
             _upsert(connection, SessionStateModel, ("session_id",), states.values())
 
-    def delete_older_than(self, cutoff_ms: int) -> int:
+    def delete_older_than(self, cutoff_ms: int) -> frozenset[str]:
         """Delete the ended and stale sessions whose last event is before ``cutoff_ms``,
         with their agents, blocks, events, state and alerts (cascade), and the cleared
         ``daily_cost`` alerts that fired before it, which have no session (ADR 0042).
-        Returns how many sessions went.
+        Returns the ``session_id`` of every session that went, so the writer forgets
+        exactly those.
 
         A session still open is never deleted, so the writer's in-memory state cannot
         outlive its rows. Retention is never shorter than the stale threshold, so the
@@ -499,12 +504,15 @@ class Repository:
         kept for the same reason: the evaluator rebuilds its key from it.
         """
         with self.engine.begin() as connection:
-            result = connection.execute(
-                delete(SessionModel).where(
+            deleted = connection.execute(
+                delete(SessionModel)
+                .where(
                     SessionModel.last_event_at_ms < cutoff_ms,
                     SessionModel.status.in_(_CLOSED),
                 )
-            )
+                .returning(SessionModel.session_id)
+            ).scalars()
+            gone = frozenset(deleted)
             connection.execute(
                 delete(AlertModel).where(
                     AlertModel.session_id.is_(None),
@@ -512,7 +520,7 @@ class Repository:
                     AlertModel.cleared_at_ms.is_not(None),
                 )
             )
-            return result.rowcount
+            return gone
 
     # Alerts (ADR 0042). Writes on the writer's engine only.
 
@@ -528,32 +536,37 @@ class Repository:
         and is never reused. A ``daily_cost`` alert has no session; any other refers to
         its session, which must be stored (``IntegrityError`` otherwise), and goes with
         it. ``discord_next_at_ms`` is required for a ``pending`` delivery."""
-        values = {
-            "host": host,
-            "rule": fired.rule,
-            "session_id": None if fired.rule == _DAILY_COST else fired.subject,
-            "subject": fired.subject,
-            "fired_at_ms": fired.fired_at_ms,
-            "value": fired.value,
-            "threshold": fired.threshold,
-            "discord_state": discord_state,
-            "discord_next_at_ms": discord_next_at_ms,
-        }
+        statement = _insert_alert(host, fired, discord_state, discord_next_at_ms)
         with self.engine.begin() as connection:
-            statement = insert(AlertModel).values(values).returning(AlertModel.id)
-            return connection.execute(statement).scalar_one()
+            return connection.execute(statement.returning(AlertModel.id)).scalar_one()
+
+    def apply_alert_effects(
+        self, host: str, effects: Sequence[AlertEffect], *, discord_configured: bool
+    ) -> None:
+        """Write one evaluation's effects, in order, in one transaction: all or nothing.
+
+        An ``AlertFired`` is stored as ``insert_alert`` stores it, its Discord delivery
+        ``pending`` and due at once (its ``fired_at_ms``) when Discord is configured, else
+        ``none``; an ``AlertCleared`` clears as ``clear_alert`` does. No effects, no
+        transaction.
+        """
+        if not effects:
+            return
+        with self.engine.begin() as connection:
+            for effect in effects:
+                if isinstance(effect, AlertCleared):
+                    connection.execute(_clear_alert(host, effect))
+                elif discord_configured:
+                    connection.execute(_insert_alert(host, effect, _PENDING, effect.fired_at_ms))
+                else:
+                    connection.execute(_insert_alert(host, effect, _NO_DISCORD, None))
 
     def clear_alert(self, host: str, cleared: AlertCleared) -> int:
         """Clear the open alerts of ``cleared``'s key at its time, never earlier than
         their fire; returns how many (0 or 1 when every fire went through the
         evaluator, which never fires a key twice before it clears)."""
-        statement = (
-            update(AlertModel)
-            .where(*_open_key(host, cleared.rule, cleared.subject))
-            .values(cleared_at_ms=func.max(cleared.cleared_at_ms, AlertModel.fired_at_ms))
-        )
         with self.engine.begin() as connection:
-            return connection.execute(statement).rowcount
+            return connection.execute(_clear_alert(host, cleared)).rowcount
 
     def set_delivery(
         self,
@@ -1099,6 +1112,32 @@ class Repository:
 def _capped(limit: int, maximum: int) -> int:
     """``limit`` within 0 and ``maximum``: a read never returns more than its cap."""
     return max(0, min(limit, maximum))
+
+
+def _insert_alert(
+    host: str, fired: AlertFired, discord_state: DiscordState, discord_next_at_ms: int | None
+) -> Insert:
+    """The insert of an alert that fired: a ``daily_cost`` alert has no session."""
+    return insert(AlertModel).values(
+        host=host,
+        rule=fired.rule,
+        session_id=None if fired.rule == _DAILY_COST else fired.subject,
+        subject=fired.subject,
+        fired_at_ms=fired.fired_at_ms,
+        value=fired.value,
+        threshold=fired.threshold,
+        discord_state=discord_state,
+        discord_next_at_ms=discord_next_at_ms,
+    )
+
+
+def _clear_alert(host: str, cleared: AlertCleared) -> Update:
+    """The clear of a key's open alerts, never earlier than their fire."""
+    return (
+        update(AlertModel)
+        .where(*_open_key(host, cleared.rule, cleared.subject))
+        .values(cleared_at_ms=func.max(cleared.cleared_at_ms, AlertModel.fired_at_ms))
+    )
 
 
 def _open_key(host: str, rule: str, subject: str) -> tuple[ColumnElement[bool], ...]:
