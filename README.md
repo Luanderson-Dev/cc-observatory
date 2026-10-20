@@ -12,41 +12,39 @@ and cost, on your own machine.
 
 ## Status
 
-**Pre-alpha.** v0.4.0 closes milestone 3 of 8: the web UI. The `cc-observatory` package
-on PyPI still only prints its version; the stack and the app run from a clone of this
-repository.
+**Pre-alpha.** v0.5.0 closes milestone 4 of 8: the `ccobs` CLI. The `cc-observatory`
+package on PyPI now carries the CLI (`uvx cc-observatory setup`); the stack and the app
+still run from a clone of this repository.
 
-What v0.4.0 adds:
+What v0.5.0 adds (see
+[docs/cli.md](https://github.com/Luanderson-Dev/cc-observatory/blob/main/docs/cli.md)):
 
-- a web UI at `http://127.0.0.1:4300` (see "Try the app" below and
-  [docs/app.md](https://github.com/Luanderson-Dev/cc-observatory/blob/main/docs/app.md)):
-  an overview of sessions grouped by state, with how long each one has been waiting on
-  you, and a page per session with its blocks, its agent tree and its hook timeline;
-- live updates over server-sent events, without a reload;
-- tokens and cost per session, read from Prometheus, and links from each session to
-  its logs, tokens and cost in Grafana;
-- vendored htmx and fonts with checksums and licenses, so the UI works offline;
-- browser hardening: a strict content security policy, Fetch Metadata checks and
-  defensive response headers;
-- separate database engines for the writer and the readers, with capped concurrent
-  reads, and bounded pages of blocks, agents and events in the API;
-- ADRs 0031 to 0035 for the UI's decisions.
+- `ccobs setup`: writes the telemetry settings and the hooks into Claude Code's user
+  settings, with a backup, `--dry-run` and an atomic write, and never removes or
+  overwrites your own entries;
+- `ccobs uninstall`: removes only what setup added;
+- `ccobs doctor`: checks the settings, Claude Code, the stack and the host, and says how
+  to fix what fails;
+- `ccobs status`: a short summary of the app and its sessions;
+- a diagnostics endpoint in the app for these commands, and an empty overview that leads
+  with the setup command;
+- ADRs 0036 to 0040, including the decision to keep v0.5.0 metadata only and defer the
+  content opt-in.
 
-Until `ccobs setup` arrives in v0.5.0, you point Claude Code at the app with a settings
-file passed to `claude --settings`. Earlier releases: v0.3.0 (milestone 2) added the app
+Earlier releases: v0.4.0 (milestone 3) added the web UI, v0.3.0 (milestone 2) the app
 that receives Claude Code's hooks, v0.2.0 (milestone 1) the observability stack in Docker
 Compose with a provisioned Grafana, and v0.1.0 (milestone 0) laid the foundation.
 
-What comes next: milestone 4 (v0.5.0), the `ccobs setup`, `uninstall`, `doctor` and
-`status` commands. The full plan is in the roadmap below.
+What comes next: milestone 5 (v0.6.0), alerts in the browser and on Discord. The full
+plan is in the roadmap below.
 
 Unless a section says otherwise, the rest of this README describes the planned design.
 
 ## What it shows
 
-The release that brings each part is in parentheses. The parts up to v0.4.0 run from a
-clone of this repository (see "Run the observability stack" and "Try the app" below);
-the rest is planned.
+The release that brings each part is in parentheses. The parts up to v0.5.0 work today:
+the stack and the app run from a clone of this repository (see "Run the observability
+stack" and "Try the app" below), and the CLI comes from PyPI; the rest is planned.
 
 - **Live overview** of the Claude Code sessions on your machine, in a web UI at
   <http://127.0.0.1:4300>: the sessions waiting on you first, with how long each has
@@ -347,7 +345,7 @@ can still do, and how to report a vulnerability.
 | 1         | v0.2.0  | Observability stack in compose, provisioned Grafana                                    | Released    |
 | 2         | v0.3.0  | Hook ingestion, session state machine, SQLite, blocks, `/metrics`                      | Released    |
 | 3         | v0.4.0  | Web UI (HTMX + SSE)                                                                    | Released    |
-| 4         | v0.5.0  | `ccobs setup`, `uninstall`, `doctor`, `status`                                         | Planned     |
+| 4         | v0.5.0  | `ccobs setup`, `uninstall`, `doctor`, `status`                                         | Released    |
 | 5         | v0.6.0  | Alerts (browser and Discord)                                                           | Planned     |
 | 6         | v0.7.0  | Grafana dashboards and polish                                                          | Planned     |
 | 7         | v1.0.0  | Distribution: GHCR multi-arch images, release hardening, contributor docs              | Planned     |
