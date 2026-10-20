@@ -1,9 +1,10 @@
 """Alert rules, their defaults and bounds, and their evaluators (ADR 0041).
 
 ADR 0007 names four rules; this module holds their configuration with the maintainer's
-defaults, the bounds a value must fall in, and the evaluation of ``waiting_user`` and
-``repeated_failures``. The cost rules (``session_cost``, ``daily_cost``) have
-configuration and validation here and are evaluated by later stages.
+defaults, the bounds a value must fall in, and their evaluation: ``waiting_user`` and
+``repeated_failures`` from the sessions and hook events the writer holds, and the cost
+rules (``session_cost``, ``daily_cost``) from a ``CostSample`` of Prometheus's answers to
+``session_cost_query`` and ``daily_cost_query``, parsed by ``parse_cost_sample``.
 
 An alert has a key, ``(rule, subject)``: the subject is a ``session_id``, or
 ``DAY_SUBJECT`` for ``daily_cost``. For each key the evaluators remember when it last
@@ -15,8 +16,11 @@ An episode of ``waiting_user`` runs while the session is ``waiting_user``, from 
 oldest open block. An episode of ``repeated_failures`` runs while ``count`` or more
 ``StopFailure`` events of one session fall within the last ``window_s``:
 ``record_failure_event`` keeps those times per session, from the hook events, and
-``evaluate_repeated_failures`` counts them. Both evaluators share one ``AlertState``:
-the writer records every hook event and calls both on each tick.
+``evaluate_repeated_failures`` counts them. An episode of a cost rule runs while a
+session's total, or the last 24 hours' total, is at or above its limit, and once fired
+lasts until the total falls below ``COST_CLEAR_RATIO`` of the limit; a sample older than
+``COST_STALE_MS`` neither fires nor clears. Every evaluator shares one ``AlertState``:
+the writer records every hook event and calls them on each tick.
 
 There is no wall clock here: the caller passes ``now_ms``. A clock that goes backwards
 never fires an episode twice, never raises, and a clear is never earlier than its fire.
@@ -31,13 +35,19 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from typing import Final, Literal
 
+from ccobs.domain.grafana_links import SESSION_ID_KEY
 from ccobs.domain.hooks import HookEvent, SessionEnd, Stop, StopFailure
 from ccobs.domain.sessions import SessionState
+from ccobs.domain.telemetry import COST_USAGE, HOST_LABEL, total_query
+from ccobs.domain.usage import parse_vector, usage_window
 
 __all__ = [
     "ALERT_RULES",
     "COOLDOWN_BOUNDS",
     "COST_BOUNDS",
+    "COST_CLEAR_RATIO",
+    "COST_STALE_MS",
+    "DAILY_COST_WINDOW",
     "DAY_SUBJECT",
     "FAILURE_COUNT_BOUNDS",
     "FAILURE_WINDOW_BOUNDS",
@@ -50,15 +60,22 @@ __all__ = [
     "AlertRule",
     "AlertState",
     "Bounds",
+    "CostSample",
     "DailyCostRule",
     "FieldError",
     "KeyState",
     "RepeatedFailuresRule",
     "SessionCostRule",
     "WaitingUserRule",
+    "daily_cost_query",
+    "evaluate_daily_cost",
     "evaluate_repeated_failures",
+    "evaluate_session_cost",
     "evaluate_waiting_user",
+    "parse_cost_sample",
     "record_failure_event",
+    "session_cost_query",
+    "session_cost_since",
     "validate_config",
     "waiting_since",
 ]
@@ -452,3 +469,222 @@ def evaluate_repeated_failures(
         now_ms=now_ms,
     )
     return replace(state, keys=keys, failures=failures), effects
+
+
+# The cost rules.
+
+# A sample older than this (3 minutes: three of Claude Code's one-minute exports, and
+# many of the reader's polls) says nothing about now: it neither fires nor clears.
+COST_STALE_MS: Final = 180_000
+# Hysteresis: an episode that fired lasts while its total stays at or above this share of
+# the limit, so a total that wobbles around the limit (the rolling day losing an old
+# request, then gaining a new one) does not clear and fire again.
+COST_CLEAR_RATIO: Final = 0.9
+# The rolling day of daily_cost (maintainer's decision P2: no time zone).
+DAILY_COST_WINDOW: Final = "24h"
+
+
+@dataclass(frozen=True, kw_only=True)
+class CostSample:
+    """What the cost queries answered, run at ``observed_at_ms``: each session's total
+    in US dollars, by ``session_id``, and the total of the last 24 hours, ``None`` when
+    the day was not asked."""
+
+    observed_at_ms: int
+    sessions: Mapping[str, float]
+    daily_usd: float | None = None
+
+
+def _open(state: SessionState) -> bool:
+    """Whether the session can alert on its cost: neither ``ended`` nor ``stale``."""
+    return state.session.status not in ("ended", "stale")
+
+
+def session_cost_since(sessions: Iterable[SessionState]) -> int | None:
+    """The ``since_ms`` of ``session_cost_query``: the earliest ``started_at_ms`` of the
+    sessions that can alert (neither ``ended`` nor ``stale``), or ``None`` when there is
+    none, and then the reader sends no query.
+
+    The range grows with the oldest open session's age: one idle but alive for days makes
+    a range of days, and every query reads all the host's cost samples in it (ADR 0041).
+    """
+    return min((s.session.started_at_ms for s in sessions if _open(s)), default=None)
+
+
+def session_cost_query(host: str, *, since_ms: int, now_ms: int) -> str:
+    """Every session's estimated cost, in one instant query to run at ``now_ms``:
+    ``sum by (session_id) (increase(<cost>{host="<host>"}[<range>] anchored))``.
+
+    It is the session page's query (ADR 0035, ``usage.usage_queries``) without the
+    ``session_id`` matcher and grouped by ``session_id`` instead of ``model``, so one
+    query covers every session and no session ID reaches Prometheus. ``since_ms`` is the
+    start of the oldest session to evaluate (``session_cost_since``), and the range is
+    that session's page window (``usage.usage_window`` while live: from
+    ``WINDOW_BEFORE_MS`` before its start to now). Each session the range covers from its
+    start has nothing before the range, so
+    ``anchored`` takes its starting value from the zero sample at its start (ADR 0013)
+    whatever the range's length, and its total is the one its page shows. Older series
+    inside the range (sessions the caller no longer holds) undercount, and the
+    evaluator ignores them. Raises ``ValueError`` for a host that is not valid UTF-8.
+    """
+    window = usage_window(since_ms, None, now_ms)
+    return total_query(
+        COST_USAGE,
+        window=window.range,
+        by=(SESSION_ID_KEY,),
+        matchers={HOST_LABEL: host},
+    )
+
+
+def daily_cost_query(host: str) -> str:
+    """The estimated cost of the last 24 hours across sessions, in one instant query:
+    ``sum(increase(<cost>{host="<host>"}[24h] anchored))``.
+
+    ADR 0013's exact total over a range that ends at the query's time: what the session
+    pages show, summed over every session and cut at 24 hours ago. A series whose last
+    sample before the range is older than Prometheus's lookback (5 minutes by default)
+    takes its starting value from its first sample inside the range instead (ADR 0013),
+    so a session idle across the range's start can undercount what it spent before its
+    next export. Raises ``ValueError`` for a host that is not valid UTF-8.
+    """
+    return total_query(COST_USAGE, window=DAILY_COST_WINDOW, matchers={HOST_LABEL: host})
+
+
+def parse_cost_sample(
+    *, observed_at_ms: int, sessions: object, daily: object | None = None
+) -> CostSample | None:
+    """The sample of the decoded answers to ``session_cost_query`` and, unless ``None``
+    (not asked), ``daily_cost_query``; ``None`` when either is not a valid instant
+    vector of finite, non-negative values (``usage.parse_vector``), so a rule never acts
+    on part of a total.
+
+    A series without ``session_id`` (``OTEL_METRICS_INCLUDE_SESSION_ID=false``) belongs
+    to no session and is left out. The day is the value of its one series; an empty
+    vector, which ``sum`` gives over no series, is US$ 0, and more than one series is
+    invalid.
+    """
+    vector = parse_vector(sessions, SESSION_ID_KEY)
+    if vector is None:
+        return None
+    daily_usd: float | None = None
+    if daily is not None:
+        day = parse_vector(daily, SESSION_ID_KEY)
+        if day is None or len(day) > 1:
+            return None
+        daily_usd = day[0][1] if day else 0.0
+    return CostSample(
+        observed_at_ms=observed_at_ms,
+        sessions={session_id: usd for session_id, usd in vector if session_id},
+        daily_usd=daily_usd,
+    )
+
+
+def _fresh(sample: CostSample, now_ms: int) -> bool:
+    """Whether ``sample`` may fire or clear at ``now_ms``: at most ``COST_STALE_MS`` old.
+    A sample from after ``now_ms`` (the clock went backwards) is fresh."""
+    return now_ms - sample.observed_at_ms <= COST_STALE_MS
+
+
+# Holds a firing key while a stale sample says nothing: _step keeps it as it is.
+_HOLD: Final = _Episode(reached=False, value=0.0, threshold=0.0)
+
+
+def _cost_episodes(
+    state: AlertState,
+    rule: AlertRule,
+    totals: Mapping[str, float] | None,
+    subjects: Iterable[str],
+    *,
+    limit: float,
+) -> dict[str, _Episode]:
+    """The episodes of a cost rule over ``subjects``, the subjects that can alert.
+
+    With ``totals`` (a fresh sample), an episode starts at ``limit`` and, once it fired,
+    lasts down to ``limit * COST_CLEAR_RATIO``; a subject without a total has none.
+    Without (``None``: stale or missing), every firing subject holds and nothing starts.
+    """
+    firing = {k.subject for k, v in state.keys.items() if k.rule == rule and v.firing}
+    episodes: dict[str, _Episode] = {}
+    for subject in subjects:
+        if totals is None:
+            if subject in firing:
+                episodes[subject] = _HOLD
+            continue
+        total = totals.get(subject)
+        if total is None:
+            continue
+        floor = limit * COST_CLEAR_RATIO if subject in firing else limit
+        if total >= floor:
+            episodes[subject] = _Episode(reached=total >= limit, value=total, threshold=limit)
+    return episodes
+
+
+def evaluate_session_cost(
+    state: AlertState,
+    sample: CostSample | None,
+    sessions: Iterable[SessionState],
+    *,
+    config: AlertConfig,
+    now_ms: int,
+) -> tuple[AlertState, list[AlertEffect]]:
+    """Evaluate ``session_cost`` at ``now_ms`` over ``sample`` and the sessions the
+    caller holds.
+
+    Only a session of ``sessions`` that is neither ``ended`` nor ``stale`` can alert: a
+    session of the sample the caller does not hold is ignored, and one that ends, turns
+    stale, leaves ``sessions`` or leaves the sample ends its episode, clearing if it
+    fired. Its episode fires when its total reaches ``limit_usd`` (value: the total,
+    threshold: the limit) and, once fired, clears only when the total falls below
+    ``limit_usd * COST_CLEAR_RATIO``. A stale or missing ``sample`` (``None``, or older
+    than ``COST_STALE_MS``) neither fires nor clears a session it still holds.
+
+    The keys of other rules pass through unchanged. Effects come sorted by subject. With
+    the rule disabled nothing fires, and what had fired clears.
+    """
+    rule = config.session_cost
+    episodes: dict[str, _Episode] = {}
+    if rule.enabled:
+        open_ids = (s.session.session_id for s in sessions if _open(s))
+        totals = sample.sessions if sample is not None and _fresh(sample, now_ms) else None
+        episodes = _cost_episodes(state, "session_cost", totals, open_ids, limit=rule.limit_usd)
+    keys, effects = _evaluate(
+        state,
+        "session_cost",
+        episodes,
+        cooldown_ms=config.cooldown_s * _MS_PER_S,
+        now_ms=now_ms,
+    )
+    return replace(state, keys=keys), effects
+
+
+def evaluate_daily_cost(
+    state: AlertState, sample: CostSample | None, *, config: AlertConfig, now_ms: int
+) -> tuple[AlertState, list[AlertEffect]]:
+    """Evaluate ``daily_cost`` at ``now_ms`` over ``sample``'s rolling 24 hours, with the
+    subject ``DAY_SUBJECT``.
+
+    The episode fires when the day's total reaches ``limit_usd`` and, once fired, clears
+    only when the total falls below ``limit_usd * COST_CLEAR_RATIO``, as old requests
+    leave the rolling day. A sample that is stale, missing or without the day neither
+    fires nor clears.
+
+    The keys of other rules pass through unchanged. With the rule disabled nothing fires,
+    and what had fired clears.
+    """
+    rule = config.daily_cost
+    episodes: dict[str, _Episode] = {}
+    if rule.enabled:
+        totals = (
+            {DAY_SUBJECT: sample.daily_usd}
+            if sample is not None and sample.daily_usd is not None and _fresh(sample, now_ms)
+            else None
+        )
+        episodes = _cost_episodes(state, "daily_cost", totals, (DAY_SUBJECT,), limit=rule.limit_usd)
+    keys, effects = _evaluate(
+        state,
+        "daily_cost",
+        episodes,
+        cooldown_ms=config.cooldown_s * _MS_PER_S,
+        now_ms=now_ms,
+    )
+    return replace(state, keys=keys), effects

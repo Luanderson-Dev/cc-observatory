@@ -136,6 +136,71 @@ narrowed to `StopFailure` in v0.6.0, because:
   `StopFailure` (`model_not_found`) for the same failure, so counting both would count
   one failure twice.
 
+**The cost rules.** Both read Claude Code's cost counter in Prometheus
+(`claude_code_cost_usage_USD_total`, ADR 0014) through ADR 0013's exact totals,
+`increase(... anchored)`, built by `telemetry.total_query` and filtered on the app's
+`host` label only. The reader that sends the queries in the background is a later stage
+of milestone 5; the domain builds the queries, parses the answers into a `CostSample`
+(the totals and the time the queries ran) and evaluates it.
+
+- **`session_cost`** sends one query for every session,
+  `sum by (session_id) (increase(claude_code_cost_usage_USD_total{host="<host>"}[<range>] anchored))`,
+  with no `session_id` matcher, so no session ID reaches Prometheus and the number of
+  sessions does not change the number of queries. It is the session page's query
+  ([ADR 0035](0035-per-session-tokens-and-cost-from-prometheus-and-grafana-links.md))
+  grouped by `session_id` instead of `model`. Its range is the page's window of the
+  oldest session evaluated, from 5 minutes before its start to now: every session it
+  covers from its start has nothing before the range, so `anchored` starts from its zero
+  sample and its total is the one its page shows. `session_cost_since` gives that start:
+  the earliest start of the sessions the writer holds that are neither `ended` nor
+  `stale`, or none, and then the reader sends no query.
+- **Cost of the range.** The range grows with the oldest open session's age: a session
+  idle but alive for days makes a range of days, and every poll reads all the host's
+  cost samples in it. The reader must therefore not query more often than Claude Code's
+  metrics export interval (about one minute), since a faster poll sees no new sample;
+  the reader and its cadence are decided in stage 7 of milestone 5 (ADR 0043).
+- Only a session the writer holds that is neither `ended` nor `stale` can alert. A
+  session of the answer the writer does not hold (an older one still inside the range,
+  whose total the range cuts) is ignored. A session that ends, turns stale or leaves the
+  answer ends its episode. Accepted consequence: a session above the limit that turns
+  `stale` clears, and if it works again its total, which never drops, starts a new
+  episode that fires again once the cooldown has passed. Making a stale session hold its
+  alert instead was rejected: a session that never comes back would keep a firing alert
+  until the writer drops it, and the evaluator would need a third session state; the
+  clear-and-refire keeps the code to one rule (open or not).
+- A limit changed while an episode fires applies at the next evaluation, with the same
+  hysteresis: raised so that the total falls below 90 % of the new limit, it clears;
+  raised less, it holds; lowered, it never fires again in the same episode.
+- **`daily_cost`** sends
+  `sum(increase(claude_code_cost_usage_USD_total{host="<host>"}[24h] anchored))`: the
+  rolling 24 hours (decision P2), across sessions, with the subject `day`. An empty
+  answer, which `sum` gives over no series, is US$ 0.
+- An episode fires when the total reaches the limit, with the total as its value and the
+  limit as its threshold. **Hysteresis:** once fired, it lasts while the total stays at
+  or above 90 % of the limit, and clears below it, so a rolling day that loses an old
+  request and gains a new one around the limit does not clear and fire again. This 90 %
+  was set by the implementer of stage 3 on the main context's brief, pending the
+  maintainer's objection.
+- **Staleness:** a sample more than 180 s old at the evaluation (three of Claude Code's
+  one-minute exports), or no sample at all (Prometheus down or its answer invalid),
+  neither fires nor clears: an alert never clears because Prometheus stopped answering.
+  A session that ends or leaves the writer still clears, since that comes from the hooks,
+  not from the sample. A sample timed after now (the clock went backwards) counts.
+- The parser accepts only the answers ADR 0035's parser accepts: a well-formed instant
+  vector of finite, non-negative values, one series per label value. Anything else
+  (`NaN`, an infinity, a negative value, a non-string label or value, a repeated
+  `session_id`, or a day of more than one series) makes the whole sample invalid, never
+  a partial total and never an exception. A series without `session_id` belongs to no
+  session and is left out.
+- **Limitations.** With `OTEL_METRICS_INCLUDE_SESSION_ID=false` set outside
+  `ccobs setup` (ADR 0016), the series carry no `session_id`: `session_cost` has no data
+  and never fires, while `daily_cost` still works. A series idle for more than
+  Prometheus's 5-minute lookback across the start of the 24-hour range takes its
+  starting value from its first sample inside the range (ADR 0013), so the day can
+  undercount a session idle at that moment. Stage 7 of milestone 5 (ADR 0043) decides
+  whether the reader passes a `lookback_delta`, with evidence, per ADR 0013. The totals
+  lag Claude Code's export interval, about a minute.
+
 **Out of v0.6.0:** immediate alerts on terminal error codes (one failure that no retry
 can fix), `api_error` from Loki, and per-rule channels (every rule goes to both
 channels).
@@ -173,8 +238,17 @@ channels).
   a disabled rule, out-of-order failures, the bound of N times per session, lowering
   and raising N, and a replay of the `headless-api-error`
   fixture, whose single `StopFailure` (`model_not_found`) does not fire.
-- Later stages of milestone 5 add the tests of the cost rules and of the writer's 5 s
-  evaluation.
+- `tests/test_domain_alerts_cost.py` covers the cost rules: the exact queries (no
+  `session_id` matcher, the session page's range, the 24-hour range) and the escaping of
+  the host label, the parser on valid, empty and malformed answers (wrong shapes, `NaN`,
+  infinities, negatives, non-string labels, repeated sessions, a day of two series),
+  firing at the limit and not below, the hysteresis, stale and missing samples, a
+  disabled rule, the cooldown, limits raised or lowered while an alert fires, sessions
+  that end, turn stale or leave the answer, sessions the writer does not hold, and the
+  start of the session query's range (`session_cost_since`: the oldest open session,
+  none when every session is ended or stale).
+- A later stage of milestone 5 adds the tests of the writer's 5 s evaluation and of the
+  cost reader.
 - `tests/test_domain_telemetry.py` and `tests/test_cli_light.py` keep
   `ccobs.domain.alerts` free of I/O.
 
