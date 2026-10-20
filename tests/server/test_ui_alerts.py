@@ -186,6 +186,8 @@ def test_the_page_has_a_title_a_lede_and_two_sections_history_first(client: Test
     assert body.index('id="alert-history"') < body.index('id="alert-settings"')
     # The slot for the browser notifications control (stage 11): empty, no placeholder.
     assert '<div id="alert-notifications" class="alert-notifications"></div>' in body
+    # notify.js fills it in (test_notify_js.py) and shows the notifications.
+    assert '<script src="/static/js/notify.js" defer></script>' in body
     # The page streams unfiltered, for the alerts ping (ADR 0044).
     assert 'data-stream="/ui/stream"' in body
     assert not INLINE_CODE.search(body)

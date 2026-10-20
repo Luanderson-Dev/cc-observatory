@@ -225,7 +225,7 @@ def test_templates_hold_nothing_the_csp_refuses(scan: re.Pattern[str]) -> None:
 
 def test_own_scripts_never_evaluate_strings() -> None:
     scripts = [path for path in _own_text_files() if path.suffix == ".js"]
-    assert {path.name for path in scripts} >= {"app.js", "live.js", "theme.js"}
+    assert {path.name for path in scripts} >= {"app.js", "live.js", "notify.js", "theme.js"}
     for path in scripts:
         assert not EVAL.search(path.read_text(encoding="utf-8")), path.name
 

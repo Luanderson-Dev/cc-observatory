@@ -48,8 +48,8 @@ refetch", because it keeps ADR 0032's model (pings plus refetch), adds one read 
 burst of alerts instead of a poll, and needs no CSP change. This ADR extends ADR 0032,
 which stays in force. The route's shape, the cursor names and the subject's kind were
 chosen in stage 8 of milestone 5; the browser behaviour below (first visit, 5 minutes,
-dedup) is proposed for stage 11. Both await the maintainer's decision, which is why this
-ADR is proposed.
+dedup, the wording and the permission control) was implemented in stage 11. Both await
+the maintainer's decision, which is why this ADR is proposed.
 
 **The ping.** `ChangeHub.publish(ALERTS)` marks every subscription, filtered on a
 session or not, with a pending alerts flag; no session is marked as changed. The stream
@@ -88,19 +88,54 @@ before. `MAX_STREAMS` stays 16 and the 17th stream still gets its plain 503 with
 those tabs show "Live updates paused" and retry as before.
 
 **No Service Worker.** Notifications show only while a tab of the app is open; the CSP
-is unchanged.
+is unchanged. If the tab that created a notification navigates away or closes, clicking
+that old notification in the OS notification centre does nothing: its handler is gone.
 
-**In the browser (stage 11).** On an `alerts` ping, and when the stream opens, the page
-fetches `?after=<cursor>` and shows a notification for each new alert:
+**In the browser (stage 11).** `static/js/notify.js`, loaded on every page after
+`live.js`, listens for `ccobs:alerts` (each ping, each stream open, and the
+`HX-Trigger` of a saved settings form). If the browser allowed notifications, it fetches
+`?after=<cursor>&limit=50`, follows up while a page comes back full, and shows a
+notification for each new alert:
 
-- the cursor is the newest alert `id` seen, kept per browser in `localStorage` for the
-  app's origin, so every tab shares it;
-- on the first visit (no cursor yet), the page sets the cursor to the newest alert and
-  shows nothing, so an old history never floods the screen;
-- later, it shows only unseen alerts that fired less than 5 minutes ago, and moves the
-  cursor past every alert it read;
-- each notification has the alert `id` as its `tag`, so several tabs that fetch the
-  same alert replace one notification instead of stacking copies.
+- the cursor is the newest alert `id` read, kept per browser in `localStorage` under
+  `ccobs.alerts.cursor` for the app's origin, so every tab shares it; where the storage
+  is unavailable, the tab keeps it in memory;
+- on the first run (no cursor yet), the page reads `?limit=1`, sets the cursor to the
+  newest alert (0 with none) and shows nothing, so an old history never floods the
+  screen; an answer of the wrong shape sets no cursor;
+- when the first page after the cursor comes back empty, the page reads `?limit=1` too:
+  a cursor above the newest alert (0 with none) comes from another database (the data
+  directory wiped, or another instance on the same origin, whose ids restart at 1) and
+  would silence every alert, so it comes down to that id, showing nothing;
+- later, it shows only unseen alerts still on (`cleared_at_ms` null) that fired less
+  than 5 minutes ago, and moves the cursor past every alert it read, shown or not; an
+  alert at or below the stored cursor (another tab read it) is skipped, and a page that
+  does not run past the cursor is dropped. The 5 minutes compare the browser's clock
+  with the server's `fired_at_ms`; in practice both run on the same machine, a browser
+  clock more than 5 minutes ahead shows nothing, and one behind only widens the window;
+- each notification's `tag` is `ccobs-alert-<id>`, so several tabs that fetch the same
+  alert replace one notification instead of stacking copies; a tab reads once at a
+  time, and pings during a read make one more read after it. The dedup is not airtight:
+  `localStorage` has no lock across tabs, so between one tab's read of the cursor and
+  its write another tab can store a higher one, the cursor goes back a little, and a
+  still-recent alert can show again; the tag collapses only a notification still on
+  screen, so one the user dismissed comes back. This needs two tabs reading the same
+  burst within that gap, and is rare;
+- the title names the rule (`cc-observatory: waiting on you`, `API requests failing`,
+  `session cost over the limit`, `daily cost over the limit`); the body is
+  `describe_alert`'s sentence, after `<project> (<8-character session id>): ` for a
+  session alert (`Unknown project` without one), so no path or content shows; an alert
+  of a rule the script does not know is read but not shown;
+- a click focuses the tab, opens `/sessions/<id>` (or `/alerts` for a daily alert) and
+  closes the notification;
+- failed reads and answers of the wrong shape are ignored; the next ping reads again
+  from the cursor.
+
+The permission is asked only from a click: on the alerts page, `#alert-notifications`
+shows the button "Notify me in this browser" while the browser has not been asked, and
+otherwise a sentence for granted, blocked, or a browser without the API. Other pages
+show no control and still notify. `Notification` and same-origin `fetch` need no CSP
+change (`script-src 'self'`, `connect-src 'self'`).
 
 ### Consequences
 
@@ -136,13 +171,25 @@ fetches `?after=<cursor>` and shows a notification for each new alert:
 - `tests/server/test_repository.py`: `alert_views` pages both ways, capped, with the
   session's `cwd`, on the readers' engine.
 - `tests/server/test_ui_overview.py` and `test_ui_session.py`: every page, error pages
-  included, has one `data-stream` and no inline code.
+  included, has one `data-stream` and no inline code, and loads `notify.js` after
+  `live.js`.
+- `tests/server/test_notify_js.py`, under node with a fake `Notification`, `fetch`,
+  `localStorage` and clock: the first run sets the cursor and shows nothing; a new alert
+  shows once with its title, body and tag; cleared, old or unknown alerts move the
+  cursor unseen, and an alert fired ahead of the browser's clock still shows; repeated
+  pings, overlapping pings and another tab's cursor show nothing twice, and the cursor
+  never goes below another tab's; a cursor above the newest alert comes down to it
+  (to 0 with none, in storage or in memory) and the next alert shows; a full page is
+  followed up; the permission is asked only on click, and its answer takes the focus
+  only from the button or the body; the sentences for granted, blocked and missing; a
+  click focuses and navigates; failed reads, wrong shapes and a throwing storage are
+  absorbed; the wording matches `describe_alert`.
 
 ## More information
 
 - Extends ADR 0032 (change hub and stream); uses ADR 0033 (read gate), ADR 0041 (rules)
   and ADR 0042 (alert table and order).
-- Stage 11 of milestone 5 implements the browser side (`live.js` or a new script), the
+- Stage 11 of milestone 5 implements the browser side in `static/js/notify.js`, the
   permission request and the notification text; stage 13 gives `ccobs doctor` a summary
   of the Discord deliveries.
 - Revisit if users ask for notifications with no tab open (a Service Worker, and a CSP
