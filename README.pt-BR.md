@@ -73,9 +73,11 @@ planejado.
   logs, tokens e custo dela lá (v0.4.0) e, mais tarde, dashboards vão abrir já filtrados
   pelo agente ou projeto que você estava vendo (v0.7.0).
 - **Alertas** (v0.6.0): notificações no navegador e, opcionalmente, um webhook do Discord
-  quando uma sessão espera por você além de um limite de tempo, quando erros de API se
-  repetem ou quando o custo estimado de uma sessão ou de um dia passa de um limite. Você
-  define os limites por variáveis de ambiente ou em uma tela de configurações.
+  quando uma sessão espera por você além de um limite de tempo (30 segundos por padrão),
+  quando as requisições à API dela falham repetidamente ou quando o custo estimado de
+  uma sessão ou das últimas 24 horas passa de um limite (desligados por padrão). Uma
+  página de alertas os lista e guarda as configurações deles, que você também pode
+  definir por variáveis de ambiente.
 
 ## Como funciona
 
@@ -279,6 +281,37 @@ somente leitura.
   métricas do app no Grafana, as configurações e a retenção dele, a privacidade e a
   solução de problemas.
 
+## Alertas (a partir da v0.6.0)
+
+O app avisa você quando uma sessão espera por você há 30 segundos, quando as
+requisições à API dela falharam 3 vezes em 10 minutos e, depois que você os liga, quando
+o custo estimado de uma sessão ou das últimas 24 horas chega a um limite.
+
+1. Abra a página **Alerts**, <http://127.0.0.1:4300/alerts>. Ela lista os alertas
+   disparados e guarda as configurações deles; um valor que você salva lá vale mais que
+   a variável `CCOBS_ALERT_*` dele, até você resetá-lo.
+2. Clique em **Notify me in this browser** e permita as notificações. Elas aparecem
+   enquanto houver uma aba do app aberta, em qualquer página dele.
+3. Se quiser, mande os alertas também para o Discord: crie um webhook no seu servidor do
+   Discord (**Server Settings**, **Integrations**, **Create Webhook**, **Copy Webhook
+   URL**, com o Discord em inglês), coloque a URL no `.env` da stack:
+
+   ~~~bash
+   CCOBS_DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/<id>/<token>
+   ~~~
+
+   Depois rode `docker compose up -d` e clique em **Send test message** na página
+   Alerts. Uma mensagem traz o alerta em palavras, o label do host, o ID curto da sessão
+   e um link local, nunca um caminho ou conteúdo; o nome do projeto só com
+   `CCOBS_DISCORD_INCLUDE_PROJECT=true`. A URL do webhook é um segredo: não inclua o
+   `.env` em nada que você compartilhe.
+
+- **Os alertas de custo** usam a estimativa do Claude Code, não o valor que você paga.
+  Enquanto um deles está ligado, o app consulta o Prometheus da stack no máximo uma vez
+  por minuto.
+- **Mais.** O [docs/app.md](docs/app.md#alerts) (em inglês) cobre as regras, as
+  configurações, as notificações, a entrega no Discord e a solução de problemas.
+
 ## Privacidade
 
 - **Só metadados por padrão.** O texto dos prompts, as entradas e saídas das
@@ -296,13 +329,17 @@ somente leitura.
   incluídas garantem: todas as portas escutam só em `127.0.0.1`; o Prometheus, o Loki e
   o Tempo não publicam porta nenhuma e ficam numa rede interna, sem rota para fora; e o
   envio de dados de uso e a busca por atualizações do Grafana, do Loki e do Tempo ficam
-  desligados. Durante o uso, nada sai da sua máquina, exceto o webhook opcional do
-  Discord, se você configurar um, e as consultas de DNS pelo nome de um armazenamento
-  enquanto ele estiver parado (veja o [SECURITY.md](SECURITY.md)).
+  desligados. Durante o uso, nada sai da sua máquina, exceto o que o app envia ao
+  webhook opcional do Discord (os alertas e a mensagem de teste, a partir da v0.6.0), se
+  você configurar um, e as
+  consultas de DNS pelo nome de um armazenamento enquanto ele estiver parado; as
+  consultas dos alertas de custo vão para o próprio Prometheus da stack e ficam na sua
+  máquina (veja o [SECURITY.md](SECURITY.md)).
 - **A interface web** (a partir da v0.4.0) também não tem login, não carrega nada da
-  internet e não muda nada. Ela mostra o diretório de trabalho só como o nome do
-  projeto, ou com o seu diretório pessoal como `~`, e recusa as requisições que outras
-  páginas web fazem pelo seu navegador (um link para ela continua só abrindo a
+  internet e não muda nada no Claude Code; a partir da v0.6.0, a única coisa que ela
+  muda são as configurações dos alertas. Ela mostra o diretório de trabalho só como o
+  nome do projeto, ou com o seu diretório pessoal como `~`, e recusa as requisições que
+  outras páginas web fazem pelo seu navegador (um link para ela continua só abrindo a
   página).
 - **O Grafana não tem login.** Quem o abre é um Editor, que pode consultar os dados e
   salvar dashboards, mas não pode mudar as fontes de dados, os plugins, os usuários nem

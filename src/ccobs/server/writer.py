@@ -25,6 +25,44 @@ a batch that failed. Like the block observer, the callback must be quick and mus
 block (the hub only schedules work on the event loop); its errors are logged and never
 reach the writer.
 
+The alert rules (ADR 0041) run here too, over the sessions this thread holds. Every hook
+event a commit stores is recorded in the failure windows (``record_failure_event``), in
+the order it was applied. Every ``AlertTick`` (``submit_alert_tick``, every 5 s from
+``ccobs.server.sweeps.AlertTicker``) runs the rules in a fixed order, ``waiting_user``,
+``repeated_failures``, ``session_cost`` and ``daily_cost``, the cost rules on the last
+``CostSample`` submitted (``submit_cost_sample``), and writes their effects in one
+transaction (``Repository.apply_alert_effects``); then ``on_committed`` gets
+``ALERTS``. The cost reader (``ccobs.server.costs``, ADR 0043) sends those samples from
+a thread of its own, after reading the rules in force (``alert_config``) and the oldest
+open session's start (``session_cost_since``, under the lock). A tick without effects
+writes nothing. The evaluators' state is rebuilt from
+the database at the first tick (ADR 0042: the open and cooling keys, and the failure
+windows, dropped while ``repeated_failures`` is off), with the saved settings applied
+over the environment's (``apply_saved_settings``); ``submit_alert_settings_changed``
+reloads them. The settings screen's saves and resets (``submit_alert_settings_save``,
+``submit_alert_settings_reset``, ADR 0045) carry a ``concurrent.futures.Future``: the
+writer checks a save on the effective configuration (``apply_settings``), writes it in
+one transaction or not at all, puts the configuration in force at once and settles the
+future with the saved values and any errors. A change that turns ``repeated_failures``
+on or widens it reloads its failure windows from the database, as the rebuild does. At
+most ``SETTINGS_PENDING_MAX`` wait; a change
+whose request gave up (its future cancelled) is skipped, and one still queued at stop is
+settled with ``AlertSettingsUnavailableError``. A failed tick changes nothing in memory,
+so the next one tries again.
+
+The Discord sender (``ccobs.server.discord``, ADR 0046) never touches the database
+either. Each of its rounds is a ``DiscordRound`` with a future, which this thread
+settles with ``Repository.take_due_deliveries``: the deliveries pending too long
+expired and the ones now due read, in one transaction. Each attempt's outcome comes
+back as ``DiscordResults``, written in one transaction (``record_deliveries``). Both run
+in queue order, so a round never reads a delivery whose last outcome is still queued. A
+round whose sender gave up (its future cancelled) is skipped; one still queued at stop,
+or whose read fails, is settled with ``DiscordUnavailableError``; a failed record is
+logged by type and changes nothing, so those alerts are sent again (ADR 0046's
+at-least-once). The writer logs and counts the deliveries a round expires
+(``on_discord_expired``) itself: a sender that stopped waiting cannot cancel a round
+already running, and would never see them.
+
 Hooks still queued when ``stop`` runs out of time are counted ``internal``: ADR 0027
 already accepts that a stop loses what is still in memory and counts losses there, and
 ``internal`` is its reason for an app-side loss, so the drop reasons stay as recorded.
@@ -38,10 +76,29 @@ import queue
 import threading
 import time
 from collections import Counter
-from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field
+from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import Future
+from dataclasses import dataclass, field, replace
 from typing import Final
 
+from ccobs.domain.alerts import (
+    AlertConfig,
+    AlertEffect,
+    AlertFired,
+    AlertState,
+    CostSample,
+    FieldError,
+    RepeatedFailuresRule,
+    apply_saved_settings,
+    apply_settings,
+    evaluate_daily_cost,
+    evaluate_repeated_failures,
+    evaluate_session_cost,
+    evaluate_waiting_user,
+    forget_sessions,
+    record_failure_event,
+    session_cost_since,
+)
 from ccobs.domain.app_metrics import event_label
 from ccobs.domain.denials import OpenBlock
 from ccobs.domain.hooks import HookEvent, parse_hook
@@ -54,15 +111,32 @@ from ccobs.domain.sessions import (
     close_block_denied,
     mark_stale,
 )
-from ccobs.server.changes import ALL, Change
-from ccobs.server.db.repository import Applied, Repository, hook_event_row
+from ccobs.server.changes import ALERTS, ALL, HubEvent
+from ccobs.server.db.repository import (
+    AlertSettingValue,
+    Applied,
+    DeliveryUpdate,
+    DueDeliveries,
+    Repository,
+    hook_event_row,
+)
 from ccobs.server.ingest import HookQueue, RawHook
 
 __all__ = [
+    "SETTINGS_PENDING_MAX",
+    "AlertSettingsChanged",
+    "AlertSettingsResult",
+    "AlertSettingsUnavailableError",
+    "AlertTick",
     "BlockClosedCallback",
     "CommittedCallback",
     "Control",
+    "DiscordResults",
+    "DiscordRound",
+    "DiscordUnavailableError",
+    "ResetAlertSettings",
     "Retention",
+    "SaveAlertSettings",
     "TelemetryClose",
     "Tick",
     "Writer",
@@ -78,20 +152,28 @@ _CLOSED: Final = frozenset({"ended", "stale"})
 _ENDED: Final = "ended"
 _PERMISSION: Final = "permission"
 _MS_PER_S: Final = 1000
+# How many settings changes may wait for the writer at once (ADR 0045); one more is
+# refused at once, and its request answers 503.
+SETTINGS_PENDING_MAX: Final = 8
 
 # Receives each closed block's kind and how long it was open, in seconds.
 type BlockClosedCallback = Callable[[BlockKind, float], None]
-# Receives the sessions each commit changed, or ALL (ADR 0032).
-type CommittedCallback = Callable[[Change], None]
+# Receives the sessions each commit changed, or ALL (ADR 0032), or ALERTS after a tick
+# that wrote alert effects (ADR 0041).
+type CommittedCallback = Callable[[HubEvent], None]
+# Receives how many Discord deliveries a round just marked expired (ADR 0046).
+type DiscordExpiredCallback = Callable[[int], None]
 
 
 @dataclass(frozen=True, kw_only=True)
 class WriterObservers:
     """The callbacks the app gives the writer it builds: the block-duration histogram
-    (ADR 0028) and the live updates hub (ADR 0032)."""
+    (ADR 0028), the live updates hub (ADR 0032) and the count of expired Discord
+    deliveries (ADR 0046)."""
 
     on_block_closed: BlockClosedCallback
     on_committed: CommittedCallback
+    on_discord_expired: DiscordExpiredCallback | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -117,7 +199,87 @@ class Retention:
     cutoff_ms: int
 
 
-type Control = Tick | TelemetryClose | Retention
+@dataclass(frozen=True, slots=True)
+class AlertTick:
+    """Run the alert rules at ``now_ms`` and write their effects (ADR 0041)."""
+
+    now_ms: int
+
+
+@dataclass(frozen=True, slots=True)
+class AlertSettingsChanged:
+    """Reload the saved alert settings: the settings screen saved or reset one."""
+
+
+@dataclass(frozen=True, kw_only=True)
+class AlertSettingsResult:
+    """What a settings change left (ADR 0045): the host's saved overrides after it, and
+    the errors that stopped it, by flat name; with errors, nothing was saved."""
+
+    saved: Mapping[str, AlertSettingValue]
+    errors: tuple[FieldError, ...] = ()
+
+
+class AlertSettingsUnavailableError(Exception):
+    """A settings change was not applied: too many were waiting, the writer stopped
+    first, or the write failed. The message never holds a value."""
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class SaveAlertSettings:
+    """Save ``values`` over the host's settings, if the effective configuration stays
+    valid, then reload it; ``result`` gets the outcome."""
+
+    values: Mapping[str, AlertSettingValue]
+    updated_at_ms: int
+    result: Future[AlertSettingsResult]
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class ResetAlertSettings:
+    """Delete the saved override of ``field``, or every one when it is None, then reload
+    the configuration; ``result`` gets the outcome."""
+
+    field: str | None
+    result: Future[AlertSettingsResult]
+
+
+class DiscordUnavailableError(Exception):
+    """A Discord round got no deliveries: the writer stopped first, or the read failed.
+    The message never holds a value."""
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class DiscordRound:
+    """Expire the pending deliveries of alerts fired before ``expire_before_ms``, then
+    read up to ``limit`` deliveries due at ``now_ms``; ``result`` gets them."""
+
+    now_ms: int
+    expire_before_ms: int
+    limit: int
+    result: Future[DueDeliveries]
+
+
+@dataclass(frozen=True, slots=True)
+class DiscordResults:
+    """Record where each delivery of one Discord attempt stands."""
+
+    updates: tuple[DeliveryUpdate, ...]
+
+
+# A CostSample, the cost reader's latest answer, is stored for the next AlertTick.
+type Control = (
+    Tick
+    | TelemetryClose
+    | Retention
+    | AlertTick
+    | AlertSettingsChanged
+    | SaveAlertSettings
+    | ResetAlertSettings
+    | DiscordRound
+    | DiscordResults
+    | CostSample
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -153,6 +315,7 @@ class WriterCounts:
     events_processed: int
     sessions_ended: int
     events_received: dict[str, int] = field(default_factory=dict)
+    alerts_fired: dict[str, int] = field(default_factory=dict)
 
 
 class _LoadError(Exception):
@@ -198,7 +361,12 @@ class Writer:
     A write that nothing in a batch survives makes the thread wait ``backoff_initial_s``,
     doubling up to ``backoff_max_s``, until a write succeeds. ``monotonic`` and ``sleep``
     are injectable for tests; the default sleep returns early when ``stop`` is called.
-    ``on_block_closed`` and ``on_committed`` are the observers (``WriterObservers``).
+    ``on_block_closed``, ``on_committed`` and ``on_discord_expired`` are the observers
+    (``WriterObservers``).
+    ``alert_config`` is the alert rules the environment gives (``Settings.alert_config``,
+    the defaults when ``None``), which saved settings override; ``discord_configured``
+    whether a fired alert waits to be sent to Discord (``pending``) or never is
+    (``none``).
     """
 
     def __init__(
@@ -215,11 +383,15 @@ class Writer:
         backoff_max_s: float = 30.0,
         on_block_closed: BlockClosedCallback | None = None,
         on_committed: CommittedCallback | None = None,
+        alert_config: AlertConfig | None = None,
+        discord_configured: bool = False,
+        on_discord_expired: DiscordExpiredCallback | None = None,
         monotonic: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], object] | None = None,
     ) -> None:
         self.host: Final = host
         self.stale_after_ms: Final = stale_after_ms
+        self.discord_configured: Final = discord_configured
         self._queue = hook_queue
         self._repository = repository
         self._batch_max = batch_max
@@ -230,6 +402,16 @@ class Writer:
         self._backoff_s = backoff_initial_s
         self._on_block_closed = on_block_closed
         self._on_committed = on_committed
+        self._on_discord_expired = on_discord_expired
+        # The alert rules: the environment's, the effective ones (saved settings on top,
+        # loaded at the first tick), and the evaluators' state, None until the first
+        # tick rebuilds it from the database.
+        self._env_alerts = alert_config or AlertConfig()
+        self._alert_config = self._env_alerts
+        self._alerts: AlertState | None = None
+        # The time of the last alert tick, which built or updated ``_alerts``.
+        self._alerts_at_ms = 0
+        self._cost_sample: CostSample | None = None
         self._monotonic = monotonic
         self._stopping = threading.Event()
         self._sleep: Callable[[float], object] = sleep or self._stopping.wait
@@ -243,6 +425,9 @@ class Writer:
         self._events = 0
         self._ended = 0
         self._received: Counter[str] = Counter()
+        self._fired: Counter[str] = Counter()
+        # Settings changes queued and not yet taken (ADR 0045), under the lock.
+        self._settings_pending = 0
         # Per run_once: whether to back off, and the seqs already persisted or counted.
         self._failing = False
         self._settled: set[int] = set()
@@ -288,7 +473,15 @@ class Writer:
             self._queue.count_drop("internal")
             self._queue.task_done(item)
             hooks += 1
-        controls = len(self._take_controls(limit=None))
+        left = self._take_controls(limit=None)
+        for control in left:
+            if isinstance(control, SaveAlertSettings | ResetAlertSettings):
+                self._settle_unavailable(control, "the writer stopped")
+            elif isinstance(control, DiscordRound) and (
+                control.result.set_running_or_notify_cancel()
+            ):
+                control.result.set_exception(DiscordUnavailableError("the writer stopped"))
+        controls = len(left)
         if hooks or controls:
             _log.warning(
                 "writer stopped with %d hooks and %d scheduled tasks left; hooks counted"
@@ -308,6 +501,51 @@ class Writer:
     def submit_retention(self, cutoff_ms: int) -> None:
         self._controls.put(Retention(cutoff_ms))
 
+    def submit_alert_tick(self, now_ms: int) -> None:
+        self._controls.put(AlertTick(now_ms))
+
+    def submit_cost_sample(self, sample: CostSample) -> None:
+        self._controls.put(sample)
+
+    def submit_alert_settings_changed(self) -> None:
+        self._controls.put(AlertSettingsChanged())
+
+    def submit_alert_settings_save(
+        self, values: Mapping[str, AlertSettingValue], *, updated_at_ms: int
+    ) -> Future[AlertSettingsResult]:
+        """Queue a save of ``values`` (ADR 0045); the future gets its outcome.
+        ``AlertSettingsUnavailableError`` when ``SETTINGS_PENDING_MAX`` already wait."""
+        self._reserve_settings_change()
+        result: Future[AlertSettingsResult] = Future()
+        self._controls.put(SaveAlertSettings(dict(values), updated_at_ms, result))
+        return result
+
+    def submit_alert_settings_reset(self, field: str | None) -> Future[AlertSettingsResult]:
+        """Queue a reset of ``field``, or of every setting when it is None (ADR 0045).
+        ``AlertSettingsUnavailableError`` when ``SETTINGS_PENDING_MAX`` already wait."""
+        self._reserve_settings_change()
+        result: Future[AlertSettingsResult] = Future()
+        self._controls.put(ResetAlertSettings(field, result))
+        return result
+
+    def submit_discord_round(
+        self, now_ms: int, *, expire_before_ms: int, limit: int
+    ) -> Future[DueDeliveries]:
+        """Queue a Discord round (ADR 0046); the future gets the deliveries due."""
+        result: Future[DueDeliveries] = Future()
+        self._controls.put(DiscordRound(now_ms, expire_before_ms, limit, result))
+        return result
+
+    def submit_discord_results(self, updates: Sequence[DeliveryUpdate]) -> None:
+        """Queue the outcome of one Discord attempt, written in one transaction."""
+        self._controls.put(DiscordResults(tuple(updates)))
+
+    def _reserve_settings_change(self) -> None:
+        with self._lock:
+            if self._settings_pending >= SETTINGS_PENDING_MAX:
+                raise AlertSettingsUnavailableError("too many settings changes waiting")
+            self._settings_pending += 1
+
     # Reads, from any thread.
 
     def counts(self) -> WriterCounts:
@@ -316,6 +554,7 @@ class Writer:
             events = self._events
             ended = self._ended
             received = dict(self._received)
+            fired = dict(self._fired)
         return WriterCounts(
             sessions_by_status=dict(Counter(state.session.status for state in states)),
             open_blocks_by_kind=dict(
@@ -331,7 +570,23 @@ class Writer:
             events_processed=events,
             sessions_ended=ended,
             events_received=received,
+            alerts_fired=fired,
         )
+
+    def alert_config(self) -> AlertConfig:
+        """The alert rules in force: the environment's, with the saved settings on top
+        once the first tick has loaded them. Safe from any thread: the writer replaces
+        the frozen config whole, and this reads one reference."""
+        return self._alert_config
+
+    def session_cost_since(self) -> int | None:
+        """The start of the cost reader's session query (ADR 0043): the earliest
+        ``started_at_ms`` of the committed sessions that are neither ended nor stale
+        (``alerts.session_cost_since``), or ``None`` when there is none. Read under the
+        lock, so another thread never sees a batch half committed."""
+        with self._lock:
+            states = list(self._states.values())
+        return session_cost_since(states)
 
     def open_permission_blocks(self) -> list[OpenBlock]:
         """The committed open permission blocks that have a ``tool_use_id``, which the
@@ -408,13 +663,26 @@ class Writer:
                 self._received.update(received)
         ops: list[_Op] = list(parsed)
         for control in controls:
-            if isinstance(control, Retention):
-                # After the writes queued before it, so it sees their effects.
-                self._write(ops)
-                ops = []
-                self._retain(control.cutoff_ms)
-            else:
+            if isinstance(control, Tick | TelemetryClose):
                 ops.append(control)
+                continue
+            # After the writes queued before it, so it sees their effects.
+            self._write(ops)
+            ops = []
+            if isinstance(control, Retention):
+                self._retain(control.cutoff_ms)
+            elif isinstance(control, AlertTick):
+                self._evaluate_alerts(control.now_ms)
+            elif isinstance(control, AlertSettingsChanged):
+                self._reload_alert_settings()
+            elif isinstance(control, SaveAlertSettings | ResetAlertSettings):
+                self._change_alert_settings(control)
+            elif isinstance(control, DiscordRound):
+                self._discord_round(control)
+            elif isinstance(control, DiscordResults):
+                self._discord_results(control.updates)
+            else:
+                self._cost_sample = control
         self._write(ops)
 
     def _parse(self, item: RawHook) -> _HookOp | None:
@@ -460,7 +728,7 @@ class Writer:
             )
             self._retry(planned)
             return
-        self._commit(view, applied)
+        self._commit(view, applied, planned)
 
     def _retry(self, ops: Sequence[_Op]) -> None:
         attempted = persisted = 0
@@ -475,7 +743,7 @@ class Writer:
             except Exception as error:
                 self._drop(op, "write failed", type(error).__name__)
                 continue
-            self._commit(view, applied)
+            self._commit(view, applied, [op])
             persisted += 1
         if attempted and not persisted:
             # Nothing could be written: likely the database itself (a full disk, a lock).
@@ -533,8 +801,9 @@ class Writer:
         else:
             _log.error("%s skipped: %s (%s)", type(op).__name__, what, error_type)
 
-    def _commit(self, view: _View, applied: Sequence[Applied]) -> None:
-        """The batch is in the database: make its states the committed ones."""
+    def _commit(self, view: _View, applied: Sequence[Applied], ops: Sequence[_Op]) -> None:
+        """The batch is in the database: make its states the committed ones, and record
+        its hook events in the failure windows, in the order they were applied."""
         ended = sum(
             1
             for item in applied
@@ -552,6 +821,7 @@ class Writer:
             self._events += sum(item.event_row is not None for item in applied)
             self._ended += ended
         self._settled.update(item.event_row.seq for item in applied if item.event_row)
+        self._record_failures(ops)
         self._backoff_s = self._backoff_initial_s
         callback = self._on_block_closed
         if callback is not None:
@@ -567,20 +837,231 @@ class Writer:
         except Exception as error:
             _log.error("retention failed (%s)", type(error).__name__)
             return
-        # The same rule as delete_older_than, so memory forgets exactly what went.
+        # Memory forgets exactly the sessions that went, alert state included: a
+        # failure window left behind would fire an alert for a session no longer
+        # stored, whose insert fails the whole tick.
         with self._lock:
-            gone = [
-                session_id
-                for session_id, state in self._states.items()
-                if state.session.status in _CLOSED and state.session.last_event_at_ms < cutoff_ms
-            ]
-            for session_id in gone:
-                del self._states[session_id]
-        _log.info("retention deleted %d sessions", deleted)
+            for session_id in deleted:
+                self._states.pop(session_id, None)
+        if self._alerts is not None:
+            self._alerts = forget_sessions(self._alerts, deleted)
+        _log.info("retention deleted %d sessions", len(deleted))
         if deleted:
             self._notify(ALL)
 
-    def _notify(self, change: Change) -> None:
+    # The alert rules (ADR 0041).
+
+    def _record_failures(self, ops: Sequence[_Op]) -> None:
+        """Feed committed hook events to ``record_failure_event``. Before the first tick
+        there is no state yet: it is rebuilt from the database, which holds them."""
+        state = self._alerts
+        if state is None:
+            return
+        for op in ops:
+            if isinstance(op, _HookOp):
+                state = record_failure_event(
+                    state, op.event, op.received_at_ms, config=self._alert_config
+                )
+        self._alerts = state
+
+    def _evaluate_alerts(self, now_ms: int) -> None:
+        """Run the rules at ``now_ms`` and write their effects in one transaction. On
+        any error nothing changes in memory: the next tick tries again."""
+        try:
+            state = self._alerts if self._alerts is not None else self._rebuild_alerts(now_ms)
+            state, effects = self._run_rules(state, now_ms)
+            if effects:
+                self._repository.apply_alert_effects(
+                    self.host, effects, discord_configured=self.discord_configured
+                )
+        except Exception as error:
+            _log.error("alert evaluation failed (%s)", type(error).__name__)
+            return
+        self._alerts = state
+        self._alerts_at_ms = now_ms
+        if not effects:
+            return
+        fired = Counter(effect.rule for effect in effects if isinstance(effect, AlertFired))
+        with self._lock:
+            self._fired.update(fired)
+        self._notify(ALERTS)
+
+    def _run_rules(self, state: AlertState, now_ms: int) -> tuple[AlertState, list[AlertEffect]]:
+        """Every rule, in a fixed order, over the committed sessions (O(sessions held))."""
+        config = self._alert_config
+        sample = self._cost_sample
+        sessions = list(self._states.values())
+        state, waiting = evaluate_waiting_user(state, sessions, config=config, now_ms=now_ms)
+        state, failures = evaluate_repeated_failures(state, config=config, now_ms=now_ms)
+        state, session_cost = evaluate_session_cost(
+            state, sample, sessions, config=config, now_ms=now_ms
+        )
+        state, daily_cost = evaluate_daily_cost(state, sample, config=config, now_ms=now_ms)
+        return state, [*waiting, *failures, *session_cost, *daily_cost]
+
+    def _rebuild_alerts(self, now_ms: int) -> AlertState:
+        """The evaluators' state after a start (ADR 0042), with the saved settings
+        loaded: the keys still firing or cooling down, and the failure windows, dropped
+        while ``repeated_failures`` is off."""
+        config = self._load_alert_config()
+        keys = self._repository.alert_keys(
+            self.host, cooldown_since_ms=now_ms - config.cooldown_s * _MS_PER_S
+        )
+        rule = config.repeated_failures
+        failures = (
+            self._repository.failure_windows(
+                self.host, since_ms=now_ms - rule.window_s * _MS_PER_S, count=rule.count
+            )
+            if rule.enabled
+            else {}
+        )
+        self._alert_config = config
+        _log.info("alerts rebuilt: %d keys, %d failure windows", len(keys), len(failures))
+        return AlertState(keys=keys, failures=failures)
+
+    def _load_alert_config(self) -> AlertConfig:
+        """The environment's rules with the saved settings on top (``_effective``)."""
+        return self._effective(self._repository.alert_settings(self.host))
+
+    def _effective(self, saved: Mapping[str, AlertSettingValue]) -> AlertConfig:
+        """The environment's rules with ``saved`` on top; a saved value out of bounds or
+        of the wrong type is ignored, and logged by its name only."""
+        config, ignored = apply_saved_settings(self._env_alerts, saved)
+        if ignored:
+            _log.warning(
+                "ignored saved alert settings out of bounds or of the wrong type: %s",
+                ", ".join(ignored),
+            )
+        return config
+
+    def _reload_alert_settings(self) -> None:
+        if self._alerts is None:
+            return  # the first tick loads them
+        before = self._alert_config.repeated_failures
+        try:
+            self._alert_config = self._load_alert_config()
+        except Exception as error:
+            _log.error("alert settings not reloaded (%s)", type(error).__name__)
+            return
+        self._reload_failure_windows(before)
+
+    # Settings changes from the settings screen (ADR 0045).
+
+    def _change_alert_settings(self, change: SaveAlertSettings | ResetAlertSettings) -> None:
+        """Apply a change and settle its future; skipped if the request gave up first."""
+        with self._lock:
+            self._settings_pending -= 1
+        if not change.result.set_running_or_notify_cancel():
+            return
+        try:
+            result = self._apply_settings_change(change)
+        except Exception as error:
+            _log.error("alert settings not changed (%s)", type(error).__name__)
+            change.result.set_exception(AlertSettingsUnavailableError("the change failed"))
+            return
+        change.result.set_result(result)
+
+    def _apply_settings_change(
+        self, change: SaveAlertSettings | ResetAlertSettings
+    ) -> AlertSettingsResult:
+        """Save (when the effective configuration stays valid) or reset in one
+        transaction, then put the effective configuration in force from now on (the
+        first tick loads it again, to the same result). The saved overrides after the
+        write are built in memory, not read back: once the write commits, the change
+        is made and nothing else can fail it."""
+        saved = self._repository.alert_settings(self.host)
+        if isinstance(change, SaveAlertSettings):
+            current, _ = apply_saved_settings(self._env_alerts, saved)
+            _, errors = apply_settings(current, change.values)
+            if errors:
+                return AlertSettingsResult(saved=saved, errors=errors)
+            self._repository.save_alert_settings(
+                self.host, change.values, updated_at_ms=change.updated_at_ms
+            )
+            saved = {**saved, **change.values}
+        elif change.field is None:
+            self._repository.reset_alert_settings(self.host)
+            saved = {}
+        else:
+            self._repository.reset_alert_setting(self.host, change.field)
+            saved = {name: value for name, value in saved.items() if name != change.field}
+        before = self._alert_config.repeated_failures
+        self._alert_config = self._effective(saved)
+        self._reload_failure_windows(before)
+        return AlertSettingsResult(saved=saved)
+
+    def _reload_failure_windows(self, before: RepeatedFailuresRule) -> None:
+        """When a change turns ``repeated_failures`` on or widens it (a longer window, a
+        higher count), reload its windows from the database, as a restart does: while
+        off, or narrower, memory kept fewer failures than the new rule counts. On a
+        read error the state is dropped, so the next tick rebuilds it all. The windows
+        start at the last tick's time, the clock of the evaluators: the next tick drops
+        what it no longer counts."""
+        rule = self._alert_config.repeated_failures
+        state = self._alerts
+        widened = rule.enabled and (
+            not before.enabled or rule.window_s > before.window_s or rule.count > before.count
+        )
+        if state is None or not widened:
+            return
+        try:
+            failures = self._repository.failure_windows(
+                self.host,
+                since_ms=self._alerts_at_ms - rule.window_s * _MS_PER_S,
+                count=rule.count,
+            )
+        except Exception as error:
+            _log.error("failure windows not reloaded (%s)", type(error).__name__)
+            self._alerts = None
+            return
+        self._alerts = replace(state, failures=failures)
+
+    # The Discord sender's rounds (ADR 0046).
+
+    def _discord_round(self, control: DiscordRound) -> None:
+        """Expire and read the deliveries due, and settle the round's future; skipped if
+        the sender gave up first."""
+        if not control.result.set_running_or_notify_cancel():
+            return
+        try:
+            due = self._repository.take_due_deliveries(
+                self.host,
+                now_ms=control.now_ms,
+                expire_before_ms=control.expire_before_ms,
+                limit=control.limit,
+            )
+        except Exception as error:
+            _log.error("discord deliveries not read (%s)", type(error).__name__)
+            control.result.set_exception(DiscordUnavailableError("the read failed"))
+            return
+        # Counted here, where the rows changed: the sender may have given up on this
+        # round already (its cancel() fails once the round runs) and never read it.
+        if due.expired:
+            _log.warning("discord: %d alerts expired unsent", due.expired)
+            self._count_expired(due.expired)
+        control.result.set_result(due)
+
+    def _count_expired(self, count: int) -> None:
+        callback = self._on_discord_expired
+        if callback is None:
+            return
+        try:
+            callback(count)
+        except Exception as error:
+            _log.error("discord expiries not counted (%s)", type(error).__name__)
+
+    def _discord_results(self, updates: Sequence[DeliveryUpdate]) -> None:
+        try:
+            self._repository.record_deliveries(self.host, updates)
+        except Exception as error:
+            _log.error("discord deliveries not recorded (%s)", type(error).__name__)
+
+    def _settle_unavailable(self, change: SaveAlertSettings | ResetAlertSettings, why: str) -> None:
+        """Settle a change the writer will never apply, unless its request gave up."""
+        if change.result.set_running_or_notify_cancel():
+            change.result.set_exception(AlertSettingsUnavailableError(why))
+
+    def _notify(self, change: HubEvent) -> None:
         """Tell ``on_committed`` what a commit changed; an error is logged, not raised."""
         callback = self._on_committed
         if callback is None:

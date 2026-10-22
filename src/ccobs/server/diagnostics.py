@@ -15,10 +15,18 @@ answers for them on the port it already publishes. One read-only JSON answer:
   the writer as ``invalid``, so each doctor run adds one ``invalid`` drop;
 - ``hook_failures``: the hook failure counts of the last hour from Loki
   (``ccobs.domain.diagnostics``), or ``available: false`` with a short ``reason`` when
-  Loki gave no usable answer. The route answers 200 either way.
+  Loki gave no usable answer. The route answers 200 either way;
+- ``alerts`` (ADR 0046): the rules on (names only), the alerts still on, those fired in
+  the last 24 hours by the app's clock, and Discord's delivery: whether a webhook is
+  configured, the status that suspended sending (``DiscordSender.suspended_status``),
+  the deliveries pending, and those of the last 24 hours that failed or expired. Read
+  in the same slot of the read gate as the sessions, so on the same budget; when that
+  read fails, ``alerts`` is ``null`` and the rest of the answer stands. A CLI older than
+  v0.6.0 ignores the field; a CLI from v0.6.0 on reads an app without it as one that
+  predates alerts.
 
-Never a session ID, a path, content or a URL: the answer holds counts and closed-list
-names only.
+Never a session ID, a path, content or a URL (the webhook's least of all): the answer
+holds counts and closed-list names only.
 
 ``HookFailuresReader`` asks Loki like the usage reader asks Prometheus
 (``ccobs.server.usage``, ADR 0035): one instant ``GET /loki/api/v1/query`` on an
@@ -35,7 +43,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Annotated, Final, Literal
 
@@ -44,6 +52,7 @@ from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel, ConfigDict
 
 import ccobs
+from ccobs.domain.alerts import ALERT_RULES, AlertConfig, AlertRule
 from ccobs.domain.app_metrics import EVENT_LABELS, LokiQueryResult
 from ccobs.domain.diagnostics import (
     HOOK_FAILURES_WINDOW_S,
@@ -53,16 +62,20 @@ from ccobs.domain.diagnostics import (
     parse_hook_failures,
 )
 from ccobs.server.api import SESSION_STATUSES
-from ccobs.server.db.repository import Repository, SessionCounts
+from ccobs.server.db.repository import AlertCounts, Repository, SessionCounts
+from ccobs.server.discord import DiscordSender
 from ccobs.server.ingest import DROP_REASONS, HookQueue
 from ccobs.server.reads import ReadGate
 from ccobs.server.writer import WriterCounts
 
 __all__ = [
+    "ALERTS_WINDOW_MS",
     "HTTP_TIMEOUT_S",
     "MAX_ANSWER_BYTES",
     "QUERY_PATH",
+    "AlertsOut",
     "DiagnosticsOut",
+    "DiscordOut",
     "HookFailuresReader",
     "HookFailuresUnavailable",
     "UnavailableReason",
@@ -77,6 +90,9 @@ HTTP_TIMEOUT_S: Final = 2.0
 # The answer has three series: a few hundred bytes.
 MAX_ANSWER_BYTES: Final = 64 * 1024
 QUERY_PATH: Final = "/loki/api/v1/query"
+# How far back the alerts part counts the alerts fired and the deliveries that failed or
+# expired (ADR 0046): the last 24 hours, by the app's clock.
+ALERTS_WINDOW_MS: Final = 24 * 3600 * 1000
 
 
 @dataclass(frozen=True, slots=True)
@@ -226,6 +242,28 @@ class HookFailuresUnavailableOut(_Out):
     window_s: int
 
 
+class DiscordOut(_Out):
+    """Discord delivery (ADR 0046): whether a webhook is configured (never its URL), the
+    status that suspended sending, the deliveries pending, and those of the last 24
+    hours that failed or expired."""
+
+    configured: bool
+    suspended_status: int | None
+    pending: int
+    failed_24h: int
+    expired_24h: int
+
+
+class AlertsOut(_Out):
+    """The rules on (names only), the alerts still on, those fired in the last 24
+    hours, and Discord's delivery."""
+
+    rules: list[AlertRule]
+    open: int
+    fired_24h: int
+    discord: DiscordOut
+
+
 class DiagnosticsOut(_Out):
     version: str
     host: str
@@ -233,6 +271,8 @@ class DiagnosticsOut(_Out):
     sessions: SessionsOut
     hooks: HooksOut
     hook_failures: HookFailuresOut | HookFailuresUnavailableOut
+    # None when the alerts could not be read; the rest of the answer stands.
+    alerts: AlertsOut | None
 
 
 # Async, like the API's dependencies: FastAPI runs a sync dependency on its threadpool.
@@ -283,20 +323,69 @@ def _failures(
     )
 
 
+def _counts(
+    repository: Repository, host: str, since_ms: int
+) -> tuple[SessionCounts, AlertCounts | None]:
+    """Both reads in one slot of the read gate, on one budget. The alert counts are an
+    extra: when they fail, the route still answers, with ``alerts: null``."""
+    sessions = repository.session_counts()
+    try:
+        alerts = repository.alert_counts(host, since_ms=since_ms)
+    except Exception as error:
+        # The type only: a database error's text can quote the statement.
+        _log.warning("alerts diagnostics read failed (%s)", type(error).__name__)
+        alerts = None
+    return sessions, alerts
+
+
+def _rules_on(config: AlertConfig) -> list[AlertRule]:
+    enabled: Mapping[AlertRule, bool] = {
+        "waiting_user": config.waiting_user.enabled,
+        "repeated_failures": config.repeated_failures.enabled,
+        "session_cost": config.session_cost.enabled,
+        "daily_cost": config.daily_cost.enabled,
+    }
+    return [rule for rule in ALERT_RULES if enabled[rule]]
+
+
+def _alerts(
+    counts: AlertCounts | None, config: AlertConfig, sender: DiscordSender | None
+) -> AlertsOut | None:
+    if counts is None:
+        return None
+    return AlertsOut(
+        rules=_rules_on(config),
+        open=counts.open,
+        fired_24h=counts.fired,
+        discord=DiscordOut(
+            configured=sender is not None,
+            suspended_status=sender.suspended_status if sender is not None else None,
+            pending=counts.pending,
+            failed_24h=counts.failed,
+            expired_24h=counts.expired,
+        ),
+    )
+
+
 @router.get("/diagnostics")
 async def get_diagnostics(request: Request, repository: _Repo, reads: _Reads) -> DiagnosticsOut:
-    """Session counts, hook counters and the last hour's hook failures from Loki."""
+    """Session counts, hook counters, the last hour's hook failures from Loki, and the
+    alerts with their Discord delivery."""
     state = request.app.state
+    host: str = state.host_label
+    now_ms: int = state.clock()
     # First: a busy database answers 503 before any query goes to Loki.
-    counts = await reads.run(repository.session_counts)
+    counts, alert_counts = await reads.run(_counts, repository, host, now_ms - ALERTS_WINDOW_MS)
     hooks = _hooks(state.writer.counts(), state.queue)
+    alerts = _alerts(alert_counts, state.writer.alert_config(), state.discord)
     reader: HookFailuresReader = state.hook_failures
     failures = await reader.read()
     return DiagnosticsOut(
         version=ccobs.__version__,
-        host=state.host_label,
+        host=host,
         started_at_ms=state.started_at_ms,
         sessions=_sessions(counts),
         hooks=hooks,
         hook_failures=_failures(failures, reader.window_s),
+        alerts=alerts,
     )

@@ -9,14 +9,31 @@ stops the app at start-up with a ``SettingsError`` that names every bad variable
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
+from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
 from typing import Final, Literal, Self
 from urllib.parse import urlsplit
 
-from pydantic import Field, ValidationError, ValidationInfo, field_validator, model_validator
+from pydantic import (
+    Field,
+    SecretStr,
+    ValidationError,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from ccobs.domain.alerts import (
+    AlertConfig,
+    DailyCostRule,
+    RepeatedFailuresRule,
+    SessionCostRule,
+    WaitingUserRule,
+    validate_config,
+)
 from ccobs.domain.durations import parse_duration
 from ccobs.domain.telemetry import DEFAULT_HOST, HOST_VALUE_PATTERN
 
@@ -51,6 +68,52 @@ _MIN_STALE_AFTER: Final = timedelta(hours=1)
 _GRAFANA_HOST: Final = "localhost"
 _GRAFANA_URL_CHARACTERS: Final = re.compile(r"[A-Za-z0-9._~:/%-]+")
 _MAX_PORT: Final = 65535
+# The alert rules' defaults (ADR 0041), declared once in the domain.
+_ALERTS: Final = AlertConfig()
+# Each numeric alert setting, and the default AlertConfig with only that setting's value
+# changed: what validate_config checks it in, so the bounds stay the domain's alone.
+_WHOLE_ALERTS: Final[dict[str, Callable[[int], AlertConfig]]] = {
+    "alert_waiting_threshold_s": lambda value: replace(
+        _ALERTS, waiting_user=replace(_ALERTS.waiting_user, threshold_s=value)
+    ),
+    "alert_failures_count": lambda value: replace(
+        _ALERTS, repeated_failures=replace(_ALERTS.repeated_failures, count=value)
+    ),
+    "alert_failures_window_s": lambda value: replace(
+        _ALERTS, repeated_failures=replace(_ALERTS.repeated_failures, window_s=value)
+    ),
+    "alert_cooldown_s": lambda value: replace(_ALERTS, cooldown_s=value),
+}
+_USD_ALERTS: Final[dict[str, Callable[[float], AlertConfig]]] = {
+    "alert_session_cost_usd": lambda value: replace(
+        _ALERTS, session_cost=replace(_ALERTS.session_cost, limit_usd=value)
+    ),
+    "alert_daily_cost_usd": lambda value: replace(
+        _ALERTS, daily_cost=replace(_ALERTS.daily_cost, limit_usd=value)
+    ),
+}
+# The app as the browser opens it, for the links in Discord messages (ADR 0046): http on
+# one of the host names the Host guard allows (ADR 0034), with an optional port (1 to
+# 65535, no leading zero) and nothing else, matched whole in ASCII.
+_APP_URL: Final = re.compile(
+    r"http://(?:localhost|127\.0\.0\.1|\[::1\])"
+    r"(?::(?:[1-9][0-9]{0,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}"
+    r"|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5]))?/?",
+    re.ASCII,
+)
+# A Discord webhook URL, as Discord shows it to a channel's admin: https, one of
+# Discord's API hosts (discord.com, the API's documented host; discordapp.com, its
+# former domain; canary. and ptb., the hosts of Discord's test clients, whose "Copy
+# Webhook URL" uses them), the webhook route /api/webhooks/<id>/<token> with an
+# optional API version (/api/v10/...), a numeric snowflake ID and a URL-safe token.
+# Nothing else: no user, port, query, fragment or trailing slash. Whole-string match
+# (fullmatch) in ASCII, so that urlsplit's quirks (dropped tabs, "@" in the host) never
+# apply, and \d never takes a non-ASCII digit.
+_DISCORD_WEBHOOK: Final = re.compile(
+    r"https://(?:discord\.com|discordapp\.com|canary\.discord\.com|ptb\.discord\.com)"
+    r"/api(?:/v[0-9]{1,3})?/webhooks/[0-9]{1,32}/[A-Za-z0-9_-]{1,256}",
+    re.ASCII,
+)
 
 
 class SettingsError(ValueError):
@@ -62,7 +125,11 @@ class Settings(BaseSettings):
 
     # env_file=None: no .env, see the module's docstring. Frozen: settings are read once.
     # No validate_by_name: with it, pydantic-settings would also read CCOBS_RETENTION.
-    model_config = SettingsConfigDict(env_prefix=ENV_PREFIX, env_file=None, frozen=True)
+    # hide_input_in_errors: pydantic's own errors never echo a value, so a bad webhook
+    # URL stays out of any error, even one raised outside load_settings().
+    model_config = SettingsConfigDict(
+        env_prefix=ENV_PREFIX, env_file=None, frozen=True, hide_input_in_errors=True
+    )
 
     # The host label on the app's /metrics series and database rows (ADR 0022): the
     # variable the collector reads, with the same default and the same allowed values.
@@ -107,6 +174,11 @@ class Settings(BaseSettings):
     # fragment. Trailing slashes are stripped. compose derives it from
     # CCOBS_GRAFANA_PORT, as Grafana's own root URL.
     grafana_url: str = "http://localhost:4330"
+    # The app as the browser opens it, for the session links of Discord messages (ADR
+    # 0046): http on localhost, 127.0.0.1 or [::1] with an optional port, and nothing
+    # else; a trailing slash is stripped. compose derives it from CCOBS_APP_PORT, the
+    # port it publishes the app on, which the app cannot see from inside the container.
+    app_url: str = "http://localhost:4300"
     # Whether the app reads Claude Code's events back from Loki to complete hook data.
     telemetry_reconcile: bool = True
     log_level: Literal["debug", "info", "warning", "error"] = "info"
@@ -122,6 +194,26 @@ class Settings(BaseSettings):
     # long command output), which can reach megabytes; 8 MiB keeps every realistic one
     # while refusing pathological ones before they are parsed.
     hook_body_max_bytes: int = 8 * _MIB
+    # The alert rules (ADR 0041): ccobs.domain.alerts.AlertConfig, flattened into one
+    # variable each, with the domain's defaults and bounds (validate_config). The
+    # settings screen may override them later; these are the values it falls back to.
+    alert_waiting_enabled: bool = _ALERTS.waiting_user.enabled
+    alert_waiting_threshold_s: int = _ALERTS.waiting_user.threshold_s
+    alert_failures_enabled: bool = _ALERTS.repeated_failures.enabled
+    alert_failures_count: int = _ALERTS.repeated_failures.count
+    alert_failures_window_s: int = _ALERTS.repeated_failures.window_s
+    alert_session_cost_enabled: bool = _ALERTS.session_cost.enabled
+    alert_session_cost_usd: float = _ALERTS.session_cost.limit_usd
+    alert_daily_cost_enabled: bool = _ALERTS.daily_cost.enabled
+    alert_daily_cost_usd: float = _ALERTS.daily_cost.limit_usd
+    alert_cooldown_s: int = _ALERTS.cooldown_s
+    # Where alerts go on Discord (ADR 0007): a secret, since anyone holding it can post
+    # to the channel. A SecretStr, so repr, str and dumps show asterisks; only the sender
+    # reads it, with get_secret_value(). None (or an empty variable): no Discord alerts.
+    discord_webhook_url: SecretStr | None = None
+    # Whether a Discord alert names the session's project (maintainer's decision P6):
+    # off by default, since the message leaves the machine.
+    discord_include_project: bool = False
 
     @field_validator("host_label")
     @classmethod
@@ -201,6 +293,56 @@ class Settings(BaseSettings):
             raise ValueError(error)
         return value.rstrip("/")
 
+    @field_validator("app_url")
+    @classmethod
+    def _check_app_url(cls, value: str) -> str:
+        if not _APP_URL.fullmatch(value):
+            raise ValueError(
+                "must be the app's URL as the browser opens it: http on localhost,"
+                " 127.0.0.1 or [::1], with an optional port and no user, path, query or"
+                " fragment"
+            )
+        return value.rstrip("/")
+
+    @field_validator(*_WHOLE_ALERTS, *_USD_ALERTS, mode="before")
+    @classmethod
+    def _refuse_bool(cls, value: object, info: ValidationInfo) -> object:
+        # pydantic would take True as 1; the domain never takes a bool as a number, so
+        # validate_config refuses it with the field's range.
+        if isinstance(value, bool):
+            name = _field_name(info)
+            build = _WHOLE_ALERTS.get(name) or _USD_ALERTS[name]
+            _check_alerts(build(value))
+        return value
+
+    @field_validator(*_WHOLE_ALERTS)
+    @classmethod
+    def _check_whole_alert(cls, value: int, info: ValidationInfo) -> int:
+        _check_alerts(_WHOLE_ALERTS[_field_name(info)](value))
+        return value
+
+    @field_validator(*_USD_ALERTS)
+    @classmethod
+    def _check_usd_alert(cls, value: float, info: ValidationInfo) -> float:
+        _check_alerts(_USD_ALERTS[_field_name(info)](value))
+        return value
+
+    @field_validator("discord_webhook_url", mode="before")
+    @classmethod
+    def _check_discord_webhook_url(cls, value: object) -> object:
+        # The value is never echoed, not even in part: it is a secret.
+        if isinstance(value, SecretStr):
+            value = value.get_secret_value()
+        if value is None or value == "":
+            return None
+        if not isinstance(value, str) or not _DISCORD_WEBHOOK.fullmatch(value):
+            raise ValueError(
+                "must be a Discord webhook URL: https on discord.com, discordapp.com,"
+                " canary.discord.com or ptb.discord.com, path /api/webhooks/<id>/<token>,"
+                " with no user, port, query or fragment"
+            )
+        return value
+
     @field_validator(*_BOUNDS)
     @classmethod
     def _check_bounds(cls, value: int, info: ValidationInfo) -> int:
@@ -235,6 +377,45 @@ class Settings(BaseSettings):
     def database_path(self) -> Path:
         """The SQLite database file."""
         return self.data_dir / DATABASE_FILE
+
+    @property
+    def alert_config(self) -> AlertConfig:
+        """The alert rules these settings give (valid: checked at start-up)."""
+        return AlertConfig(
+            waiting_user=WaitingUserRule(
+                enabled=self.alert_waiting_enabled, threshold_s=self.alert_waiting_threshold_s
+            ),
+            repeated_failures=RepeatedFailuresRule(
+                enabled=self.alert_failures_enabled,
+                count=self.alert_failures_count,
+                window_s=self.alert_failures_window_s,
+            ),
+            session_cost=SessionCostRule(
+                enabled=self.alert_session_cost_enabled, limit_usd=self.alert_session_cost_usd
+            ),
+            daily_cost=DailyCostRule(
+                enabled=self.alert_daily_cost_enabled, limit_usd=self.alert_daily_cost_usd
+            ),
+            cooldown_s=self.alert_cooldown_s,
+        )
+
+    @property
+    def discord_configured(self) -> bool:
+        """Whether a Discord webhook URL is set; never the URL itself."""
+        return self.discord_webhook_url is not None
+
+
+def _field_name(info: ValidationInfo) -> str:
+    assert info.field_name is not None  # noqa: S101 - always set for field validators
+    return info.field_name
+
+
+def _check_alerts(config: AlertConfig) -> None:
+    """Raise ``validate_config``'s error for ``config``, which differs from the defaults
+    in one setting only, so that each bad variable gets its own line. The message gives
+    the range, never the value; the variable replaces the domain's field name."""
+    for error in validate_config(config):
+        raise ValueError(error.message.removeprefix(f"{error.field} "))
 
 
 # The environment variable of each field: its alias when it has one, else the prefixed

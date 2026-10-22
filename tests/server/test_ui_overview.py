@@ -513,15 +513,7 @@ def test_an_empty_or_failed_board_keeps_listening(client: TestClient) -> None:
 def test_the_overview_opens_the_live_stream(client: TestClient) -> None:
     body = page(client, "/")
 
-    expected = '<div id="live-status" class="live-status" role="status" data-stream="/ui/stream">'
-    assert expected + "</div>" in body
-
-
-def test_all_sessions_opens_no_live_stream(client: TestClient) -> None:
-    body = page(client, "/sessions")
-
-    assert '<div id="live-status" class="live-status" role="status"></div>' in body
-    assert "data-stream" not in body
+    assert UNFILTERED_STREAM in body
 
 
 def test_collapsed_bays_name_themselves_for_app_js(client: TestClient) -> None:
@@ -830,6 +822,46 @@ BUSY: Final = HTTPException(status_code=503, detail="database busy")
 BROKEN: Final = OperationalError("SELECT secret", {}, Exception("disk I/O error"))
 
 
+# Every page streams (ADR 0044), so alert pings can reach any of them; a page with no
+# live parts just has nothing to refetch on "changed".
+UNFILTERED_STREAM: Final = (
+    '<div id="live-status" class="live-status" role="status" data-stream="/ui/stream"></div>'
+)
+INLINE_CODE: Final = re.compile(
+    r"<script\b(?![^>]*\bsrc\s*=)[^>]*>|<style\b|\sstyle\s*=|\son[a-z]+\s*=|\shx-on",
+    re.IGNORECASE,
+)
+
+
+@pytest.mark.parametrize(
+    ("url", "status", "failure"),
+    [
+        ("/", 200, None),
+        ("/sessions", 200, None),
+        ("/sessions?before=1800000000000-x", 200, None),
+        ("/sessions/00000000-0000-4000-8000-0000000000ff", 404, None),
+        ("/", 503, BROKEN),
+        ("/sessions", 503, BUSY),
+    ],
+)
+def test_every_page_opens_the_live_stream_without_inline_code(
+    client: TestClient, url: str, status: int, failure: Exception | None
+) -> None:
+    seed(client, *board_sessions())
+    if failure is not None:
+        app_of(client).state.reads = FailingGate(failure)
+
+    body = page(client, url, status=status)
+
+    assert UNFILTERED_STREAM in body
+    assert body.count("data-stream=") == 1
+    # The stream is opened by live.js, a file of the app's own (no inline code: CSP).
+    assert '<script src="/static/js/live.js" defer></script>' in body
+    # Every page can show a notification for a new alert (ADR 0044).
+    assert '<script src="/static/js/notify.js" defer></script>' in body
+    assert not INLINE_CODE.search(body)
+
+
 @pytest.mark.parametrize(
     ("error", "message"),
     [(BUSY, "The database is busy"), (BROKEN, "The app could not read its database")],
@@ -952,13 +984,15 @@ def test_the_scripts_load_in_order_without_inline_code(client: TestClient) -> No
     head = body.split("</head>", 1)[0]
 
     scripts = re.findall(r"<script\b([^>]*)>(.*?)</script>", body, re.DOTALL)
-    assert [content for _, content in scripts] == ["", "", "", ""]
+    assert [content for _, content in scripts] == ["", "", "", "", ""]
     sources = [re.search(r'src="([^"]+)"', attributes) for attributes, _ in scripts]
     assert [found.group(1) if found else None for found in sources] == [
         "/static/js/theme.js",
         "/static/vendor/htmx-2.0.11.min.js",
         "/static/js/app.js",
         "/static/js/live.js",
+        # After live.js: it listens for the alerts pings live.js dispatches (ADR 0044).
+        "/static/js/notify.js",
     ]
     # theme.js runs before the first paint; the others after parsing.
     assert "defer" not in scripts[0][0]
@@ -997,7 +1031,12 @@ def test_the_ui_routes_are_behind_the_host_guard_and_fetch_metadata(client: Test
 
 
 def test_static_files_revalidate_with_their_etag(client: TestClient) -> None:
-    for url in ("/static/css/app.css", "/static/js/app.js", "/static/js/theme.js"):
+    for url in (
+        "/static/css/app.css",
+        "/static/js/app.js",
+        "/static/js/theme.js",
+        "/static/js/notify.js",
+    ):
         response = client.get(url)
         assert response.status_code == 200
         assert response.headers["cache-control"] == "no-cache"
@@ -1023,6 +1062,7 @@ def test_versioned_vendor_files_are_cached_for_good(client: TestClient) -> None:
     [
         ("/static/js/app.js", "text/javascript; charset=utf-8"),
         ("/static/js/theme.js", "text/javascript; charset=utf-8"),
+        ("/static/js/notify.js", "text/javascript; charset=utf-8"),
         ("/static/css/app.css", "text/css; charset=utf-8"),
         ("/static/fonts/atkinson-hyperlegible-next-wght.woff2", "font/woff2"),
         ("/static/img/favicon.svg", "image/svg+xml"),

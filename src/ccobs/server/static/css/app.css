@@ -1126,6 +1126,189 @@ details[open] > .bay__summary .bay__title::before {
   margin-bottom: 0;
 }
 
+/* The alerts page: the history is strips; an alert still on has the amber band, a
+   cleared one the ended band and muted words. The settings are one paper group per
+   rule, the legend inside it, each value with its unit and where it comes from. */
+
+.alerts-section {
+  margin-top: var(--space-6);
+}
+
+.alerts-section__title {
+  margin-bottom: var(--space-3);
+  font-size: var(--text-lg);
+}
+
+.alert--on {
+  border-left-color: var(--waiting);
+  background: color-mix(in srgb, var(--waiting) 9%, var(--strip));
+}
+
+.alert--on:hover {
+  background: color-mix(in srgb, var(--waiting) 15%, var(--strip));
+}
+
+.alert--on .strip__state {
+  color: var(--waiting-text);
+}
+
+.alert--cleared {
+  border-left-color: var(--ended);
+}
+
+.alert--cleared .alert__what,
+.alert-history__empty,
+.alerts-discord {
+  color: var(--ink-muted);
+}
+
+/* The Discord test button (ADR 0046), under the Discord line, styled like the settings'
+   buttons; its status line follows it. */
+.discord-test {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-2) var(--space-3);
+  margin: 0 0 var(--space-4);
+}
+
+.discord-test__send {
+  padding: var(--space-1) var(--space-4);
+  border: 1px solid var(--ink-muted);
+  border-radius: var(--radius-strip);
+  background: var(--strip);
+  cursor: pointer;
+}
+
+.discord-test__send:hover {
+  background: color-mix(in srgb, var(--ink) 6%, var(--strip));
+}
+
+.discord-test__status {
+  margin: 0;
+  font-weight: var(--weight-semibold);
+}
+
+/* The browser notifications control, which notify.js fills in: a sentence, or the
+   button that asks for the permission, styled like the settings' buttons. */
+.alert-notifications {
+  margin: 0 0 var(--space-4);
+}
+
+.alert-notifications:empty {
+  display: none;
+}
+
+.alert-notifications__text {
+  margin: 0;
+  color: var(--ink-muted);
+}
+
+.alert-settings {
+  display: grid;
+  gap: var(--space-2);
+  max-width: 52rem;
+}
+
+.alert-settings__message {
+  margin: 0;
+  font-weight: var(--weight-semibold);
+}
+
+.alert-settings__group {
+  margin: 0;
+  padding: var(--space-3) var(--space-4);
+  border: 0;
+  border-radius: var(--radius-strip);
+  background: var(--strip);
+}
+
+/* Floated, the legend sits inside the group instead of on its edge. */
+.alert-settings__legend {
+  float: left;
+  width: 100%;
+  margin-bottom: var(--space-1);
+  padding: 0;
+  font-weight: var(--weight-semibold);
+}
+
+.alert-settings__field {
+  clear: both;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-1) var(--space-3);
+  padding-block: var(--space-1);
+}
+
+.alert-settings__input {
+  width: 7rem;
+  padding: var(--space-1) var(--space-2);
+  border: 1px solid var(--ink-muted);
+  border-radius: var(--radius-strip);
+  background: transparent;
+  font-family: var(--font-sans);
+  font-variant-numeric: tabular-nums;
+}
+
+.alert-settings__input[aria-invalid="true"] {
+  border-color: var(--error);
+}
+
+.alert-settings__unit,
+.alert-settings__source,
+.alert-settings__note {
+  color: var(--ink-muted);
+}
+
+.alert-settings__source,
+.alert-settings__note,
+.alert-settings__error,
+.alert-settings__reset {
+  font-size: var(--text-sm);
+}
+
+.alert-settings__error {
+  flex-basis: 100%;
+  color: var(--error);
+  font-family: var(--font-sans);
+}
+
+.alert-settings__note {
+  clear: both;
+  margin: var(--space-1) 0 0;
+}
+
+.alert-settings__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-3);
+  margin-top: var(--space-2);
+}
+
+.alert-settings button,
+.alert-notifications__ask {
+  padding: var(--space-1) var(--space-4);
+  border: 1px solid var(--ink-muted);
+  border-radius: var(--radius-strip);
+  background: var(--strip);
+  cursor: pointer;
+}
+
+.alert-settings button:hover,
+.alert-notifications__ask:hover {
+  background: color-mix(in srgb, var(--ink) 6%, var(--strip));
+}
+
+.alert-settings .alert-settings__save {
+  border-color: var(--ink);
+  font-weight: var(--weight-semibold);
+}
+
+.alert-settings .alert-settings__reset {
+  padding: 0 var(--space-3);
+}
+
 /* Desktop: blocks and agents beside the timeline. */
 
 @media (min-width: 64rem) {

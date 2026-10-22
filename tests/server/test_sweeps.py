@@ -22,13 +22,20 @@ from typing import Any, Final
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from pydantic import SecretStr
 
 from ccobs.domain.hook_config import HOOK_PATH
 from ccobs.server.app import create_app
 from ccobs.server.config import Settings
 from ccobs.server.db.repository import Repository
 from ccobs.server.ingest import HookQueue
-from ccobs.server.sweeps import RETENTION_INTERVAL_S, TICK_INTERVAL_S, Sweeper
+from ccobs.server.sweeps import (
+    ALERT_TICK_INTERVAL_S,
+    RETENTION_INTERVAL_S,
+    TICK_INTERVAL_S,
+    AlertTicker,
+    Sweeper,
+)
 from ccobs.server.writer import Writer, WriterObservers
 
 HOST: Final = "test-host"
@@ -44,6 +51,7 @@ FIXTURE: Final = Path(__file__).parents[1] / "fixtures" / "hooks" / "headless-to
 PREFIX: Final = 19
 SILENT: Final = "00000000-0000-4000-8000-0000000000a1"
 RECENT: Final = "00000000-0000-4000-8000-0000000000a2"
+PRIVATE: Final = "C:\\Users\\someone"
 # How long the end-to-end tests wait for the sweeper thread before they give up.
 PATIENCE_S: Final = 10.0
 # The most writer rounds one persist runs: far more than the controls a 20 ms sweeper
@@ -72,6 +80,11 @@ class Recorder:
         self.calls.append(("retention", cutoff_ms))
         if "retention" in self.fail:
             raise self.fail["retention"]
+
+    def submit_alert_tick(self, now_ms: int) -> None:
+        self.calls.append(("alert tick", now_ms))
+        if "alert tick" in self.fail:
+            raise self.fail["alert tick"]
 
 
 class FakeTime:
@@ -321,6 +334,66 @@ def test_a_thread_that_does_not_stop_in_time_is_logged(
     release.set()
 
 
+# The alert ticker: the alert rules every 5 s (ADR 0041).
+
+
+def test_the_alert_ticker_ticks_every_5_s_with_the_current_time() -> None:
+    assert ALERT_TICK_INTERVAL_S == 5.0
+    writer, fake = Recorder(), FakeTime(rounds=4)
+    ticker = AlertTicker(writer, clock=fake.clock, wait=fake.wait)
+    assert ticker.interval_s == ALERT_TICK_INTERVAL_S
+
+    ticker.run()
+
+    assert fake.waits == [5.0] * 4
+    assert writer.calls == [("alert tick", BASE + n * 5 * SECOND_MS) for n in range(1, 5)]
+
+
+@pytest.mark.parametrize("value", [0.0, -1.0])
+def test_the_alert_interval_must_be_positive(value: float) -> None:
+    with pytest.raises(ValueError, match="interval_s"):
+        AlertTicker(Recorder(), interval_s=value)
+
+
+def test_a_failing_alert_tick_or_clock_is_logged_by_its_type_and_the_loop_goes_on(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    writer, fake = Recorder(), FakeTime(rounds=3)
+    writer.fail["alert tick"] = RuntimeError(f"secret detail {PRIVATE}")
+    failures = iter([True])
+
+    def clock() -> int:
+        if next(failures, False):
+            raise OSError(f"clock {PRIVATE}")
+        return fake.clock()
+
+    caplog.set_level(logging.DEBUG, logger="ccobs.server.sweeps")
+    AlertTicker(writer, interval_s=1.0, clock=clock, wait=fake.wait).run()
+
+    assert [name for name, _ in writer.calls] == ["alert tick"] * 2
+    errors = [record.getMessage() for record in caplog.records if record.levelno >= logging.ERROR]
+    assert len(errors) == 3
+    assert "OSError" in errors[0]
+    assert all("RuntimeError" in message for message in errors[1:])
+    assert not any("someone" in message for message in errors)
+
+
+def test_the_alert_ticker_runs_on_its_own_thread_and_stops_at_once() -> None:
+    writer = Recorder()
+    ticker = AlertTicker(writer, interval_s=0.001)
+    ticker.start()
+    with pytest.raises(RuntimeError, match="already started"):
+        ticker.start()
+    deadline = time.monotonic() + PATIENCE_S
+    while len(writer.calls) < 2 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    ticker.stop(timeout_s=5.0)
+
+    assert {name for name, _ in writer.calls} == {"alert tick"}
+    assert not ticker.is_alive()
+    AlertTicker(Recorder()).stop(timeout_s=1.0)  # never started: nothing to join
+
+
 # End to end: the real app, a writer the test drives, the sweeper on small intervals.
 
 
@@ -377,6 +450,7 @@ def client(settings: Settings, clock: Clock) -> Iterator[TestClient]:
         writer_factory=manual,
         serve_metrics=False,
         sweep_intervals=(0.02, 0.02),
+        alert_interval_s=0.02,
         reconcile=False,
     )
     with TestClient(app, base_url=f"http://{GOOD_HOST}") as test_client:
@@ -488,10 +562,30 @@ def test_a_silent_session_goes_stale_and_is_deleted_after_retention(
     assert writer_of(client).state(RECENT) is not None
 
 
+def test_a_waiting_session_fires_an_alert_from_the_ticker(client: TestClient, clock: Clock) -> None:
+    post(client, clock, BASE, session_lines(SILENT))
+    persist(client)
+    state = writer_of(client).state(SILENT)
+    assert state is not None
+    assert state.session.status == "waiting_user"
+    app = client.app
+    assert isinstance(app, FastAPI)
+    repository = app.state.repository
+    assert isinstance(repository, Repository)
+
+    clock.now = BASE + 10 * 60 * SECOND_MS
+    eventually(client, lambda: bool(repository.list_alerts(HOST, 10)))
+
+    (alert,) = repository.list_alerts(HOST, 10)
+    assert (alert.rule, alert.subject, alert.discord_state) == ("waiting_user", SILENT, "none")
+    assert writer_of(client).counts().alerts_fired == {"waiting_user": 1}
+
+
 def test_create_app_can_leave_the_sweeper_off(settings: Settings) -> None:
     app = create_app(settings, serve_metrics=False, sweeps=False, reconcile=False)
     with TestClient(app, base_url=f"http://{GOOD_HOST}"):
         assert app.state.sweeper is None
+        assert app.state.alert_ticker is None
 
 
 def test_the_default_sweeper_follows_the_settings(settings: Settings) -> None:
@@ -504,8 +598,30 @@ def test_the_default_sweeper_follows_the_settings(settings: Settings) -> None:
         assert sweeper.retention_ms == 7 * DAY_MS
         assert sweeper.tick_interval_s == TICK_INTERVAL_S
         assert sweeper.retention_interval_s == RETENTION_INTERVAL_S
+        ticker = app.state.alert_ticker
+        assert isinstance(ticker, AlertTicker)
+        assert ticker.is_alive()
+        assert ticker.interval_s == ALERT_TICK_INTERVAL_S
     assert not sweeper.is_alive()
     assert app.state.sweeper is None
+    assert not ticker.is_alive()
+    assert app.state.alert_ticker is None
+
+
+def test_the_default_writer_takes_the_alert_settings(settings: Settings) -> None:
+    configured = settings.model_copy(
+        update={
+            "alert_waiting_threshold_s": 90,
+            "discord_webhook_url": SecretStr("https://discord.com/api/webhooks/123/abcDEF_-123"),
+        }
+    )
+    app = create_app(configured, serve_metrics=False, sweeps=False, reconcile=False)
+    with TestClient(app, base_url=f"http://{GOOD_HOST}"):
+        writer = app.state.writer
+        assert isinstance(writer, Writer)
+        assert writer.alert_config() == configured.alert_config
+        assert writer.alert_config().waiting_user.threshold_s == 90
+        assert writer.discord_configured
 
 
 def test_the_lifespan_stops_the_sweeper_before_the_writer(
@@ -514,6 +630,8 @@ def test_the_lifespan_stops_the_sweeper_before_the_writer(
     order: list[str] = []
     original_start = Sweeper.start
     original_sweeper_stop = Sweeper.stop
+    original_ticker_start = AlertTicker.start
+    original_ticker_stop = AlertTicker.stop
     original_writer_start = Writer.start
     original_writer_stop = Writer.stop
 
@@ -525,6 +643,14 @@ def test_the_lifespan_stops_the_sweeper_before_the_writer(
         order.append("sweeper stop")
         original_sweeper_stop(self, timeout_s)
 
+    def ticker_start(self: AlertTicker) -> None:
+        order.append("ticker start")
+        original_ticker_start(self)
+
+    def ticker_stop(self: AlertTicker, timeout_s: float) -> None:
+        order.append("ticker stop")
+        original_ticker_stop(self, timeout_s)
+
     def writer_start(self: Writer) -> None:
         order.append("writer start")
         original_writer_start(self)
@@ -535,10 +661,19 @@ def test_the_lifespan_stops_the_sweeper_before_the_writer(
 
     monkeypatch.setattr(Sweeper, "start", sweeper_start)
     monkeypatch.setattr(Sweeper, "stop", sweeper_stop)
+    monkeypatch.setattr(AlertTicker, "start", ticker_start)
+    monkeypatch.setattr(AlertTicker, "stop", ticker_stop)
     monkeypatch.setattr(Writer, "start", writer_start)
     monkeypatch.setattr(Writer, "stop", writer_stop)
     app = create_app(settings, serve_metrics=False, reconcile=False)
     with TestClient(app, base_url=f"http://{GOOD_HOST}"):
-        assert order == ["writer start", "sweeper start"]
+        assert order == ["writer start", "sweeper start", "ticker start"]
 
-    assert order == ["writer start", "sweeper start", "sweeper stop", "writer stop"]
+    assert order == [
+        "writer start",
+        "sweeper start",
+        "ticker start",
+        "ticker stop",
+        "sweeper stop",
+        "writer stop",
+    ]

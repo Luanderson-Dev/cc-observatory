@@ -16,6 +16,8 @@ from __future__ import annotations
 import http.client
 import json
 import math
+import re
+import socket
 import time
 import uuid
 from collections.abc import Callable, Iterable, Mapping
@@ -36,6 +38,7 @@ from ccobs.domain.sessions import (
     SessionState,
     apply,
 )
+from ccobs.server.live import RETRY_MS
 from tools.stack.replay import HookLine
 
 APP: Final = "app"
@@ -44,6 +47,10 @@ APP_METRICS_PORT: Final = "CCOBS_APP_METRICS_PORT"
 API: Final = "/api/v1/sessions"
 HTTP_TIMEOUT: Final = 10.0
 POLL_INTERVAL: Final = 0.2
+LOOPBACK: Final = "127.0.0.1"
+# Seconds for a live stream's first line.
+STREAM_START_DEADLINE: Final = 10.0
+RETRY: Final = re.compile(rb"retry: (\d+)\n\n")
 # The API's largest page (ccobs.server.api.MAX_LIMIT).
 PAGE: Final = 500
 # Statuses the session gauge counts: every one but ended (ADR 0028).
@@ -362,3 +369,133 @@ def gauges_in(found: Samples, names: Iterable[str]) -> Samples:
         for key, value in found.items()
         if key[0] in wanted and (value != 0 or key[0] == "ccobs_agents_running")
     }
+
+
+# Live updates (ADR 0032).
+
+# A server-sent events stream on a raw socket: http.client and httpx read a stream only
+# by blocking until its next bytes, and the tests must post hooks, watch the deadline and
+# close it while it is open.
+
+
+class EventStream:
+    """``GET path`` held open on a socket of its own; the body decoded from HTTP/1.1
+    chunks when the answer is chunked."""
+
+    def __init__(self, base: str, path: str, headers: Mapping[str, str] | None = None) -> None:
+        parts = urlsplit(base)
+        host, port = parts.hostname or LOOPBACK, parts.port or 80
+        self._socket = socket.create_connection((host, port), timeout=HTTP_TIMEOUT)
+        self._socket.settimeout(POLL_INTERVAL)
+        lines = [
+            f"GET {path} HTTP/1.1",
+            f"Host: {host}:{port}",
+            "Accept: text/event-stream",
+            *(f"{name}: {value}" for name, value in (headers or {}).items()),
+        ]
+        self._socket.sendall(("\r\n".join(lines) + "\r\n\r\n").encode("ascii"))
+        self._raw = b""
+        self.body = b""
+        self._seen = 0
+        self.closed = False
+        self.finished = False
+        self.status, self.headers = self._head(time.monotonic() + STREAM_START_DEADLINE)
+        self._chunked = self.headers.get("transfer-encoding", "").lower() == "chunked"
+        self._decode()
+
+    def _receive(self, deadline: float) -> None:
+        """Read what arrives before ``deadline`` or the next poll interval."""
+        if self.closed:
+            return
+        self._socket.settimeout(max(0.01, min(POLL_INTERVAL, deadline - time.monotonic())))
+        try:
+            chunk = self._socket.recv(65536)
+        except TimeoutError:
+            return
+        except OSError:
+            self.closed = True
+            return
+        if not chunk:
+            self.closed = True
+        self._raw += chunk
+
+    def _head(self, deadline: float) -> tuple[int, dict[str, str]]:
+        while b"\r\n\r\n" not in self._raw:
+            assert not self.closed, f"the stream closed before its headers: {self._raw!r}"
+            assert time.monotonic() < deadline, f"no headers in time: {self._raw!r}"
+            self._receive(deadline)
+        head, self._raw = self._raw.split(b"\r\n\r\n", 1)
+        status_line, *header_lines = head.decode("latin-1").split("\r\n")
+        headers: dict[str, str] = {}
+        for line in header_lines:
+            name, _, value = line.partition(":")
+            headers[name.strip().lower()] = value.strip()
+        return int(status_line.split(" ", 2)[1]), headers
+
+    def _decode(self) -> None:
+        if not self._chunked:
+            self.body += self._raw
+            self._raw = b""
+            return
+        while not self.finished:
+            end = self._raw.find(b"\r\n")
+            if end < 0:
+                return
+            size = int(self._raw[:end].split(b";", 1)[0], 16)
+            if size == 0:
+                self.finished = True
+                return
+            start = end + 2
+            if len(self._raw) < start + size + 2:
+                return
+            self.body += self._raw[start : start + size]
+            self._raw = self._raw[start + size + 2 :]
+
+    def next_match(self, pattern: re.Pattern[bytes], seconds: float) -> re.Match[bytes] | None:
+        """The next match of ``pattern`` in the body after the last one returned, waiting
+        up to ``seconds``; ``None`` if none came."""
+        deadline = time.monotonic() + seconds
+        while True:
+            found = pattern.search(self.body, self._seen)
+            if found is not None:
+                self._seen = found.end()
+                return found
+            if self.closed or self.finished or time.monotonic() >= deadline:
+                return None
+            self._receive(deadline)
+            self._decode()
+
+    def read_body(self, size: int, seconds: float) -> bytes:
+        """At least ``size`` bytes of the body, or what came before ``seconds``."""
+        deadline = time.monotonic() + seconds
+        while len(self.body) < size and not self.closed and time.monotonic() < deadline:
+            self._receive(deadline)
+            self._decode()
+        return self.body
+
+    def ends_within(self, seconds: float) -> bool:
+        """Whether the server ends the stream (its last chunk, or the connection) within
+        ``seconds``."""
+        deadline = time.monotonic() + seconds
+        while not (self.closed or self.finished) and time.monotonic() < deadline:
+            self._receive(deadline)
+            self._decode()
+        return self.closed or self.finished
+
+    def close(self) -> None:
+        self._socket.close()
+
+
+def open_stream(app_url: str, path: str) -> EventStream:
+    """A live stream that the app accepted: a 200 event stream whose retry line came."""
+    stream = EventStream(app_url, path)
+    try:
+        assert stream.status == 200, (stream.status, stream.body[:300])
+        assert stream.headers.get("content-type", "").startswith("text/event-stream")
+        retry = stream.next_match(RETRY, STREAM_START_DEADLINE)
+        assert retry is not None, f"no retry line: {stream.body[:300]!r}"
+        assert int(retry[1]) == RETRY_MS
+    except BaseException:
+        stream.close()
+        raise
+    return stream

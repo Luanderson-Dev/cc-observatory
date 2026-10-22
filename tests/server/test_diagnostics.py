@@ -24,9 +24,19 @@ import pytest
 from fastapi import FastAPI
 from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
+from pydantic import SecretStr
 from sqlalchemy import insert
+from sqlalchemy.exc import OperationalError
 
 import ccobs
+from ccobs.domain.alerts import (
+    DAY_SUBJECT,
+    AlertConfig,
+    DailyCostRule,
+    RepeatedFailuresRule,
+    SessionCostRule,
+    WaitingUserRule,
+)
 from ccobs.domain.app_metrics import EVENT_LABELS, LOKI_QUERIES, event_label
 from ccobs.domain.diagnostics import (
     CANCELLED,
@@ -35,15 +45,18 @@ from ccobs.domain.diagnostics import (
     HOOK_FAILURES_WINDOW_S,
     NON_BLOCKING_ERROR,
     HookFailures,
+    ReportedAlerts,
+    ReportedDiscord,
     hook_failures_query,
+    parse_diagnostics,
 )
 from ccobs.domain.hook_config import HOOK_PATH
 from ccobs.server import app as app_module
 from ccobs.server import diagnostics
 from ccobs.server.app import create_app
 from ccobs.server.config import Settings
-from ccobs.server.db.models import BlockModel, SessionModel
-from ccobs.server.db.repository import Repository, SessionCounts
+from ccobs.server.db.models import AlertModel, BlockModel, SessionModel
+from ccobs.server.db.repository import AlertCounts, Repository, SessionCounts
 from ccobs.server.diagnostics import (
     HTTP_TIMEOUT_S,
     MAX_ANSWER_BYTES,
@@ -51,6 +64,7 @@ from ccobs.server.diagnostics import (
     HookFailuresReader,
     HookFailuresUnavailable,
 )
+from ccobs.server.discord import DiscordSender
 from ccobs.server.ingest import DROP_REASONS, HookQueue
 from ccobs.server.reads import ReadGate
 from ccobs.server.writer import Writer, WriterObservers
@@ -260,6 +274,18 @@ def test_an_empty_database_answers_every_field_with_zeros(client: TestClient) ->
             "executions": 12,
             "non_blocking_error": 5,
             "cancelled": 4,
+        },
+        "alerts": {
+            "rules": ["waiting_user", "repeated_failures"],
+            "open": 0,
+            "fired_24h": 0,
+            "discord": {
+                "configured": False,
+                "suspended_status": None,
+                "pending": 0,
+                "failed_24h": 0,
+                "expired_24h": 0,
+            },
         },
     }
 
@@ -484,9 +510,11 @@ def test_the_counts_take_one_read_slot(client: TestClient) -> None:
     gate = portal.call(lambda: CountingGate(slots=1))
     app_of(client).state.reads = gate
 
-    ok(client)
+    document = ok(client)
 
+    # The alert counts share the session counts' slot: one read, one budget.
     assert gate.runs == 1
+    assert document["alerts"] is not None
 
 
 def test_a_saturated_read_gate_answers_503_without_asking_loki(
@@ -566,3 +594,241 @@ def test_no_session_id_path_or_content_reaches_the_answer(client: TestClient) ->
     assert "/home/" not in text
     assert "session_id" not in text
     assert "cwd" not in text
+
+
+# Alerts (ADR 0046): the rules on, the counts, and Discord's delivery, never its URL.
+
+DAY_MS: Final = 24 * HOUR_MS
+CANARY_URL: Final = f"https://discord.com/api/webhooks/123456789012345678/{CANARY}"
+URL_PARTS: Final = (CANARY, "123456789012345678", "/webhooks/", "discord.com")
+
+
+def alert_row(
+    *,
+    fired_at_ms: int,
+    cleared: bool = False,
+    discord_state: str = "none",
+    host: str = HOST,
+) -> dict[str, object]:
+    """A daily_cost alert: it needs no session row."""
+    return {
+        "host": host,
+        "rule": "daily_cost",
+        "subject": DAY_SUBJECT,
+        "session_id": None,
+        "fired_at_ms": fired_at_ms,
+        "cleared_at_ms": fired_at_ms if cleared else None,
+        "value": 60.0,
+        "threshold": 50.0,
+        "discord_state": discord_state,
+        "discord_attempts": 0,
+        "discord_next_at_ms": fired_at_ms if discord_state == "pending" else None,
+    }
+
+
+def seed_alerts(client: TestClient, rows: list[dict[str, object]]) -> None:
+    repository = app_of(client).state.repository
+    assert isinstance(repository, Repository)
+    with repository.engine.begin() as connection:
+        connection.execute(insert(AlertModel), rows)
+
+
+def test_alerts_are_counted_over_the_last_24_hours(client: TestClient) -> None:
+    recent, old = NOW - HOUR_MS, NOW - DAY_MS - 1
+    seed_alerts(
+        client,
+        [
+            # Still on: two recent, one older than a day (open counts every age).
+            alert_row(fired_at_ms=recent),
+            alert_row(fired_at_ms=recent, discord_state="pending"),
+            alert_row(fired_at_ms=old, discord_state="pending"),
+            # Cleared, fired within the day (its first millisecond included).
+            alert_row(fired_at_ms=recent, cleared=True, discord_state="sent"),
+            alert_row(fired_at_ms=recent, cleared=True, discord_state="failed"),
+            alert_row(fired_at_ms=recent, cleared=True, discord_state="failed"),
+            alert_row(fired_at_ms=NOW - DAY_MS, cleared=True, discord_state="expired"),
+            # Older than the day: out of every 24 h count.
+            alert_row(fired_at_ms=old, cleared=True, discord_state="failed"),
+            alert_row(fired_at_ms=old, cleared=True, discord_state="expired"),
+            # Another host's alerts are not this app's.
+            alert_row(fired_at_ms=recent, discord_state="failed", host="other-host"),
+        ],
+    )
+
+    alerts = ok(client)["alerts"]
+
+    assert alerts["open"] == 3
+    assert alerts["fired_24h"] == 6
+    assert alerts["discord"] == {
+        "configured": False,
+        "suspended_status": None,
+        "pending": 2,
+        "failed_24h": 2,
+        "expired_24h": 1,
+    }
+
+
+def test_the_window_follows_the_app_clock(client: TestClient, clock: Clock) -> None:
+    seed_alerts(client, [alert_row(fired_at_ms=NOW, discord_state="failed")])
+    assert ok(client)["alerts"]["fired_24h"] == 1
+
+    clock.now = NOW + DAY_MS + 1
+
+    alerts = ok(client)["alerts"]
+    assert alerts["fired_24h"] == 0
+    assert alerts["discord"]["failed_24h"] == 0
+    assert alerts["open"] == 1
+
+
+def test_the_rules_are_those_in_force(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    writer = app_of(client).state.writer
+    some = AlertConfig(
+        waiting_user=WaitingUserRule(enabled=False),
+        repeated_failures=RepeatedFailuresRule(enabled=True),
+        session_cost=SessionCostRule(enabled=False),
+        daily_cost=DailyCostRule(enabled=True),
+    )
+    none = AlertConfig(
+        waiting_user=WaitingUserRule(enabled=False),
+        repeated_failures=RepeatedFailuresRule(enabled=False),
+    )
+
+    monkeypatch.setattr(writer, "alert_config", lambda: some)
+    assert ok(client)["alerts"]["rules"] == ["repeated_failures", "daily_cost"]
+
+    monkeypatch.setattr(writer, "alert_config", lambda: none)
+    assert ok(client)["alerts"]["rules"] == []
+
+
+@pytest.fixture
+def discord_client(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, clock: Clock, loki: Loki
+) -> Iterator[TestClient]:
+    for name in list(os.environ):
+        if name.upper().startswith("CCOBS_"):
+            monkeypatch.delenv(name)
+    settings = Settings(
+        data_dir=tmp_path / "data",
+        host_label=HOST,
+        loki_url=LOKI,
+        discord_webhook_url=SecretStr(CANARY_URL),
+    )
+    app = create_app(
+        settings,
+        clock=clock,
+        serve_metrics=False,
+        sweeps=False,
+        reconcile=False,
+        diagnostics_transport=httpx.MockTransport(loki.handle),
+        discord_transport=httpx.MockTransport(lambda _request: httpx.Response(404)),
+    )
+    with TestClient(app, base_url=f"http://{GOOD_HOST}") as test_client:
+        yield test_client
+
+
+def test_a_configured_webhook_says_so_and_never_shows_its_url(
+    discord_client: TestClient,
+) -> None:
+    response = discord_client.get(URL)
+
+    assert response.status_code == 200
+    discord = response.json()["alerts"]["discord"]
+    assert discord["configured"] is True
+    assert discord["suspended_status"] is None
+    for forbidden in URL_PARTS:
+        assert forbidden not in response.text
+
+
+def test_a_suspended_sender_reports_its_status_only(discord_client: TestClient) -> None:
+    seed_alerts(discord_client, [alert_row(fired_at_ms=NOW, discord_state="pending")])
+    sender = app_of(discord_client).state.discord
+    assert isinstance(sender, DiscordSender)
+
+    assert sender.send_once() == "suspended"
+    # The outcome reaches the database through the writer's queue, in order.
+    writer = app_of(discord_client).state.writer
+    writer.submit_discord_round(NOW, expire_before_ms=0, limit=0).result(timeout=5.0)
+    response = discord_client.get(URL)
+
+    assert response.json()["alerts"]["discord"] == {
+        "configured": True,
+        "suspended_status": 404,
+        "pending": 0,
+        "failed_24h": 1,
+        "expired_24h": 0,
+    }
+    for forbidden in URL_PARTS:
+        assert forbidden not in response.text
+
+
+def test_a_failed_alerts_read_answers_null_and_keeps_the_rest(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    seed(client, {"working": 1}, open_blocks=0, closed=0)
+    reader = app_of(client).state.read_repository
+
+    def broken(*_args: object, **_kwargs: object) -> object:
+        raise OperationalError(f"SELECT {CANARY}", None, RuntimeError(CANARY))
+
+    monkeypatch.setattr(reader, "alert_counts", broken)
+
+    with caplog.at_level(logging.DEBUG):
+        document = ok(client)
+
+    assert document["alerts"] is None
+    assert document["sessions"]["by_state"]["working"] == 1
+    assert document["hook_failures"]["available"] is True
+    assert "alerts diagnostics read failed (OperationalError)" in caplog.text
+    assert CANARY not in caplog.text
+
+
+def test_a_failed_session_read_still_fails_the_route(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    reader = app_of(client).state.read_repository
+
+    def broken() -> object:
+        raise RuntimeError(CANARY)
+
+    monkeypatch.setattr(reader, "session_counts", broken)
+    failing = TestClient(
+        app_of(client), base_url=f"http://{GOOD_HOST}", raise_server_exceptions=False
+    )
+
+    # Only the alerts part degrades: the sessions are the route's core (ADR 0038).
+    assert failing.get(URL).status_code == 500
+
+
+def test_the_answer_is_what_the_cli_parses(client: TestClient) -> None:
+    seed_alerts(client, [alert_row(fired_at_ms=NOW, discord_state="pending")])
+
+    parsed = parse_diagnostics(client.get(URL).content)
+
+    assert parsed is not None
+    assert parsed.alerts == ReportedAlerts(
+        rules=("waiting_user", "repeated_failures"),
+        open=1,
+        fired_24h=1,
+        discord=ReportedDiscord(
+            configured=False, suspended_status=None, pending=1, failed_24h=0, expired_24h=0
+        ),
+    )
+
+
+def test_the_repository_counts_alerts_in_one_aggregate(client: TestClient) -> None:
+    seed_alerts(
+        client,
+        [
+            alert_row(fired_at_ms=NOW, discord_state="failed"),
+            alert_row(fired_at_ms=NOW - DAY_MS - 1, cleared=True, discord_state="expired"),
+        ],
+    )
+    reader = app_of(client).state.read_repository
+    assert isinstance(reader, Repository)
+
+    assert reader.alert_counts(HOST, since_ms=NOW - DAY_MS) == AlertCounts(
+        open=1, fired=1, pending=0, failed=1, expired=0
+    )
+    assert reader.alert_counts("nobody", since_ms=0) == AlertCounts(
+        open=0, fired=0, pending=0, failed=0, expired=0
+    )

@@ -1,4 +1,5 @@
-"""The app's tables (ADR 0026): sessions, agents, blocks, hook events and session state.
+"""The app's tables (ADRs 0026 and 0042): sessions, agents, blocks, hook events, session
+state, alerts and alert settings.
 
 Metadata only (ADR 0023): no column holds a prompt, a tool input or output, a message,
 error text or a path, except ``sessions.cwd``. ``sessions.cwd`` and ``sessions.model``
@@ -11,19 +12,38 @@ the receive time the reducer works with (ADR 0024).
 
 from __future__ import annotations
 
-from typing import Final
+from collections.abc import Iterable
+from typing import Final, Literal
 
-from sqlalchemy import JSON, ForeignKey, Index, MetaData, text
+from sqlalchemy import JSON, REAL, CheckConstraint, ForeignKey, Index, MetaData, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
+from ccobs.domain.alerts import ALERT_RULES, DAY_SUBJECT
+
 __all__ = [
+    "DISCORD_STATES",
     "AgentModel",
+    "AlertModel",
+    "AlertSettingModel",
     "Base",
     "BlockModel",
+    "DiscordState",
     "HookEventModel",
     "SessionModel",
     "SessionStateModel",
 ]
+
+# Where an alert's Discord delivery stands (ADR 0042). The transitions belong to the
+# Discord stage of milestone 5; revision 0002 freezes this set in a CHECK, so changing it
+# needs a new revision.
+# - none: Discord was not configured when the alert fired; it is never sent.
+# - pending: waiting to be sent; the next attempt is due at discord_next_at_ms.
+# - sent: Discord accepted it.
+# - failed: given up, the attempts exhausted or the webhook refused (401, 403 or 404).
+# - expired: still pending an hour after it fired, and dropped.
+type DiscordState = Literal["none", "pending", "sent", "failed", "expired"]
+DISCORD_STATES: Final[tuple[DiscordState, ...]] = ("none", "pending", "sent", "failed", "expired")
+_DAILY: Final = "daily_cost"
 
 # Named constraints, so that later migrations (batch mode on SQLite) can refer to them.
 NAMING_CONVENTION: Final = {
@@ -175,3 +195,86 @@ class SessionStateModel(Base):
     completed_tool_use_ids: Mapped[list[str]] = mapped_column(JSON)
     stopped_agent_ids: Mapped[list[str]] = mapped_column(JSON)
     async_launches: Mapped[list[str]] = mapped_column(JSON)
+
+
+def _one_of(column: str, values: Iterable[str]) -> str:
+    """A CHECK clause that ``column`` holds one of ``values`` (fixed identifiers)."""
+    return f"{column} IN ({', '.join(f"'{value}'" for value in values)})"
+
+
+class AlertModel(Base):
+    """One row per alert that fired (ADR 0042): its key, when it fired and cleared, its
+    value and threshold in the rule's unit, and the state of its Discord delivery.
+
+    ``subject`` is the key's subject: the session's ID, which ``session_id`` repeats so
+    that the alert goes with its session (cascade), or ``"day"`` for ``daily_cost``,
+    whose ``session_id`` is null; a CHECK keeps it to those, never free text. No
+    project name, ``cwd`` or content: pages and messages derive the project from the
+    session at read time. ``id`` is ``AUTOINCREMENT``, so an ID is never reused and a
+    page cursor never meets another alert under an old ID.
+    """
+
+    __tablename__ = "alerts"
+    __table_args__ = (
+        CheckConstraint(_one_of("rule", ALERT_RULES), name="rule"),
+        CheckConstraint(_one_of("discord_state", DISCORD_STATES), name="discord_state"),
+        CheckConstraint(
+            f"(rule = '{_DAILY}' AND session_id IS NULL AND subject = '{DAY_SUBJECT}')"
+            f" OR (rule != '{_DAILY}' AND session_id IS NOT NULL AND subject = session_id)",
+            name="subject",
+        ),
+        CheckConstraint(
+            "discord_state != 'pending' OR discord_next_at_ms IS NOT NULL", name="discord_next"
+        ),
+        CheckConstraint("discord_attempts >= 0", name="discord_attempts"),
+        CheckConstraint("cleared_at_ms IS NULL OR cleared_at_ms >= fired_at_ms", name="cleared"),
+        # The open alerts of a key, which a clear looks up.
+        Index(
+            "ix_alerts_open",
+            "host",
+            "rule",
+            "subject",
+            sqlite_where=text("cleared_at_ms IS NULL"),
+        ),
+        # The Discord deliveries due, in the order they are sent.
+        Index(
+            "ix_alerts_discord_pending",
+            "host",
+            "discord_next_at_ms",
+            "id",
+            sqlite_where=text("discord_state = 'pending'"),
+        ),
+        # Retention of the daily alerts, and the cooldowns rebuilt at start-up.
+        Index("ix_alerts_fired_at_ms", "fired_at_ms"),
+        # The cascade from sessions looks alerts up by session.
+        Index("ix_alerts_session_id", "session_id"),
+        {"sqlite_autoincrement": True},
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    host: Mapped[str]
+    rule: Mapped[str]
+    session_id: Mapped[str | None] = mapped_column(_session_fk())
+    subject: Mapped[str]
+    fired_at_ms: Mapped[int]
+    cleared_at_ms: Mapped[int | None]
+    value: Mapped[float] = mapped_column(REAL)
+    threshold: Mapped[float] = mapped_column(REAL)
+    discord_state: Mapped[str]
+    discord_attempts: Mapped[int] = mapped_column(server_default=text("0"))
+    discord_next_at_ms: Mapped[int | None]
+
+
+class AlertSettingModel(Base):
+    """One row per alert setting saved on the settings screen (ADR 0042), which overrides
+    the environment's value. ``field`` is a flat setting name (``CCOBS_<FIELD>`` lower
+    case, such as ``alert_cooldown_s``), checked against an allowlist in code;
+    ``value`` is its JSON text (``true``, ``30``, ``10.5``), which keeps a bool, an int
+    and a float apart exactly."""
+
+    __tablename__ = "alert_settings"
+
+    host: Mapped[str] = mapped_column(primary_key=True)
+    field: Mapped[str] = mapped_column(primary_key=True)
+    value: Mapped[str]
+    updated_at_ms: Mapped[int]

@@ -1,0 +1,29 @@
+{% extends "base.html" %}
+{% block title %}Alerts - cc-observatory{% endblock %}
+{% block content %}
+<h1 class="page-title">Alerts</h1>
+<p class="page-lede">What the app warns you about, and the warnings it sent.</p>
+{% if error %}
+{% include "_error.html" %}
+<p><a href="/alerts">Newest alerts</a></p>
+{% else %}
+<section class="alerts-section" aria-labelledby="alerts-history-title">
+  <h2 class="alerts-section__title" id="alerts-history-title">Recent alerts</h2>
+  {% include "_alert_history.html" %}
+</section>
+<section class="alerts-section" aria-labelledby="alerts-settings-title">
+  <h2 class="alerts-section__title" id="alerts-settings-title">Settings</h2>
+  {#- Whether alerts also go to Discord; never the webhook URL, which only the
+      environment holds (P7). -#}
+  {% if discord.configured %}
+  <p class="alerts-discord">Alerts also go to your Discord webhook.{% if discord.names_project %} Messages name the project.{% endif %}</p>
+  {% with discord_test_path=discord.test_path, discord_test_message=None %}{% include "_discord_test.html" %}{% endwith %}
+  {% else %}
+  <p class="alerts-discord">Discord is off. Set <code>CCOBS_DISCORD_WEBHOOK_URL</code> in the stack's <code>.env</code> and restart the app to send alerts there too.</p>
+  {% endif %}
+  {#- notify.js fills this with the browser notifications control (ADR 0044). -#}
+  <div id="alert-notifications" class="alert-notifications"></div>
+  {% include "_alert_settings.html" %}
+</section>
+{% endif %}
+{% endblock %}

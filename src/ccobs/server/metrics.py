@@ -4,12 +4,15 @@
 one, so that several apps (in tests) never share series. Live state is read at scrape
 time, not pushed: a collector asks the writer for its counts, the queue for its depth,
 bytes and drop counters and the live updates hub (ADR 0032) for its open and refused
-streams, so a gauge never goes stale. Only the block-duration histogram
-and the Loki and Prometheus query counters keep state of their own, fed by the writer's
-``on_block_closed`` callback, the reconciler's ``on_query`` (ADR 0029) and the usage
-reader's ``on_query`` (ADR 0035). Every label
-value comes from a closed list (``ccobs.domain.app_metrics``), states, kinds, reasons and
-events are exported with zeros, and there is no ``_created`` series.
+streams, so a gauge never goes stale; the counter of alerts fired (ADR 0041) is one of
+the writer's counts. Only the block-duration histogram and the Loki and Prometheus query
+counters keep state of their own, fed by the writer's ``on_block_closed`` callback, the
+reconciler's ``on_query`` (ADR 0029) and the usage reader's ``on_query`` (ADR 0035), and
+so does the counter of Discord deliveries, fed by the Discord sender's ``on_delivery``
+(ADR 0046).
+Every label value comes from a closed list (``ccobs.domain.app_metrics``), states,
+kinds, reasons, events and rules are exported with zeros, and there is no ``_created``
+series.
 
 ``MetricsListener`` serves the registry on ``CCOBS_METRICS_PORT`` from a thread of its
 own: ``/metrics`` only, and a 404 for anything else. It has no Host check: compose never
@@ -40,14 +43,18 @@ from prometheus_client.metrics_core import CounterMetricFamily, GaugeMetricFamil
 from prometheus_client.registry import Collector
 
 import ccobs
+from ccobs.domain.alerts import ALERT_RULES
 from ccobs.domain.app_metrics import (
     AGENTS_RUNNING,
+    ALERT_DELIVERIES,
+    ALERTS_FIRED,
     BLOCK_DURATION,
     BLOCK_DURATION_BUCKETS,
     BLOCK_KINDS,
     BLOCKS_OPEN,
     BUILD_INFO,
     DATABASE_WAL,
+    DELIVERY_RESULTS,
     EVENT_LABELS,
     HOOK_EVENTS_DROPPED,
     HOOK_EVENTS_PROCESSED,
@@ -65,6 +72,7 @@ from ccobs.domain.app_metrics import (
     UI_STREAMS,
     UI_STREAMS_REFUSED,
     AppMetric,
+    DeliveryResult,
     LokiQueryResult,
     PrometheusQueryResult,
 )
@@ -145,6 +153,7 @@ class _StateCollector(Collector):
         self._queries_lock = threading.Lock()
         self._loki_queries: Counter[str] = Counter()
         self._prometheus_queries: Counter[str] = Counter()
+        self._deliveries: Counter[str] = Counter()
 
     def count_loki_query(self, result: LokiQueryResult) -> None:
         with self._queries_lock:
@@ -153,6 +162,10 @@ class _StateCollector(Collector):
     def count_prometheus_query(self, result: PrometheusQueryResult) -> None:
         with self._queries_lock:
             self._prometheus_queries[result] += 1
+
+    def count_alert_delivery(self, result: DeliveryResult, count: int) -> None:
+        with self._queries_lock:
+            self._deliveries[result] += count
 
     def collect(self) -> Iterator[Metric]:
         host = self._host
@@ -163,6 +176,7 @@ class _StateCollector(Collector):
         with self._queries_lock:
             queries = dict(self._loki_queries)
             prometheus_queries = dict(self._prometheus_queries)
+            deliveries = dict(self._deliveries)
         loki = _counter(LOKI_QUERIES)
         for result in LOKI_RESULTS:
             loki.add_metric([host, result], queries.get(result, 0))
@@ -171,6 +185,10 @@ class _StateCollector(Collector):
         for outcome in PROMETHEUS_RESULTS:
             prometheus.add_metric([host, outcome], prometheus_queries.get(outcome, 0))
         yield prometheus
+        delivered = _counter(ALERT_DELIVERIES)
+        for delivery in DELIVERY_RESULTS:
+            delivered.add_metric([host, delivery], deliveries.get(delivery, 0))
+        yield delivered
         yield from self._from_streams()
         writer = self.writer
         if writer is None:
@@ -226,6 +244,10 @@ class _StateCollector(Collector):
         for event in EVENT_LABELS:
             received.add_metric([host, event], counts.events_received.get(event, 0))
         yield received
+        fired = _counter(ALERTS_FIRED)
+        for rule in ALERT_RULES:
+            fired.add_metric([host, rule], counts.alerts_fired.get(rule, 0))
+        yield fired
 
 
 class AppMetrics:
@@ -274,6 +296,16 @@ class AppMetrics:
         """The usage reader's ``on_query``: one query sent to Prometheus, with its
         ``result``."""
         self._state.count_prometheus_query(result)
+
+    def count_alert_delivery(self, result: DeliveryResult, count: int = 1) -> None:
+        """The Discord sender's ``on_delivery``: ``count`` alerts whose delivery had
+        ``result`` (ADR 0046)."""
+        self._state.count_alert_delivery(result, count)
+
+    def count_expired_deliveries(self, count: int) -> None:
+        """The writer's ``on_discord_expired``: ``count`` deliveries it marked expired
+        (ADR 0046)."""
+        self._state.count_alert_delivery("expired", count)
 
     def observe_block_closed(self, kind: BlockKind, seconds: float) -> None:
         """The writer's ``on_block_closed``: one closed block of ``kind``, open ``seconds``."""

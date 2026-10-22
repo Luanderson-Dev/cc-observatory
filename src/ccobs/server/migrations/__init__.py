@@ -23,7 +23,7 @@ from ccobs.server.db.engine import create_engine_for
 __all__ = ["HEAD", "MigrationError", "alembic_config", "upgrade_to_head"]
 
 # The latest revision in versions/.
-HEAD: Final = "0001"
+HEAD: Final = "0002"
 
 _SCRIPT_LOCATION: Final = Path(__file__).parent
 

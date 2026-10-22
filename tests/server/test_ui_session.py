@@ -1567,8 +1567,10 @@ def test_a_failed_read_says_what_failed_with_503(
         assert "<html" not in body
     else:
         assert '<header class="masthead">' in body
-        # Nothing to refresh: the page does not open a live stream.
-        assert "data-stream" not in body
+        # Nothing of the session to refresh, but the page still streams, unfiltered,
+        # for the alerts pings (ADR 0044).
+        assert 'data-stream="/ui/stream">' in body
+        assert body.count("data-stream=") == 1
 
 
 def test_session_pages_are_guarded_and_never_stored(client: TestClient) -> None:

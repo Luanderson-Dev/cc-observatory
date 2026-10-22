@@ -91,14 +91,18 @@ ALLOWED_IMPORTS: Final = frozenset(
     | {"math"}
     # copy.deepcopy of parsed JSON (ccobs.domain.settings_merge).
     | {"copy"}
+    # unicodedata.category, a table lookup (ccobs.domain.discord_message).
+    | {"unicodedata"}
     # Domain modules, each one checked by the same test.
     | {
+        "ccobs.domain.alerts",
         "ccobs.domain.denials",
         "ccobs.domain.diagnostics",
         "ccobs.domain.durations",
         "ccobs.domain.grafana_links",
         "ccobs.domain.hook_config",
         "ccobs.domain.hooks",
+        "ccobs.domain.presentation",
         "ccobs.domain.sessions",
         "ccobs.domain.settings_merge",
         "ccobs.domain.telemetry",

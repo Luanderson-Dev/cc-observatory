@@ -6,11 +6,18 @@ transaction. A batch of events is one transaction too, with each record coalesce
 last version wins. After a restart, ``load_open_states`` rebuilds the exact states the
 writer had in memory: the session, its running agents and open blocks come from their
 tables, and the bookkeeping no table holds comes from ``session_state``.
+
+The alerts and the alert settings saved on the settings screen have their own reads and
+writes (ADR 0042). Every write goes through the writer's engine; the API's reads
+(``list_alerts``, ``alert_views``, ``alert_settings``) run on the readers' engine (ADR
+0033).
 """
 
 from __future__ import annotations
 
+import json
 import logging
+import math
 from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass, fields, replace
 from typing import Any, Final
@@ -19,17 +26,31 @@ from sqlalchemy import (
     ColumnElement,
     Connection,
     Engine,
+    Insert,
     RowMapping,
+    Update,
+    and_,
+    case,
     delete,
     func,
     insert,
     or_,
     select,
     tuple_,
+    update,
 )
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
-from sqlalchemy.orm import InstrumentedAttribute
+from sqlalchemy.orm import InstrumentedAttribute, aliased
 
+from ccobs.domain.alerts import (
+    ALERT_RULES,
+    AlertCleared,
+    AlertEffect,
+    AlertFired,
+    AlertKey,
+    AlertRule,
+    KeyState,
+)
 from ccobs.domain.hooks import (
     Elicitation,
     ElicitationResult,
@@ -58,20 +79,33 @@ from ccobs.domain.sessions import (
     SessionState,
 )
 from ccobs.server.db.models import (
+    DISCORD_STATES,
     AgentModel,
+    AlertModel,
+    AlertSettingModel,
     Base,
     BlockModel,
+    DiscordState,
     HookEventModel,
     SessionModel,
     SessionStateModel,
 )
 
 __all__ = [
+    "ALERT_PAGE_MAX",
+    "ALERT_SETTING_TYPES",
+    "DELIVERY_BATCH_MAX",
     "DETAIL_CLOSED_LIMIT",
     "LIVE_STATUSES",
     "AgentPage",
+    "AlertCounts",
+    "AlertRecord",
+    "AlertSettingValue",
+    "AlertView",
     "Applied",
     "BoardRows",
+    "DeliveryUpdate",
+    "DueDeliveries",
     "HookEventRow",
     "Repository",
     "SessionCounts",
@@ -114,6 +148,41 @@ _AGENT_FIRST_SEEN: Final = func.coalesce(
 # sweep moves a session out of them after hours of silence (ADR 0024).
 LIVE_STATUSES: Final = ("waiting_user", "working", "idle")
 _STALE: Final = "stale"
+# The alerts (ADR 0042). A page of alerts and a batch of Discord deliveries hold at
+# most this many rows, whatever the caller asks (ADR 0033).
+ALERT_PAGE_MAX: Final = 500
+DELIVERY_BATCH_MAX: Final = 100
+_DAILY_COST: Final = "daily_cost"
+_PENDING: Final = "pending"
+_NO_DISCORD: Final = "none"
+_EXPIRED: Final = "expired"
+_FAILED: Final = "failed"
+# The values the CHECK constraints allow, typed: a row's rule and delivery state.
+_RULES: Final[Mapping[str, AlertRule]] = {rule: rule for rule in ALERT_RULES}
+_DISCORD_STATES: Final[Mapping[str, DiscordState]] = {state: state for state in DISCORD_STATES}
+# The hook events that end a streak of failures (ADR 0041): a main-thread Stop (no
+# agent_id) and SessionEnd.
+_STOP: Final = "Stop"
+_SESSION_END: Final = "SessionEnd"
+_STOP_FAILURE: Final = "StopFailure"
+
+type AlertSettingValue = bool | int | float
+# The alert settings the settings screen may save, by their flat name (the Settings
+# field, CCOBS_<FIELD> in lower case), with the type each takes: a bool, an int, or a
+# dollar amount, an int or a finite float (ADR 0041). Anything else is refused on write
+# and ignored on read.
+ALERT_SETTING_TYPES: Final[Mapping[str, type[bool] | type[int] | type[float]]] = {
+    "alert_waiting_enabled": bool,
+    "alert_waiting_threshold_s": int,
+    "alert_failures_enabled": bool,
+    "alert_failures_count": int,
+    "alert_failures_window_s": int,
+    "alert_session_cost_enabled": bool,
+    "alert_session_cost_usd": float,
+    "alert_daily_cost_enabled": bool,
+    "alert_daily_cost_usd": float,
+    "alert_cooldown_s": int,
+}
 _SESSION_FIELDS: Final = tuple(f.name for f in fields(Session))
 _AGENT_FIELDS: Final = tuple(f.name for f in fields(Agent))
 # Block.scope is stored as scope_agent_id.
@@ -226,6 +295,54 @@ class Applied:
 
 
 @dataclass(frozen=True, kw_only=True)
+class AlertRecord:
+    """An ``alerts`` row (ADR 0042): an alert that fired, ``session_id`` ``None`` for
+    ``daily_cost``, and its Discord delivery."""
+
+    id: int
+    rule: AlertRule
+    subject: str
+    session_id: str | None
+    fired_at_ms: int
+    cleared_at_ms: int | None
+    value: float
+    threshold: float
+    discord_state: DiscordState
+    discord_attempts: int
+    discord_next_at_ms: int | None
+
+
+@dataclass(frozen=True, kw_only=True)
+class AlertView:
+    """An alert as the API shows it: its row and the ``cwd`` of its session, ``None`` for
+    ``daily_cost`` or a session with none. The API turns ``cwd`` into the project name
+    (ADR 0044); neither table stores a project name (ADR 0042)."""
+
+    alert: AlertRecord
+    cwd: str | None
+
+
+@dataclass(frozen=True, kw_only=True)
+class DueDeliveries:
+    """What the Discord sender gets of one round (ADR 0046): how many pending deliveries
+    it expired, and the deliveries now due, with their sessions' ``cwd``."""
+
+    expired: int
+    alerts: list[AlertView]
+
+
+@dataclass(frozen=True, kw_only=True)
+class DeliveryUpdate:
+    """Where one alert's Discord delivery stands after an attempt: its state, how many
+    attempts were made and, while ``pending``, when the next is due."""
+
+    alert_id: int
+    state: DiscordState
+    attempts: int
+    next_at_ms: int | None = None
+
+
+@dataclass(frozen=True, kw_only=True)
 class SessionView:
     host: str
     session: Session
@@ -265,6 +382,20 @@ class SessionCounts:
 
     by_state: dict[str, int]
     open_blocks: int
+
+
+@dataclass(frozen=True, kw_only=True)
+class AlertCounts:
+    """A host's alerts as ``ccobs doctor`` and ``status`` see them (ADR 0046): how many
+    are still on (any age), how many fired at or after the window's start, the Discord
+    deliveries still ``pending`` (any age), and, of the alerts fired in the window, the
+    deliveries that ended ``failed`` or ``expired``."""
+
+    open: int
+    fired: int
+    pending: int
+    failed: int
+    expired: int
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -411,22 +542,386 @@ class Repository:
             _upsert(connection, BlockModel, ("session_id", "block_id"), blocks.values())
             _upsert(connection, SessionStateModel, ("session_id",), states.values())
 
-    def delete_older_than(self, cutoff_ms: int) -> int:
+    def delete_older_than(self, cutoff_ms: int) -> frozenset[str]:
         """Delete the ended and stale sessions whose last event is before ``cutoff_ms``,
-        with their agents, blocks, events and state (cascade). Returns how many went.
+        with their agents, blocks, events, state and alerts (cascade), and the cleared
+        ``daily_cost`` alerts that fired before it, which have no session (ADR 0042).
+        Returns the ``session_id`` of every session that went, so the writer forgets
+        exactly those.
 
         A session still open is never deleted, so the writer's in-memory state cannot
         outlive its rows. Retention is never shorter than the stale threshold, so the
-        sweep has made every session that old stale by then.
+        sweep has made every session that old stale by then. A daily alert still open is
+        kept for the same reason: the evaluator rebuilds its key from it.
         """
         with self.engine.begin() as connection:
-            result = connection.execute(
-                delete(SessionModel).where(
+            deleted = connection.execute(
+                delete(SessionModel)
+                .where(
                     SessionModel.last_event_at_ms < cutoff_ms,
                     SessionModel.status.in_(_CLOSED),
                 )
+                .returning(SessionModel.session_id)
+            ).scalars()
+            gone = frozenset(deleted)
+            connection.execute(
+                delete(AlertModel).where(
+                    AlertModel.session_id.is_(None),
+                    AlertModel.fired_at_ms < cutoff_ms,
+                    AlertModel.cleared_at_ms.is_not(None),
+                )
             )
-            return result.rowcount
+            return gone
+
+    # Alerts (ADR 0042). Writes on the writer's engine only.
+
+    def insert_alert(
+        self,
+        host: str,
+        fired: AlertFired,
+        *,
+        discord_state: DiscordState,
+        discord_next_at_ms: int | None = None,
+    ) -> int:
+        """Store an alert that fired and return its ``id``, which grows with every alert
+        and is never reused. A ``daily_cost`` alert has no session; any other refers to
+        its session, which must be stored (``IntegrityError`` otherwise), and goes with
+        it. ``discord_next_at_ms`` is required for a ``pending`` delivery."""
+        statement = _insert_alert(host, fired, discord_state, discord_next_at_ms)
+        with self.engine.begin() as connection:
+            return connection.execute(statement.returning(AlertModel.id)).scalar_one()
+
+    def apply_alert_effects(
+        self, host: str, effects: Sequence[AlertEffect], *, discord_configured: bool
+    ) -> None:
+        """Write one evaluation's effects, in order, in one transaction: all or nothing.
+
+        An ``AlertFired`` is stored as ``insert_alert`` stores it, its Discord delivery
+        ``pending`` and due at once (its ``fired_at_ms``) when Discord is configured, else
+        ``none``; an ``AlertCleared`` clears as ``clear_alert`` does. No effects, no
+        transaction.
+        """
+        if not effects:
+            return
+        with self.engine.begin() as connection:
+            for effect in effects:
+                if isinstance(effect, AlertCleared):
+                    connection.execute(_clear_alert(host, effect))
+                elif discord_configured:
+                    connection.execute(_insert_alert(host, effect, _PENDING, effect.fired_at_ms))
+                else:
+                    connection.execute(_insert_alert(host, effect, _NO_DISCORD, None))
+
+    def clear_alert(self, host: str, cleared: AlertCleared) -> int:
+        """Clear the open alerts of ``cleared``'s key at its time, never earlier than
+        their fire; returns how many (0 or 1 when every fire went through the
+        evaluator, which never fires a key twice before it clears)."""
+        with self.engine.begin() as connection:
+            return connection.execute(_clear_alert(host, cleared)).rowcount
+
+    def set_delivery(
+        self,
+        host: str,
+        alert_id: int,
+        *,
+        state: DiscordState,
+        attempts: int,
+        next_at_ms: int | None = None,
+    ) -> bool:
+        """Record where an alert's Discord delivery stands: its state, how many attempts
+        were made and, while ``pending``, when the next is due (``IntegrityError``
+        without it). False when the host has no such alert."""
+        statement = (
+            update(AlertModel)
+            .where(AlertModel.host == host, AlertModel.id == alert_id)
+            .values(discord_state=state, discord_attempts=attempts, discord_next_at_ms=next_at_ms)
+        )
+        with self.engine.begin() as connection:
+            return connection.execute(statement).rowcount == 1
+
+    def list_alerts(self, host: str, limit: int, before_id: int | None = None) -> list[AlertRecord]:
+        """The host's ``limit`` latest alerts, at most ``ALERT_PAGE_MAX``, newest first,
+        starting just below ``before_id`` (exclusive) when given: a keyset page of the
+        primary key, the same however many alerts fire later."""
+        statement = select(AlertModel.__table__).where(AlertModel.host == host)
+        if before_id is not None:
+            statement = statement.where(AlertModel.id < before_id)
+        statement = statement.order_by(AlertModel.id.desc()).limit(_capped(limit, ALERT_PAGE_MAX))
+        with self.engine.connect() as connection:
+            return [_alert(row) for row in connection.execute(statement).mappings()]
+
+    def alert_views(
+        self,
+        host: str,
+        limit: int,
+        *,
+        before_id: int | None = None,
+        after_id: int | None = None,
+    ) -> list[AlertView]:
+        """The host's alerts with their session's ``cwd``, at most ``limit`` and
+        ``ALERT_PAGE_MAX``, by keyset on ``id`` (ADR 0044): with no cursor, the latest,
+        newest first; below ``before_id``, the next older ones, newest first; above
+        ``after_id``, the next newer ones, oldest first, so a client that catches up
+        page by page never skips one. Cursors are exclusive; not both at once."""
+        if before_id is not None and after_id is not None:
+            raise ValueError("before_id or after_id, not both")
+        session_cwd = SessionModel.cwd.label("session_cwd")
+        statement = (
+            select(AlertModel.__table__, session_cwd)
+            .outerjoin(SessionModel, SessionModel.session_id == AlertModel.session_id)
+            .where(AlertModel.host == host)
+        )
+        if after_id is not None:
+            statement = statement.where(AlertModel.id > after_id).order_by(AlertModel.id)
+        else:
+            if before_id is not None:
+                statement = statement.where(AlertModel.id < before_id)
+            statement = statement.order_by(AlertModel.id.desc())
+        statement = statement.limit(_capped(limit, ALERT_PAGE_MAX))
+        with self.engine.connect() as connection:
+            return [
+                AlertView(alert=_alert(row), cwd=row["session_cwd"])
+                for row in connection.execute(statement).mappings()
+            ]
+
+    def due_deliveries(self, host: str, now_ms: int, limit: int) -> list[AlertRecord]:
+        """The host's ``pending`` Discord deliveries due at ``now_ms``, the earliest due
+        first (then by ``id``), at most ``limit`` and ``DELIVERY_BATCH_MAX``: a range of
+        the partial index on pending deliveries."""
+        statement = (
+            select(AlertModel.__table__)
+            .where(
+                AlertModel.host == host,
+                AlertModel.discord_state == _PENDING,
+                AlertModel.discord_next_at_ms <= now_ms,
+            )
+            .order_by(AlertModel.discord_next_at_ms, AlertModel.id)
+            .limit(_capped(limit, DELIVERY_BATCH_MAX))
+        )
+        with self.engine.connect() as connection:
+            return [_alert(row) for row in connection.execute(statement).mappings()]
+
+    def take_due_deliveries(
+        self, host: str, *, now_ms: int, expire_before_ms: int, limit: int
+    ) -> DueDeliveries:
+        """In one transaction on the writer's engine (ADR 0046): expire the host's
+        ``pending`` deliveries of alerts fired before ``expire_before_ms``, never sent,
+        then read the ``pending`` ones due at ``now_ms``, as ``due_deliveries`` orders and
+        caps them (``limit`` may be 0: expire only), with their sessions' ``cwd``."""
+        expire = (
+            update(AlertModel)
+            .where(
+                AlertModel.host == host,
+                AlertModel.discord_state == _PENDING,
+                AlertModel.fired_at_ms < expire_before_ms,
+            )
+            .values(discord_state=_EXPIRED, discord_next_at_ms=None)
+        )
+        session_cwd = SessionModel.cwd.label("session_cwd")
+        due = (
+            select(AlertModel.__table__, session_cwd)
+            .outerjoin(SessionModel, SessionModel.session_id == AlertModel.session_id)
+            .where(
+                AlertModel.host == host,
+                AlertModel.discord_state == _PENDING,
+                AlertModel.discord_next_at_ms <= now_ms,
+            )
+            .order_by(AlertModel.discord_next_at_ms, AlertModel.id)
+            .limit(_capped(limit, DELIVERY_BATCH_MAX))
+        )
+        with self.engine.begin() as connection:
+            expired = connection.execute(expire).rowcount
+            alerts = [
+                AlertView(alert=_alert(row), cwd=row["session_cwd"])
+                for row in connection.execute(due).mappings()
+            ]
+        return DueDeliveries(expired=expired, alerts=alerts)
+
+    def record_deliveries(self, host: str, updates: Sequence[DeliveryUpdate]) -> int:
+        """Record the outcome of one Discord attempt for each alert of ``updates``, in one
+        transaction: all or nothing (``IntegrityError`` for a ``pending`` one without a
+        time). Only deliveries still ``pending`` change; returns how many did. No
+        updates, no transaction."""
+        if not updates:
+            return 0
+        changed = 0
+        with self.engine.begin() as connection:
+            for item in updates:
+                statement = (
+                    update(AlertModel)
+                    .where(
+                        AlertModel.host == host,
+                        AlertModel.id == item.alert_id,
+                        AlertModel.discord_state == _PENDING,
+                    )
+                    .values(
+                        discord_state=item.state,
+                        discord_attempts=item.attempts,
+                        discord_next_at_ms=item.next_at_ms,
+                    )
+                )
+                changed += connection.execute(statement).rowcount
+        return changed
+
+    def alert_keys(self, host: str, *, cooldown_since_ms: int) -> dict[AlertKey, KeyState]:
+        """The evaluators' ``AlertState.keys`` after a restart (ADR 0041): every key with
+        an alert still open, firing, and every key that fired at or after
+        ``cooldown_since_ms`` (now minus the cooldown), whose cooldown still runs. Each
+        with its latest fire."""
+        open_now = case((AlertModel.cleared_at_ms.is_(None), 1), else_=0)
+        statement = (
+            select(
+                AlertModel.rule,
+                AlertModel.subject,
+                func.max(AlertModel.fired_at_ms),
+                func.max(open_now),
+            )
+            .where(
+                AlertModel.host == host,
+                or_(
+                    AlertModel.cleared_at_ms.is_(None),
+                    AlertModel.fired_at_ms >= cooldown_since_ms,
+                ),
+            )
+            .group_by(AlertModel.rule, AlertModel.subject)
+        )
+        with self.engine.connect() as connection:
+            rows = connection.execute(statement).all()
+        return {
+            AlertKey(rule=_RULES[rule], subject=subject): KeyState(
+                last_fired_at_ms=int(last_fired), firing=bool(firing)
+            )
+            for rule, subject, last_fired, firing in rows
+        }
+
+    def failure_windows(
+        self, host: str, *, since_ms: int, count: int
+    ) -> dict[str, tuple[int, ...]]:
+        """The ``repeated_failures`` windows after a restart, as
+        ``record_failure_event`` and ``evaluate_repeated_failures`` would hold them
+        (ADR 0041), from the stored hook events.
+
+        For each session that has not ended: the receive times of its ``StopFailure``
+        events after (in ``seq``, the order the writer processed them) its last
+        main-thread ``Stop`` or ``SessionEnd``, at or after ``since_ms`` (now minus the
+        window), the newest ``count`` of them, sorted. Sessions with none are absent.
+
+        It rebuilds them whether or not ``repeated_failures`` is enabled, unlike
+        ``record_failure_event``, which records nothing while the rule is off: the caller
+        (the writer at start-up) drops the rebuilt windows when the rule is disabled.
+
+        A ``StopFailure`` counts when no reset follows it in its session: ``NOT EXISTS``
+        on the ``(session_id, seq)`` index reads only the events after the failure and
+        stops at the first reset, where a ``max(seq)`` of the resets read the session's
+        whole history for every failure.
+        """
+        reset = aliased(HookEventModel)
+        reset_after = (
+            select(1)
+            .where(
+                reset.session_id == HookEventModel.session_id,
+                reset.seq > HookEventModel.seq,
+                or_(
+                    and_(reset.hook_event_name == _STOP, reset.agent_id.is_(None)),
+                    reset.hook_event_name == _SESSION_END,
+                ),
+            )
+            .exists()
+        )
+        rank = (
+            func.row_number()
+            .over(
+                partition_by=HookEventModel.session_id,
+                order_by=(HookEventModel.received_at_ms.desc(), HookEventModel.seq.desc()),
+            )
+            .label("rank")
+        )
+        ranked = (
+            select(HookEventModel.session_id, HookEventModel.received_at_ms, rank)
+            .join(SessionModel, SessionModel.session_id == HookEventModel.session_id)
+            .where(
+                HookEventModel.host == host,
+                SessionModel.status != _ENDED,
+                HookEventModel.hook_event_name == _STOP_FAILURE,
+                HookEventModel.received_at_ms >= since_ms,
+                ~reset_after,
+            )
+            .subquery()
+        )
+        statement = (
+            select(ranked.c.session_id, ranked.c.received_at_ms)
+            .where(ranked.c.rank <= count)
+            .order_by(ranked.c.session_id, ranked.c.received_at_ms)
+        )
+        windows: dict[str, list[int]] = {}
+        with self.engine.connect() as connection:
+            for session_id, received_at_ms in connection.execute(statement):
+                windows.setdefault(session_id, []).append(received_at_ms)
+        return {session_id: tuple(times) for session_id, times in windows.items()}
+
+    # Alert settings (ADR 0042).
+
+    def alert_settings(self, host: str) -> dict[str, AlertSettingValue]:
+        """The host's saved overrides, by flat setting name, each with the type it was
+        saved with. A row that is not an allowlisted setting of the right type (a file
+        edited by hand) is ignored, and counted in a log line without names or values.
+        Bounds are the caller's to check, with ``validate_config`` (ADR 0042)."""
+        statement = select(AlertSettingModel.field, AlertSettingModel.value).where(
+            AlertSettingModel.host == host
+        )
+        with self.engine.connect() as connection:
+            rows = connection.execute(statement).all()
+        settings: dict[str, AlertSettingValue] = {}
+        for field, stored in rows:
+            value = _decoded_setting(field, stored)
+            if value is not None:
+                settings[field] = value
+        if ignored := len(rows) - len(settings):
+            _log.warning("ignored %d invalid saved alert settings", ignored)
+        return settings
+
+    def save_alert_setting(
+        self, host: str, field: str, value: AlertSettingValue, *, updated_at_ms: int
+    ) -> None:
+        """Save one override, replacing the one saved before. ``ValueError`` for a name
+        outside ``ALERT_SETTING_TYPES`` or a value of the wrong type; the message never
+        holds the value, nor an unknown name."""
+        self.save_alert_settings(host, {field: value}, updated_at_ms=updated_at_ms)
+
+    def save_alert_settings(
+        self, host: str, values: Mapping[str, AlertSettingValue], *, updated_at_ms: int
+    ) -> None:
+        """Save several overrides in one transaction (the settings screen, ADR 0045):
+        all of them or, on any error, none. Each is checked as ``save_alert_setting``
+        checks one, before anything is written."""
+        rows = [
+            {
+                "host": host,
+                "field": field,
+                "value": _encoded_setting(field, value),
+                "updated_at_ms": updated_at_ms,
+            }
+            for field, value in values.items()
+        ]
+        if not rows:
+            return
+        with self.engine.begin() as connection:
+            _upsert(connection, AlertSettingModel, ("host", "field"), rows)
+
+    def reset_alert_setting(self, host: str, field: str) -> bool:
+        """Delete one override (Reset): the setting falls back to the environment's
+        value, then the built-in default. False when none was saved."""
+        statement = delete(AlertSettingModel).where(
+            AlertSettingModel.host == host, AlertSettingModel.field == field
+        )
+        with self.engine.begin() as connection:
+            return connection.execute(statement).rowcount == 1
+
+    def reset_alert_settings(self, host: str) -> int:
+        """Delete every override of the host; returns how many."""
+        statement = delete(AlertSettingModel).where(AlertSettingModel.host == host)
+        with self.engine.begin() as connection:
+            return connection.execute(statement).rowcount
 
     # State after a restart.
 
@@ -699,6 +1194,36 @@ class Repository:
             open_blocks=int(open_blocks),
         )
 
+    def alert_counts(self, host: str, *, since_ms: int) -> AlertCounts:
+        """The host's ``AlertCounts`` with the window starting at ``since_ms``
+        (inclusive): one aggregate over the host's alerts, which retention bounds (ADR
+        0042), never a list. A delivery has no time of its own: ``failed`` and
+        ``expired`` count by when their alert fired, which an hour at most separates
+        from the outcome (ADR 0046)."""
+        recent = AlertModel.fired_at_ms >= since_ms
+        state = AlertModel.discord_state
+
+        def counted(*conditions: ColumnElement[bool]) -> ColumnElement[int]:
+            # COUNT skips the NULL a CASE without ELSE gives the rows it does not match.
+            return func.count(case((and_(*conditions), 1)))
+
+        statement = select(
+            counted(AlertModel.cleared_at_ms.is_(None)),
+            counted(recent),
+            counted(state == _PENDING),
+            counted(recent, state == _FAILED),
+            counted(recent, state == _EXPIRED),
+        ).where(AlertModel.host == host)
+        with self.engine.connect() as connection:
+            open_, fired, pending, failed, expired = connection.execute(statement).one()
+        return AlertCounts(
+            open=int(open_),
+            fired=int(fired),
+            pending=int(pending),
+            failed=int(failed),
+            expired=int(expired),
+        )
+
     # Reads for the web UI.
 
     def board(self, *, ended_since_ms: int, closed_limit: int) -> BoardRows:
@@ -767,6 +1292,110 @@ class Repository:
         with self.engine.connect() as connection:
             rows = connection.execute(statement).mappings().all()
             return _strip_rows(connection, rows)
+
+
+def _capped(limit: int, maximum: int) -> int:
+    """``limit`` within 0 and ``maximum``: a read never returns more than its cap."""
+    return max(0, min(limit, maximum))
+
+
+def _insert_alert(
+    host: str, fired: AlertFired, discord_state: DiscordState, discord_next_at_ms: int | None
+) -> Insert:
+    """The insert of an alert that fired: a ``daily_cost`` alert has no session."""
+    return insert(AlertModel).values(
+        host=host,
+        rule=fired.rule,
+        session_id=None if fired.rule == _DAILY_COST else fired.subject,
+        subject=fired.subject,
+        fired_at_ms=fired.fired_at_ms,
+        value=fired.value,
+        threshold=fired.threshold,
+        discord_state=discord_state,
+        discord_next_at_ms=discord_next_at_ms,
+    )
+
+
+def _clear_alert(host: str, cleared: AlertCleared) -> Update:
+    """The clear of a key's open alerts, never earlier than their fire."""
+    return (
+        update(AlertModel)
+        .where(*_open_key(host, cleared.rule, cleared.subject))
+        .values(cleared_at_ms=func.max(cleared.cleared_at_ms, AlertModel.fired_at_ms))
+    )
+
+
+def _open_key(host: str, rule: str, subject: str) -> tuple[ColumnElement[bool], ...]:
+    """The open alerts of a key: a range of the partial index ``ix_alerts_open``."""
+    return (
+        AlertModel.host == host,
+        AlertModel.rule == rule,
+        AlertModel.subject == subject,
+        AlertModel.cleared_at_ms.is_(None),
+    )
+
+
+def _alert(row: RowMapping) -> AlertRecord:
+    # The CHECK constraints keep rule and discord_state to the typed values.
+    return AlertRecord(
+        id=row["id"],
+        rule=_RULES[row["rule"]],
+        subject=row["subject"],
+        session_id=row["session_id"],
+        fired_at_ms=row["fired_at_ms"],
+        cleared_at_ms=row["cleared_at_ms"],
+        value=row["value"],
+        threshold=row["threshold"],
+        discord_state=_DISCORD_STATES[row["discord_state"]],
+        discord_attempts=row["discord_attempts"],
+        discord_next_at_ms=row["discord_next_at_ms"],
+    )
+
+
+_KIND_NAMES: Final[Mapping[type, str]] = {
+    bool: "true or false",
+    int: "a whole number",
+    float: "a finite number",
+}
+
+
+def _typed(kind: type, value: object) -> bool:
+    """Whether ``value`` has the type of a setting of ``kind``: a bool for a switch, an
+    int (never a bool) for a whole number, an int or a finite float (never a bool) for a
+    dollar amount."""
+    if kind is bool:
+        return isinstance(value, bool)
+    if isinstance(value, bool):
+        return False
+    if kind is int:
+        return isinstance(value, int)
+    return isinstance(value, int) or (isinstance(value, float) and math.isfinite(value))
+
+
+def _encoded_setting(field: str, value: AlertSettingValue) -> str:
+    """A setting's value as stored (JSON keeps ``true``, ``30`` and ``30.0`` apart).
+    ``ValueError`` for a name outside ``ALERT_SETTING_TYPES`` or a value of the wrong
+    type; the message never holds the value, nor an unknown name."""
+    kind = ALERT_SETTING_TYPES.get(field)
+    if kind is None:
+        raise ValueError("not an alert setting")
+    if not _typed(kind, value):
+        raise ValueError(f"{field} must be {_KIND_NAMES[kind]}")
+    return json.dumps(value, allow_nan=False)
+
+
+def _decoded_setting(field: str, stored: str) -> AlertSettingValue | None:
+    """The value of a saved setting, or ``None`` when the row is not a valid one."""
+    kind = ALERT_SETTING_TYPES.get(field)
+    if kind is None:
+        return None
+    try:
+        value: object = json.loads(stored)
+    except ValueError:
+        return None
+    if not _typed(kind, value) or not isinstance(value, bool | int | float):
+        return None
+    return value
 
 
 def _widened[K](

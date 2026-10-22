@@ -579,3 +579,63 @@ def test_settings_are_frozen() -> None:
 
     with pytest.raises(ValueError, match="frozen"):
         settings.port = 1
+
+
+# The app as the browser opens it, for the links in Discord messages (ADR 0046).
+
+
+def test_app_url_defaults_to_the_published_port_on_localhost() -> None:
+    assert load_settings().app_url == "http://localhost:4300"
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("http://localhost:4300", "http://localhost:4300"),
+        ("http://localhost:24300/", "http://localhost:24300"),
+        ("http://127.0.0.1:4300", "http://127.0.0.1:4300"),
+        ("http://[::1]:4300", "http://[::1]:4300"),
+        ("http://localhost", "http://localhost"),
+        ("http://localhost:65535", "http://localhost:65535"),
+    ],
+)
+def test_app_url_accepts_http_on_the_hosts_the_app_answers(
+    monkeypatch: pytest.MonkeyPatch, value: str, expected: str
+) -> None:
+    monkeypatch.setenv("CCOBS_APP_URL", value)
+
+    assert load_settings().app_url == expected
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "",
+        "localhost:4300",
+        "https://localhost:4300",
+        "http://example.com:4300",
+        "http://localhost.example.com:4300",
+        "http://user@localhost:4300",
+        "http://localhost:4300/path",
+        "http://localhost:4300?x=1",
+        "http://localhost:4300#top",
+        "http://localhost:0",
+        "http://localhost:65536",
+        "http://localhost:",
+        "http://localhost:04300",
+        " http://localhost:4300",
+        "http://localhost:4300\n",
+        # Non-ASCII digits (fullwidth), which a bare \d would take.
+        "http://localhost:\uff14\uff13\uff10\uff10",
+    ],
+)
+def test_app_url_rejects_anything_else_without_echoing_it(
+    monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    monkeypatch.setenv("CCOBS_APP_URL", value)
+
+    with pytest.raises(SettingsError, match="CCOBS_APP_URL") as caught:
+        load_settings()
+    assert "localhost" in str(caught.value)
+    if value.strip():
+        assert value.strip() not in str(caught.value)

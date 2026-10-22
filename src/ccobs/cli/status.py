@@ -2,15 +2,17 @@
 
 A subset of ``ccobs doctor``: whether the app, the collector's OTLP/HTTP port and
 Grafana answer, whether setup's hooks and telemetry ``env`` are in the user settings
-file, and the session counts by state, the open blocks and the last hour's hook
-failures from the app's ``GET /api/v1/diagnostics`` (ADR 0038), parsed by
+file, and the session counts by state, the open blocks, the last hour's hook failures
+and the alerts with their Discord delivery (ADR 0046) from the app's
+``GET /api/v1/diagnostics`` (ADR 0038), parsed by
 ``ccobs.domain.diagnostics.parse_diagnostics`` as doctor does. It runs no command and
 reads no managed source; the four network probes run at once, so the whole command
 waits at most ``DIAGNOSTICS_TIMEOUT_S``.
 
-Output: about eight lines, or ``--json``. Exit 0 unless the app does not answer (1); 2
-on a usage error. No output quotes a value read from a settings file or the
-environment: settings are summarized as states, and the URLs shown are the stack's own.
+Output: about nine lines, or ``--json``. Exit 0 unless the app does not answer (1); 2
+on a usage error; Discord's state never changes it. No output quotes a value read from
+a settings file or the environment: settings are summarized as states, and the URLs
+shown are the stack's own (never the webhook's).
 
 Standard library only: the CLI stays light (tests/test_cli_light.py).
 """
@@ -42,8 +44,10 @@ from ccobs.cli.settings_file import ConfigDirError, SettingsFileError
 from ccobs.cli.streams import tolerate_unencodable
 from ccobs.domain import doctor as rules
 from ccobs.domain.diagnostics import (
+    AlertsUnavailable,
     CountedHookFailures,
     Diagnostics,
+    ReportedAlerts,
     ReportedSessions,
     UncountedHookFailures,
     parse_diagnostics,
@@ -89,6 +93,14 @@ _UNAVAILABLE_TEXT: Final[Mapping[_Unavailable, str]] = {
     # An app built before ADR 0038 has no such route.
     "no_route": "unknown (the app predates /api/v1/diagnostics; rebuild it)",
     "not_understood": "unknown (the app's diagnostics were not understood)",
+}
+# Why the diagnostics hold no alerts to show (ADR 0046).
+_ALERTS_UNAVAILABLE_TEXT: Final[Mapping[AlertsUnavailable, str]] = {
+    "unread": "unknown (the app could not read its alerts)",
+    # An app older than v0.6.0.
+    "predates": "unknown (the app predates alerts; rebuild it)",
+    # An app newer or older than the CLI changed the part; the rest still shows.
+    "not_understood": "unknown (the app's alerts were not understood)",
 }
 
 
@@ -250,6 +262,22 @@ def _failures_line(summary: _Summary) -> str:
     )
 
 
+def _alerts_line(summary: _Summary) -> str:
+    if summary.diagnostics is None:
+        return f"Alerts: {_unavailable_text(summary)}"
+    alerts = summary.diagnostics.alerts
+    if not isinstance(alerts, ReportedAlerts):
+        return f"Alerts: {_ALERTS_UNAVAILABLE_TEXT[alerts]}"
+    discord = alerts.discord
+    if not discord.configured:
+        state = "off"
+    elif discord.suspended_status is not None:
+        state = f"suspended (status {discord.suspended_status})"
+    else:
+        state = "on"
+    return f"Alerts: {alerts.open} on; Discord: {state}"
+
+
 def _text_lines(summary: _Summary) -> Sequence[str]:
     version = f"cc-observatory {ccobs.__version__}"
     diagnostics = summary.diagnostics
@@ -268,6 +296,7 @@ def _text_lines(summary: _Summary) -> Sequence[str]:
         _settings_line(summary.settings),
         f"Sessions: {sessions}",
         _failures_line(summary),
+        _alerts_line(summary),
         "Run `ccobs doctor` for details.",
     ]
 
@@ -276,6 +305,12 @@ def _failures_json(failures: CountedHookFailures | UncountedHookFailures) -> dic
     if isinstance(failures, UncountedHookFailures):
         return {"available": False, "reason": failures.reason, "window_s": failures.window_s}
     return {"available": True, "window_s": failures.window_s, **asdict(failures.counts)}
+
+
+def _alerts_json(alerts: ReportedAlerts | AlertsUnavailable) -> dict[str, object]:
+    if isinstance(alerts, ReportedAlerts):
+        return {"available": True, **asdict(alerts)}
+    return {"available": False, "reason": alerts}
 
 
 def _json_document(summary: _Summary) -> dict[str, object]:
@@ -295,6 +330,7 @@ def _json_document(summary: _Summary) -> dict[str, object]:
         "hook_failures": (
             _failures_json(diagnostics.hook_failures) if diagnostics is not None else None
         ),
+        "alerts": _alerts_json(diagnostics.alerts) if diagnostics is not None else None,
     }
 
 

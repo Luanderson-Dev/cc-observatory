@@ -1142,7 +1142,189 @@ def test_no_rule_quotes_a_secret_value() -> None:
         ),
         doctor.check_stack_readable([StatEntry("stack", True, 0, "Permission denied")]),
         doctor.check_diagnostics(_answer(_diagnostics(host=PLANTED)), cli_version="0.5.0"),
+        doctor.check_alerts(
+            _answer(_diagnostics(host=PLANTED, alerts=_alerts({"suspended_status": 404})))
+        ),
     ]
 
     assert all(PLANTED not in _texts(check) for check in checks)
     assert {check.status for check in checks} >= {"warn", "fail"}
+
+
+# The alerts check (ADR 0046): Discord delivery, from the diagnostics answer.
+
+
+def _alerts(discord: dict[str, object] | None = None, **change: object) -> dict[str, object]:
+    alerts: dict[str, object] = {
+        "rules": ["waiting_user", "repeated_failures"],
+        "open": 2,
+        "fired_24h": 5,
+        "discord": {
+            "configured": True,
+            "suspended_status": None,
+            "pending": 0,
+            "failed_24h": 0,
+            "expired_24h": 0,
+            **(discord or {}),
+        },
+    }
+    alerts.update(change)
+    return alerts
+
+
+def _alerts_check(alerts: object) -> Check:
+    return doctor.check_alerts(_answer(_diagnostics(alerts=alerts)))
+
+
+def test_alerts_ok_when_discord_delivers() -> None:
+    check = _alerts_check(_alerts())
+
+    assert check.id == "alerts"
+    assert check.status == "ok"
+    assert check.fix is None
+    assert "2 on, 5 fired in the last 24 h; rules on: waiting_user, repeated_failures." in (
+        check.detail
+    )
+    assert "Discord is configured." in check.detail
+
+
+def test_alerts_ok_names_deliveries_waiting() -> None:
+    check = _alerts_check(_alerts({"pending": 3}))
+
+    assert check.status == "ok"
+    assert "Discord is configured; 3 alerts waiting to be sent." in check.detail
+
+
+def test_alerts_with_no_rule_on_say_so() -> None:
+    check = _alerts_check(_alerts(rules=[]))
+
+    assert "rules on: none." in check.detail
+
+
+def test_discord_not_configured_is_info() -> None:
+    check = _alerts_check(_alerts({"configured": False}))
+
+    # The browser alone is a valid setup, not a problem (ADR 0046).
+    assert check.status == "info"
+    assert "Discord is not configured; alerts show in the browser only." in check.detail
+    assert check.fix is None
+
+
+@pytest.mark.parametrize(
+    ("failed", "expired", "line"),
+    [
+        (1, 0, "1 alert did not reach Discord in the last 24 h (1 failed, 0 expired)."),
+        (0, 1, "1 alert did not reach Discord in the last 24 h (0 failed, 1 expired)."),
+        (2, 3, "5 alerts did not reach Discord in the last 24 h (2 failed, 3 expired)."),
+    ],
+)
+def test_undelivered_alerts_warn(failed: int, expired: int, line: str) -> None:
+    check = _alerts_check(_alerts({"failed_24h": failed, "expired_24h": expired}))
+
+    assert check.status == "warn"
+    assert line in check.detail
+    assert "docker compose logs app" in (check.fix or "")
+
+
+@pytest.mark.parametrize("status", [401, 403, 404])
+def test_a_suspended_webhook_fails(status: int) -> None:
+    check = _alerts_check(_alerts({"suspended_status": status, "failed_24h": 1}))
+
+    assert check.status == "fail"
+    assert (
+        f"Discord refused the webhook (status {status}); sending is suspended until the app"
+        " restarts." in check.detail
+    )
+    assert check.fix == (
+        "check CCOBS_DISCORD_WEBHOOK_URL in the stack's .env, then `docker compose up -d`"
+    )
+
+
+def test_an_app_that_predates_alerts_is_info() -> None:
+    document = _diagnostics()
+    assert "alerts" not in document
+
+    check = doctor.check_alerts(_answer(document))
+
+    assert check.status == "info"
+    assert check.title == "the app predates alerts"
+    assert "rebuild the app" in (check.fix or "")
+
+
+def test_alerts_the_app_could_not_read_warn() -> None:
+    check = _alerts_check(None)
+
+    assert check.status == "warn"
+    assert "could not read its alerts" in check.detail
+    assert "docker compose logs app" in (check.fix or "")
+
+
+def test_alerts_skipped_when_the_app_is_down() -> None:
+    check = doctor.check_alerts(None)
+
+    assert check.status == "info"
+    assert check.detail == "Skipped: the app is down."
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        HttpAnswer(404, b'{"detail": "Not Found"}'),
+        HttpAnswer(503, b'{"detail": "busy"}'),
+        HttpAnswer(None),
+    ],
+)
+def test_alerts_skipped_without_diagnostics(answer: HttpAnswer) -> None:
+    check = doctor.check_alerts(answer)
+
+    # The diagnostics check already warns on the answer itself.
+    assert check.status == "info"
+    assert check.detail == "Skipped: no diagnostics from the app (see `diagnostics` above)."
+    assert check.fix is None
+
+
+@pytest.mark.parametrize("body", [b"not json", b"{}", json.dumps({"version": 1}).encode()])
+def test_alerts_skipped_when_the_diagnostics_were_not_understood(body: bytes) -> None:
+    check = doctor.check_alerts(HttpAnswer(200, body))
+
+    assert check.status == "info"
+    assert check.detail == "Skipped: the app's diagnostics were not understood."
+
+
+@pytest.mark.parametrize(
+    "alerts",
+    [[], "on", _alerts({"suspended_status": "404"}), _alerts(open={"count": 2})],
+)
+def test_alerts_not_understood_warn(alerts: object) -> None:
+    check = _alerts_check(alerts)
+
+    assert check.status == "warn"
+    assert check.title == "the app's alerts were not understood"
+    assert check.detail == "The app's alerts were not understood (a newer or older app?)."
+    fix = check.fix or ""
+    assert "uvx cc-observatory@latest" in fix
+    assert "docker compose build app" in fix
+    assert "logs" not in fix
+
+
+def test_alerts_not_understood_leave_the_diagnostics_check_alone() -> None:
+    answer = _answer(_diagnostics(alerts=_alerts(open="2")))
+
+    check = doctor.check_diagnostics(answer, cli_version="0.5.0")
+
+    assert check.title != "the app's diagnostics were not understood"
+
+
+def test_the_alerts_check_never_shows_a_webhook_url() -> None:
+    url = f"https://discord.com/api/webhooks/1/{PLANTED}"
+    document = _diagnostics(
+        host=url,
+        alerts=_alerts({"suspended_status": 404, "webhook": url}, rules=[url, "daily_cost"]),
+    )
+
+    check = doctor.check_alerts(_answer(document))
+
+    assert check.status == "fail"
+    assert "rules on: daily_cost." in check.detail
+    assert PLANTED not in _texts(check)
+    assert "/webhooks/" not in _texts(check)

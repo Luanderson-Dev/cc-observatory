@@ -19,6 +19,7 @@ import threading
 import time
 from collections import Counter
 from collections.abc import Callable, Iterator, Sequence
+from concurrent.futures import Future
 from contextlib import contextmanager
 from datetime import timedelta
 from pathlib import Path
@@ -29,6 +30,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import Engine, func, select
 from sqlalchemy.exc import OperationalError
 
+from ccobs.domain.alerts import AlertConfig, CostSample
 from ccobs.domain.app_metrics import EVENT_LABELS, event_label
 from ccobs.domain.denials import OpenBlock
 from ccobs.domain.hook_config import HOOK_PATH
@@ -45,7 +47,14 @@ from ccobs.server.db.models import (
     SessionModel,
     SessionStateModel,
 )
-from ccobs.server.db.repository import Applied, HookEventRow, Repository, hook_event_row
+from ccobs.server.db.repository import (
+    Applied,
+    DeliveryUpdate,
+    DueDeliveries,
+    HookEventRow,
+    Repository,
+    hook_event_row,
+)
 from ccobs.server.ingest import DROP_REASONS, HookQueue, RawHook
 from ccobs.server.live import ChangeHub
 from ccobs.server.migrations import upgrade_to_head
@@ -192,7 +201,7 @@ class FlakyRepository(Repository):
             )
         super().apply_batch(host, items)
 
-    def delete_older_than(self, cutoff_ms: int) -> int:
+    def delete_older_than(self, cutoff_ms: int) -> frozenset[str]:
         if self.fail_retention:
             raise OperationalError("DELETE FROM sessions", None, Exception(PRIVATE_PATH))
         return super().delete_older_than(cutoff_ms)
@@ -397,11 +406,33 @@ def test_the_lifespan_uses_an_injected_writer_factory(settings: Settings) -> Non
         def submit_retention(self, cutoff_ms: int) -> None:
             calls.append(("retention", cutoff_ms))
 
+        def submit_alert_tick(self, now_ms: int) -> None:
+            calls.append(("alert tick", now_ms))
+
         def submit_telemetry_close(self, session_id: str, tool_use_id: str, at_ms: int) -> None:
             calls.append(("close", at_ms))
 
         def open_permission_blocks(self) -> list[OpenBlock]:
             return []
+
+        def alert_config(self) -> AlertConfig:
+            return AlertConfig()
+
+        def session_cost_since(self) -> int | None:
+            return None
+
+        def submit_cost_sample(self, sample: CostSample) -> None:
+            pass
+
+        def submit_discord_round(
+            self, now_ms: int, *, expire_before_ms: int, limit: int
+        ) -> Future[DueDeliveries]:
+            found: Future[DueDeliveries] = Future()
+            found.set_result(DueDeliveries(expired=0, alerts=[]))
+            return found
+
+        def submit_discord_results(self, updates: Sequence[DeliveryUpdate]) -> None:
+            pass
 
         def counts(self) -> WriterCounts:
             return WriterCounts(

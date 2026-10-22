@@ -33,7 +33,7 @@ from ccobs.domain.app_metrics import UI_STREAMS, UI_STREAMS_REFUSED
 from ccobs.server import __main__ as server_main
 from ccobs.server import live
 from ccobs.server.app import create_app
-from ccobs.server.changes import ALL
+from ccobs.server.changes import ALERTS, ALL
 from ccobs.server.config import Settings
 from ccobs.server.live import ChangeHub, StreamTiming, Subscription, encode_change
 from ccobs.server.metrics import AppMetrics
@@ -265,6 +265,90 @@ def test_notify_threadsafe_reaches_subscribers_from_another_thread() -> None:
     assert run(body) == frozenset({SID})
 
 
+def test_an_alerts_change_marks_every_stream_but_no_session() -> None:
+    # The writer publishes ALERTS after a fire or a clear (ADR 0041): every stream,
+    # filtered on a session or not, gets the alerts ping (ADR 0044), and no session is
+    # marked as changed.
+    hub = ChangeHub()
+
+    async def body() -> list[tuple[bool, bool, object, bool]]:
+        hub.open(asyncio.get_running_loop())
+        subscriptions = [hub.subscribe(None), hub.subscribe(SID), hub.subscribe(OTHER)]
+        hub.publish(ALERTS)
+        hub.publish(ALERTS)
+        seen: list[tuple[bool, bool, object, bool]] = []
+        for subscription in subscriptions:
+            assert subscription is not None
+            woke = await subscription.wait(1.0)
+            alerts = subscription.take_alerts()
+            change = subscription.take()
+            # Taken: nothing is pending until the next change.
+            seen.append((woke, alerts, change, await subscription.wait(0.01)))
+        return seen
+
+    assert run(body) == [(True, True, frozenset(), False)] * 3
+
+
+def test_taking_the_changes_keeps_the_alerts_pending_and_back() -> None:
+    hub = ChangeHub()
+
+    async def body() -> None:
+        hub.open(asyncio.get_running_loop())
+        subscription = hub.subscribe(SID)
+        assert subscription is not None
+        hub.publish(ALERTS)
+        hub.publish(frozenset({SID}))
+        assert subscription.take() == frozenset({SID})
+        # The alerts are still pending, so the stream still wakes for them.
+        assert await subscription.wait(0.5)
+        assert subscription.take_alerts()
+        assert not subscription.take_alerts()
+        assert not await subscription.wait(0.01)
+
+        hub.publish(frozenset({SID}))
+        hub.publish(ALERTS)
+        assert subscription.take_alerts()
+        assert await subscription.wait(0.5)
+        assert subscription.take() == frozenset({SID})
+        assert not await subscription.wait(0.01)
+
+    run(body)
+
+
+def test_a_stream_pings_alerts_without_data_and_apart_from_the_changes() -> None:
+    hub = ChangeHub()
+
+    async def body() -> list[bytes]:
+        hub.open(asyncio.get_running_loop())
+        subscription = hub.subscribe(SID)
+        assert subscription is not None
+        stream = live.stream_events(subscription, FAST)
+        chunks = [await anext(stream)]
+        # Alerts alone: the ping, no changed event.
+        waiting = asyncio.ensure_future(anext(stream))
+        await asyncio.sleep(0)
+        hub.publish(ALERTS)
+        chunks.append(await waiting)
+        # A change and alerts in one burst: the changed event, then the ping.
+        waiting = asyncio.ensure_future(anext(stream))
+        await asyncio.sleep(0)
+        hub.publish(ALERTS)
+        hub.publish(frozenset({SID}))
+        chunks.append(await waiting)
+        chunks.append(await anext(stream))
+        await stream.aclose()
+        return chunks
+
+    assert run(body) == [
+        b"retry: 5000\n\n",
+        live.ALERTS_EVENT,
+        f'event: changed\ndata: ["{SID}"]\n\n'.encode(),
+        live.ALERTS_EVENT,
+    ]
+    # A fixed marker: nothing about the alert, its session or its value.
+    assert live.ALERTS_EVENT == b"event: alerts\ndata: alerts\n\n"
+
+
 def test_notify_threadsafe_schedules_nothing_without_subscribers_or_a_loop() -> None:
     loop = mock.create_autospec(asyncio.AbstractEventLoop, instance=True)
     hub = ChangeHub()
@@ -299,7 +383,9 @@ def test_a_closed_subscription_ignores_changes() -> None:
         assert subscription is not None
         subscription.close()
         subscription.offer(frozenset({SID}))
+        subscription.offer_alerts()
         assert subscription.take() == frozenset()
+        assert not subscription.take_alerts()
 
     run(body)
 
@@ -419,6 +505,22 @@ def test_a_session_stream_skips_other_sessions(client: TestClient) -> None:
     response = stream(client, f"{live.STREAM_PATH}?session={SID}", during=during)
 
     assert response.text == f'retry: 5000\n\nevent: changed\ndata: ["{SID}"]\n\n'
+
+
+@pytest.mark.parametrize("url", [live.STREAM_PATH, f"{live.STREAM_PATH}?session={SID}"])
+def test_the_alerts_ping_reaches_every_stream(client: TestClient, url: str) -> None:
+    def during(hub: ChangeHub) -> None:
+        hub.notify_threadsafe(ALERTS)
+        time.sleep(SETTLE_S)
+        hub.notify_threadsafe(frozenset({SID}))
+        time.sleep(SETTLE_S)
+
+    response = stream(client, url, during=during)
+
+    # The ping carries a fixed marker only; the changed event is as before.
+    assert response.text == (
+        f'retry: 5000\n\nevent: alerts\ndata: alerts\n\nevent: changed\ndata: ["{SID}"]\n\n'
+    )
 
 
 def test_heartbeats_keep_an_idle_stream_open(settings: Settings) -> None:
@@ -607,7 +709,9 @@ const status = {
   textContent: '',
   getAttribute(name) { return name === 'data-stream' ? '/ui/stream?session=s' : null; },
 };
-const body = { dispatchEvent(event) { log.push('changed:' + event.type); } };
+const body = {
+  dispatchEvent(event) { log.push('changed:' + event.type + (event.bubbles ? ':bubbles' : '')); },
+};
 const document = {
   readyState: 'complete', body,
   getElementById(id) { return id === 'live-status' ? status : null; },
@@ -623,7 +727,9 @@ class FakeSource {
   close() { this.closed = true; log.push('close'); }
   fire(name) { this.handlers[name]({ type: name }); }
 }
-class FakeEvent { constructor(type) { this.type = type; } }
+class FakeEvent {
+  constructor(type, init) { this.type = type; this.bubbles = Boolean(init && init.bubbles); }
+}
 const window = {
   EventSource: FakeSource, Event: FakeEvent,
   setTimeout(fn, ms) { timers.push([fn, ms]); log.push('wait:' + ms); return timers.length; },
@@ -636,6 +742,7 @@ const first = sources[0];
 first.fire('open');
 log.push('status:' + status.textContent);
 first.fire('changed');
+first.fire('alerts');
 first.fire('error');
 log.push('status:' + status.textContent);
 for (let n = 0; n < 6; n += 1) {
@@ -673,13 +780,17 @@ def test_live_js_reconnects_with_backoff_and_refetches_on_open() -> None:
     log = json.loads(completed.stdout)
     paused = "status:Live updates paused. Reconnecting\u2026"
     url = "open:/ui/stream?session=s"
+    alerts = "changed:ccobs:alerts:bubbles"
 
     assert log == [
         url,
-        # Every open, the first one included, makes the page refetch.
+        # Every open, the first one included, makes the page refetch, the alerts too.
         "changed:ccobs:changed",
+        alerts,
         "status:",
         "changed:ccobs:changed",
+        # An alerts ping is its own event, which bubbles to document (ADR 0044).
+        alerts,
         # An error closes the source (no browser retry storm on a 503) and waits.
         "close",
         "wait:5000",
@@ -704,6 +815,7 @@ def test_live_js_reconnects_with_backoff_and_refetches_on_open() -> None:
         "wait:60000",
         url,
         "changed:ccobs:changed",
+        alerts,
         "status:",
         # After an open the backoff starts over.
         "close",

@@ -1,0 +1,9 @@
+{#- The Discord test button (alert_settings.py, ADR 0046): htmx posts it to the guarded
+    POST route and swaps the answer, this fragment with a status line, in its place.
+    The line never holds the webhook URL. -#}
+<div id="discord-test" class="discord-test">
+  <button type="button" class="discord-test__send" hx-post="{{ discord_test_path }}" hx-target="#discord-test" hx-swap="outerHTML">Send test message</button>
+  {% if discord_test_message %}
+  <p class="discord-test__status" role="status">{{ discord_test_message }}</p>
+  {% endif %}
+</div>

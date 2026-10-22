@@ -169,8 +169,10 @@ a new ADR supersedes it, and only the old one's status line changes.
   `cross-site` or `same-site` gets a 403 unless it is a top-level `GET` navigation), a
   strict CSP, `Cross-Origin-Resource-Policy` and `Cross-Origin-Opener-Policy`
   `same-origin`, `nosniff`, `no-referrer` and `Cache-Control: no-store` outside
-  `/static/` (ADR 0034). Every route but the hook route is `GET`-only. The hook route
-  is exempt and keeps its empty 2xx with no added header.
+  `/static/` (ADR 0034). Every route but the hook route is `GET`-only, except the alert
+  settings routes and the Discord test button (`POST /ui/alerts/discord/test`), guarded
+  as ADR 0045. The hook route is exempt and keeps its
+  empty 2xx with no added header.
 - Keep a `host` label on stored data for a future central mode, without implementing it.
 
 ### Code
@@ -241,7 +243,8 @@ tests/fixtures/   sanitized real payloads (hooks and OTLP) captured from Claude 
 tools/capture/    dev-only fixture capture tooling (not packaged; tests import it
                   through `pythonpath = ["."]`); its `out/` holds raw data, never committed
 tools/stack/      dev-only stack tools (not packaged): OTLP replay, isolated ccobs-it
-                  project, memory per service, egress sink override
+                  project, memory per service, egress sink override, in-process hook
+                  replay shared by unit tests
 docs/stack.md     operator reference for the stack (settings, memory, troubleshooting)
 docs/app.md       operator reference for the app (web UI, hook settings, API, metrics,
                   data, troubleshooting)

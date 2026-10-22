@@ -162,7 +162,13 @@ __all__ = [
     "SESSIONS_PAGE_SIZE",
     "STATIC_DIR",
     "TEMPLATES_DIR",
+    "ErrorView",
+    "Moment",
     "StaticAssets",
+    "gated_read",
+    "grafana_home",
+    "moment",
+    "render",
     "router",
 ]
 
@@ -233,6 +239,8 @@ _environment: Final = Environment(
     lstrip_blocks=True,
     keep_trailing_newline=True,
 )
+# The stream of a page that names none of its own: every page streams (ADR 0044).
+_environment.globals["stream_path"] = STREAM_PATH
 
 
 # View objects: what the templates see.
@@ -313,7 +321,7 @@ _NO_SESSION: Final = ErrorView(
 )
 
 
-def _moment(since_ms: int, now_ms: int) -> Moment:
+def moment(since_ms: int, now_ms: int) -> Moment:
     at = datetime.fromtimestamp(since_ms / 1000, UTC)
     return Moment(
         iso=at.strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -365,7 +373,7 @@ def _strip(row: StripRow, now_ms: int) -> Strip:
         doing=doing,
         agents=None if agents == doing else agents,
         error_code=session.last_error_code,
-        elapsed=_moment(since, now_ms),
+        elapsed=moment(since, now_ms),
         elapsed_kind=elapsed_kind,
     )
 
@@ -445,6 +453,12 @@ def _render(name: str, *, status_code: int = 200, **context: object) -> HTMLResp
     return HTMLResponse(body, status_code=status_code)
 
 
+def render(name: str, *, status_code: int = 200, **context: object) -> HTMLResponse:
+    """The template ``name`` rendered with the UI's environment (autoescape, an undefined
+    name fails), for the UI's other routers (``ccobs.server.alert_settings``)."""
+    return _render(name, status_code=status_code, **context)
+
+
 # Reads: one call on the gate per request.
 
 
@@ -454,7 +468,9 @@ def _board_read(repository: Repository, now_ms: int) -> BoardRows:
     )
 
 
-async def _read[T, *Ts](reads: ReadGate, read: Callable[[*Ts], T], *args: *Ts) -> T | ErrorView:
+async def gated_read[T, *Ts](
+    reads: ReadGate, read: Callable[[*Ts], T], *args: *Ts
+) -> T | ErrorView:
     """``read(*args)`` through the gate, or the error to show: a busy gate (its 503) or
     a failed query. Only the error's type is logged; its message may quote a value."""
     try:
@@ -484,7 +500,7 @@ def _now_ms(request: Request) -> int:
     return clock()
 
 
-def _grafana_home(request: Request) -> str:
+def grafana_home(request: Request) -> str:
     """The header's link: the overview dashboard for the app's host label, over the
     dashboard's own default range."""
     return dashboard_url(request.app.state.grafana_url, host=request.app.state.host_label)
@@ -519,7 +535,7 @@ async def _board_context(
     request: Request, repository: Repository, reads: ReadGate
 ) -> dict[str, object]:
     now_ms = _now_ms(request)
-    rows = await _read(reads, _board_read, repository, now_ms)
+    rows = await gated_read(reads, _board_read, repository, now_ms)
     if isinstance(rows, ErrorView):
         return {"board": None, "error": rows, "hook_json": "", "setup_command": ""}
     board = _board_view(rows, now_ms)
@@ -544,7 +560,7 @@ async def overview(request: Request, repository: _Repo, reads: _Reads) -> Respon
         "overview.html",
         status_code=_status(context),
         nav="overview",
-        grafana_home=_grafana_home(request),
+        grafana_home=grafana_home(request),
         live_stream=STREAM_PATH,
         **context,
     )
@@ -587,7 +603,7 @@ async def all_sessions(
             return _sessions_page(request, status_code=_BAD_REQUEST, paged=True, error=_BAD_CURSOR)
     now_ms = _now_ms(request)
     # One more than a page: whether an older page exists.
-    rows = await _read(reads, _page_read, repository, SESSIONS_PAGE_SIZE + 1, cursor)
+    rows = await gated_read(reads, _page_read, repository, SESSIONS_PAGE_SIZE + 1, cursor)
     if isinstance(rows, ErrorView):
         return _sessions_page(
             request, status_code=_SERVICE_UNAVAILABLE, paged=cursor is not None, error=rows
@@ -620,7 +636,7 @@ def _sessions_page(
         "sessions.html",
         status_code=status_code,
         nav="sessions",
-        grafana_home=_grafana_home(request),
+        grafana_home=grafana_home(request),
         before=paged,
         error=error,
         strips=strips,
@@ -771,7 +787,7 @@ def _session_head(detail: SessionDetail, now_ms: int) -> SessionHead:
             else describe_block(oldest.kind, oldest.tool_name, oldest.mcp_server_name)
         )
         since = session.last_event_at_ms if oldest is None else oldest.opened_at_ms
-        waiting = _moment(since, now_ms)
+        waiting = moment(since, now_ms)
     else:
         running = sum(
             1 for agent in detail.agents if agent.status == "running" and not agent.internal
@@ -797,9 +813,9 @@ def _session_head(detail: SessionDetail, now_ms: int) -> SessionHead:
         doing=None if doing == state_label else doing,
         error_code=session.last_error_code,
         waiting=waiting,
-        started=_moment(session.started_at_ms, now_ms),
-        last_event=_moment(session.last_event_at_ms, now_ms),
-        ended=None if ended is None else _moment(ended, now_ms),
+        started=moment(session.started_at_ms, now_ms),
+        last_event=moment(session.last_event_at_ms, now_ms),
+        ended=None if ended is None else moment(ended, now_ms),
     )
 
 
@@ -810,9 +826,9 @@ def _block_view(block: Block, now_ms: int) -> BlockView:
         is_open=closed_at is None,
         what=describe_block(block.kind, block.tool_name, block.mcp_server_name),
         scope=None if block.scope is None else block.scope[:_SHORT_ID],
-        opened=_moment(block.opened_at_ms, now_ms),
+        opened=moment(block.opened_at_ms, now_ms),
         waited=None if closed_at is None else format_duration(closed_at - block.opened_at_ms),
-        closed=None if closed_at is None else _moment(closed_at, now_ms),
+        closed=None if closed_at is None else moment(closed_at, now_ms),
         close=None if closed_at is None else describe_block_close(block.kind, block.close_reason),
     )
 
@@ -853,8 +869,8 @@ def _agent_views(
                 status_text="Running" if running else describe_agent_stop(agent.stop_reason),
                 internal=agent.internal,
                 background=agent.background,
-                started=None if started is None else _moment(started, now_ms),
-                stopped=None if stopped is None else _moment(stopped, now_ms),
+                started=None if started is None else moment(started, now_ms),
+                stopped=None if stopped is None else moment(stopped, now_ms),
                 ran=(
                     None
                     if started is None or stopped is None
@@ -907,7 +923,7 @@ def _event_view(row: HookEventRow, now_ms: int) -> EventView:
     return EventView(
         seq=row.seq,
         name=row.hook_event_name,
-        at=_moment(row.received_at_ms, now_ms),
+        at=moment(row.received_at_ms, now_ms),
         details=_event_details(row),
     )
 
@@ -1022,7 +1038,7 @@ def _not_found_page(request: Request) -> HTMLResponse:
         "not_found.html",
         status_code=_NOT_FOUND,
         nav=None,
-        grafana_home=_grafana_home(request),
+        grafana_home=grafana_home(request),
         error=_NO_SESSION,
     )
 
@@ -1035,13 +1051,13 @@ async def session_page(
     if not is_valid_session_id(session_id):
         return _not_found_page(request)
     now_ms = _now_ms(request)
-    found = await _read(reads, _session_read, repository, session_id, EVENTS_PAGE_SIZE + 1)
+    found = await gated_read(reads, _session_read, repository, session_id, EVENTS_PAGE_SIZE + 1)
     if isinstance(found, ErrorView):
         return _render(
             "session.html",
             status_code=_SERVICE_UNAVAILABLE,
             nav=None,
-            grafana_home=_grafana_home(request),
+            grafana_home=grafana_home(request),
             error=found,
         )
     if found is None:
@@ -1067,7 +1083,7 @@ async def session_page(
     return _render(
         "session.html",
         nav=None,
-        grafana_home=_grafana_home(request),
+        grafana_home=grafana_home(request),
         error=None,
         grafana=_grafana_session(request, detail.session),
         live_stream=_live_stream(session_id),
@@ -1129,7 +1145,9 @@ async def blocks_fragment(
     if cursor is None:
         return _fragment_error(_BAD_LINK, _BAD_REQUEST)
     now_ms = _now_ms(request)
-    found = await _read(reads, _blocks_read, repository, session_id, BLOCKS_PAGE_SIZE + 1, cursor)
+    found = await gated_read(
+        reads, _blocks_read, repository, session_id, BLOCKS_PAGE_SIZE + 1, cursor
+    )
     if isinstance(found, ErrorView):
         return _fragment_error(found, _SERVICE_UNAVAILABLE)
     if found is None:
@@ -1177,7 +1195,9 @@ async def agents_fragment(
     if before is None or not is_valid_session_id(before):
         return _fragment_error(_BAD_LINK, _BAD_REQUEST)
     now_ms = _now_ms(request)
-    found = await _read(reads, _agents_read, repository, session_id, AGENTS_PAGE_SIZE + 1, before)
+    found = await gated_read(
+        reads, _agents_read, repository, session_id, AGENTS_PAGE_SIZE + 1, before
+    )
     if isinstance(found, ErrorView):
         return _fragment_error(found, _SERVICE_UNAVAILABLE)
     if isinstance(found, _UnknownAgent):
@@ -1228,7 +1248,7 @@ async def events_fragment(
     if (before is None) == (after is None) or (older is None and newer is None):
         return _fragment_error(_BAD_LINK, _BAD_REQUEST)
     now_ms = _now_ms(request)
-    found = await _read(
+    found = await gated_read(
         reads, _events_read, repository, session_id, EVENTS_PAGE_SIZE + 1, older, newer
     )
     if isinstance(found, ErrorView):
@@ -1335,7 +1355,7 @@ async def live_fragment(
     block_window, agent_window = windows
     # Before the read: a window that starts over takes rows closed from here on.
     now_ms = _now_ms(request)
-    found = await _read(reads, _live_read, repository, session_id, block_window, agent_window)
+    found = await gated_read(reads, _live_read, repository, session_id, block_window, agent_window)
     if isinstance(found, ErrorView):
         return _fragment_error(found, _SERVICE_UNAVAILABLE)
     if found is None:
@@ -1432,7 +1452,7 @@ async def usage_fragment(
     if not is_valid_session_id(session_id):
         return _fragment_error(_NO_SESSION, _NOT_FOUND)
     # The read gate's slot is released before Prometheus is asked.
-    found = await _read(reads, _usage_read, repository, session_id)
+    found = await gated_read(reads, _usage_read, repository, session_id)
     if isinstance(found, ErrorView):
         return _usage_fragment(message=f"{found.title}. {found.detail}")
     if found is None:

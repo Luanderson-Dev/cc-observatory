@@ -137,9 +137,23 @@ to each part from the release that ships it.
           `Referrer-Policy: no-referrer` (a link to Grafana carries no address of the
           app's) and, outside the static files, `Cache-Control: no-store`, so the
           browser keeps no copy of a page on disk.
-        - **Read-only.** Every route but the hook endpoint serves only `GET`; the UI
-          has no form and changes nothing, in the app or in Claude Code. It keeps one
-          value in the browser's local storage, the theme.
+        - **Read-only, but for the alert settings.** Every route but the hook endpoint
+          serves only `GET`, and the UI changes nothing in Claude Code. From v0.6.0 the
+          Alerts page has the only exceptions, three `POST` routes: save and reset the
+          alert settings, and send the Discord test message. They accept only a
+          same-origin htmx request: `Sec-Fetch-Site: same-origin` when the browser
+          sends it, exactly one `Origin` equal to the app's own (`<scheme>://<Host>`,
+          with `Host` already on the allowlist), `HX-Request: true` and a urlencoded
+          form; anything else gets a 403, or a 415 for another body type, before the
+          body is read
+          ([ADR 0045](docs/adr/0045-state-changing-routes-and-csrf.md)). A page of
+          another origin cannot forge `Origin`, and can add `HX-Request` only after a
+          CORS preflight, which fails since the app sends no CORS headers; a plain HTML
+          form cannot send it at all. So no web page can change your alert settings or
+          make the app post to Discord through your browser. Any local process still
+          can, like it can post fake hooks. The UI keeps two values in the browser's
+          local storage: the theme and, from v0.6.0, the ID of the newest alert the
+          browser has read, for its notifications.
         - **Less personal data on screen.** The pages never show the full working
           directory: the overview shows the project name, and a session's page the
           path with the home directory as `~`. Homes are recognised by the shape of
@@ -168,8 +182,12 @@ to each part from the release that ships it.
       types (your own agents by name), enumerated values, durations, sizes, the model
       and the working directory; never prompts, tool inputs or outputs, messages, error
       text or other paths
-      ([ADR 0023](docs/adr/0023-per-event-allowlist-of-hook-metadata.md)). Alerts join
-      it in v0.6.0. [docs/app.md](docs/app.md#privacy) has the details;
+      ([ADR 0023](docs/adr/0023-per-event-allowlist-of-hook-metadata.md)). From
+      v0.6.0 it also holds the alerts (the rule, the session ID, the times, the value
+      and the threshold; no content, path or project name) and the alert settings saved
+      on the Alerts page
+      ([ADR 0042](docs/adr/0042-alert-tables-settings-precedence-and-retention.md)).
+      [docs/app.md](docs/app.md#privacy) has the details;
     - Prometheus: metrics from Claude Code's telemetry (tokens, cost, counters) and the
       app's live state;
     - Loki: events from Claude Code's telemetry (API requests and errors, tool results
@@ -211,7 +229,24 @@ to each part from the release that ships it.
     - Prometheus has no remote write or read and no Alertmanager, and the collector
       exports only to Prometheus, Loki and Tempo;
     - Prometheus, Loki and Tempo sit on an internal Docker network with no route out,
-      so they cannot reach the internet even with a wrong setting.
+      so they cannot reach the internet even with a wrong setting;
+    - the app connects to nothing but Loki and Prometheus, over that internal network:
+      Loki to close permission prompts denied with Esc and for the diagnostics of
+      `ccobs doctor` and `status`, and Prometheus for a session page's tokens and
+      cost and, from v0.6.0, for the cost alerts' totals, at most once a minute and
+      only while a cost alert is enabled; those queries hold no session ID and stay on
+      your machine. The optional Discord webhook above is its only connection that
+      leaves your machine, and it exists only while `CCOBS_DISCORD_WEBHOOK_URL` is set:
+      a message per alert (up to ten together) with the rule in words ("Waiting on you
+      for over 31s"), the host label, the short session ID and a local link to the
+      session's page, and the project name only with
+      `CCOBS_DISCORD_INCLUDE_PROJECT=true`; never the working directory or another
+      path, a prompt, a tool input or output, a message or error text, since an alert
+      stores none of them. A message mentions nobody (`allowed_mentions` is empty).
+      The "Send test message" button posts one fixed line with the host label. That
+      connection alone follows the container's `HTTPS_PROXY`, `NO_PROXY` and
+      `SSL_CERT_FILE`, and stops at the first 401, 403 or 404 until the app restarts
+      ([ADR 0046](docs/adr/0046-discord-delivery.md)).
 
   Tests check these settings in the configs and in the running stack, and
   [docs/stack.md](docs/stack.md#checking-that-nothing-leaves-the-machine) describes a
@@ -223,6 +258,21 @@ to each part from the release that ships it.
   if any).
 - **Secrets.** Secrets such as `CCOBS_DISCORD_WEBHOOK_URL` are read from the environment
   and never logged.
+    - The webhook URL holds its token: anyone who has it can post to your channel. The
+      app keeps it in a `SecretStr`, read only by the Discord sender at each post, and
+      never puts it in a log line, a page, an API answer, a metric, a database row or a
+      settings error: it logs only status codes and error types for Discord, and drops
+      the HTTP client's own log lines that name a webhook path
+      ([ADR 0046](docs/adr/0046-discord-delivery.md)). The Alerts page says only
+      whether a webhook is configured.
+    - Docker does show it: `docker compose config` (without `--quiet`) prints it with
+      the other resolved settings, and `docker inspect` of the app container lists it
+      in the container's environment. Keep it in `.env`, which Git ignores, and keep
+      that output, and `.env`, out of issues and screenshots.
+    - If it leaks, delete the webhook in Discord (the server's **Server Settings**,
+      **Integrations**, its webhooks), which makes the old URL useless, create a new
+      one, put the new URL in `.env` and run `docker compose up -d`
+      ([docs/app.md](docs/app.md#discord)).
 - **Settings backup.** `ccobs setup` backs up `~/.claude/settings.json` before changing
   it. The backup holds everything that file holds, including any secrets in its `env`
   block.

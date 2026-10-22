@@ -225,7 +225,7 @@ def test_templates_hold_nothing_the_csp_refuses(scan: re.Pattern[str]) -> None:
 
 def test_own_scripts_never_evaluate_strings() -> None:
     scripts = [path for path in _own_text_files() if path.suffix == ".js"]
-    assert {path.name for path in scripts} >= {"app.js", "live.js", "theme.js"}
+    assert {path.name for path in scripts} >= {"app.js", "live.js", "notify.js", "theme.js"}
     for path in scripts:
         assert not EVAL.search(path.read_text(encoding="utf-8")), path.name
 
@@ -315,6 +315,16 @@ def test_the_session_header_takes_its_band_and_tint_from_the_strip_classes() -> 
     for status in ("waiting_user", "working", "idle", "ended", "stale"):
         assert any("border-left-color" in band for band in _blocks(css, f".strip--{status}"))
     assert css.index(".strip--waiting_user {") < css.index(".session-head {")
+
+
+def test_the_alert_settings_numbers_are_in_the_ui_face_with_tabular_figures() -> None:
+    # Mono is only for identifiers: a setting's number and its range are not.
+    css = APP_CSS.read_text(encoding="utf-8")
+    (field,) = _blocks(css, ".alert-settings__input")
+    assert "font-family: var(--font-sans);" in field
+    assert "font-variant-numeric: tabular-nums;" in field
+    (error,) = _blocks(css, ".alert-settings__error")
+    assert "font-family: var(--font-sans);" in error
 
 
 def test_the_stylesheet_has_light_and_dark_colour_tokens() -> None:

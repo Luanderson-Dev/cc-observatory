@@ -23,6 +23,8 @@ from ccobs.domain.telemetry import HOST_LABEL
 
 __all__ = [
     "AGENTS_RUNNING",
+    "ALERTS_FIRED",
+    "ALERT_DELIVERIES",
     "APP_METRICS",
     "BLOCKS_OPEN",
     "BLOCK_DURATION",
@@ -30,6 +32,7 @@ __all__ = [
     "BLOCK_KINDS",
     "BUILD_INFO",
     "DATABASE_WAL",
+    "DELIVERY_RESULTS",
     "EVENT_LABEL",
     "EVENT_LABELS",
     "HOOK_EVENTS_DROPPED",
@@ -47,6 +50,7 @@ __all__ = [
     "REASON_LABEL",
     "RECEIVED_EVENTS",
     "RESULT_LABEL",
+    "RULE_LABEL",
     "SCRAPE_JOB",
     "SESSIONS",
     "SESSIONS_ENDED",
@@ -56,6 +60,7 @@ __all__ = [
     "UI_STREAMS_REFUSED",
     "VERSION_LABEL",
     "AppMetric",
+    "DeliveryResult",
     "LokiQueryResult",
     "MetricType",
     "PrometheusQueryResult",
@@ -73,6 +78,7 @@ EVENT_LABEL: Final = "event"
 REASON_LABEL: Final = "reason"
 VERSION_LABEL: Final = "version"
 RESULT_LABEL: Final = "result"
+RULE_LABEL: Final = "rule"
 
 # Every status but ended, the values of the state label: ended sessions leave the
 # writer's memory, and the counter of sessions ended stands for them.
@@ -121,6 +127,15 @@ type PrometheusQueryResult = Literal["ok", "error", "timeout", "invalid"]
 PROMETHEUS_RESULTS: Final[tuple[PrometheusQueryResult, ...]] = get_args(
     PrometheusQueryResult.__value__
 )
+
+# What became of an alert's Discord delivery at one round of the sender (ADR 0046): sent
+# (Discord accepted it); retried (no answer, a timeout or a 5xx: tried again later);
+# rate_limited (a 429: tried again after Discord's retry_after); failed (given up: the
+# attempts ran out, or Discord rejected the message for good); expired (still pending an
+# hour after it fired: dropped unsent); suspended (the webhook was refused with 401, 403
+# or 404: the alert failed and sending stops until the app restarts). Counted per alert.
+type DeliveryResult = Literal["sent", "retried", "rate_limited", "failed", "expired", "suspended"]
+DELIVERY_RESULTS: Final[tuple[DeliveryResult, ...]] = get_args(DeliveryResult.__value__)
 
 type MetricType = Literal["gauge", "counter", "histogram"]
 
@@ -243,6 +258,24 @@ UI_STREAMS_REFUSED: Final = AppMetric(
     (HOST_LABEL,),
 )
 
+# The alerts that fired since the app started (ADR 0041), by rule: every rule of
+# ALERT_RULES is exported, with zeros. A fire is counted once its row is committed.
+ALERTS_FIRED: Final = AppMetric(
+    "ccobs_alerts_fired_total",
+    "counter",
+    "Alerts that fired since the app started, by rule.",
+    (HOST_LABEL, RULE_LABEL),
+)
+
+# The Discord deliveries of alerts since the app started (ADR 0046), by result: every
+# result of DELIVERY_RESULTS is exported, with zeros, whether Discord is configured or not.
+ALERT_DELIVERIES: Final = AppMetric(
+    "ccobs_alert_deliveries_total",
+    "counter",
+    "Alert deliveries to the Discord webhook since the app started, by result (counted per alert).",
+    (HOST_LABEL, RESULT_LABEL),
+)
+
 APP_METRICS: Final = (
     SESSIONS,
     SESSIONS_ENDED,
@@ -260,6 +293,8 @@ APP_METRICS: Final = (
     PROMETHEUS_QUERIES,
     UI_STREAMS,
     UI_STREAMS_REFUSED,
+    ALERTS_FIRED,
+    ALERT_DELIVERIES,
 )
 
 

@@ -1,0 +1,68 @@
+# Discord sink: a test-only override for test_app_alerts.py, which checks that the app's
+# only call out of the machine, the Discord webhook (ADR 0046), goes out only when a
+# webhook is configured. Not shipped to users; compose.yaml, compose.debug.yaml and the
+# ccobs-it project never load it. The test runs it in a project of its own,
+# ccobs-it-discord, with the app and this sink only, and removes it with its volumes.
+#
+# The sink takes the name discord.com on both of the stack's networks, as a network
+# alias: Docker's embedded DNS answers it with the sink's address before asking any real
+# DNS server. It listens on 443 and logs each connection: the peer, then the printable
+# bytes it sends, among them the server name of the TLS ClientHello. TLS fails, which is
+# fine: the connection is the signal, and the app counts it as a failed attempt. The
+# edge network is internal here, so nothing else leaves the machine either (and Docker
+# publishes no port; the test drives the app with `docker compose exec`). The proxy
+# variables are emptied for the app, whose Discord client trusts the environment, so a
+# proxy injected into containers cannot take the call elsewhere.
+#
+# The sink is tools/stack/compose.egress-sink.yaml's, on 443 only, with its image.
+
+services:
+  discord-sink:
+    image: busybox:1.38.0-musl@sha256:ea2b9914a16a4ac1981994af97b318f7c7d4db76b580c56177f08bf76f4a0be8
+    # Each connection runs the report below, which writes to the container's log.
+    # Compose turns $$ into $, so the shell sees its own variables.
+    command:
+      - sh
+      - -c
+      - |
+        report='echo "sink: connection to $$TCPLOCALADDR from $$TCPREMOTEHOST $$TCPREMOTEADDR" >&2
+        timeout 5 head -c 2048 | strings -n 6 | sed "s/^/sink:   /" >&2'
+        tcpsvd -v -h -l sink 0.0.0.0 443 sh -c "$$report" &
+        echo "sink: listening on 443" >&2
+        wait
+    init: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    mem_limit: 64m
+    healthcheck:
+      # netstat only reads the sockets: a connection would show up in the sink's log.
+      test: ["CMD", "sh", "-c", "netstat -ltn | grep -q ':443 '"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+      start_interval: 1s
+    networks:
+      backend:
+        aliases: &discord-hosts
+          - discord.com
+      edge:
+        aliases: *discord-hosts
+
+  app:
+    depends_on:
+      discord-sink:
+        condition: service_healthy
+    environment:
+      HTTP_PROXY: ""
+      HTTPS_PROXY: ""
+      ALL_PROXY: ""
+      http_proxy: ""
+      https_proxy: ""
+      all_proxy: ""
+
+networks:
+  edge:
+    internal: true

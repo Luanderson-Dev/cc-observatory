@@ -75,9 +75,26 @@ def _diagnostics(**change: object) -> dict[str, object]:
         },
         "hooks": {"received": {"Stop": 2}, "dropped": {"invalid": 1, "full": 0}},
         "hook_failures": dict(_GOOD_FAILURES),
+        "alerts": _alerts(),
     }
     document.update(change)
     return document
+
+
+def _alerts(**discord: object) -> dict[str, object]:
+    return {
+        "rules": ["waiting_user", "repeated_failures"],
+        "open": 2,
+        "fired_24h": 3,
+        "discord": {
+            "configured": True,
+            "suspended_status": None,
+            "pending": 0,
+            "failed_24h": 0,
+            "expired_24h": 0,
+            **discord,
+        },
+    }
 
 
 def _body(document: object) -> HttpAnswer:
@@ -195,6 +212,7 @@ def test_everything_up(fakes: Fakes, config: Path) -> None:
         f"Claude Code settings: hooks installed, telemetry on ({path})\n"
         "Sessions: 2 working, 1 waiting on you, 0 idle, 3 ended, 0 stale; 1 open block\n"
         "Hook failures (last hour): 0 non-blocking errors, 0 cancelled (12 runs)\n"
+        "Alerts: 2 on; Discord: on\n"
         "Run `ccobs doctor` for details.\n"
     )
 
@@ -235,6 +253,7 @@ def test_the_app_down_exits_1_with_unknown_lines(fakes: Fakes, config: Path) -> 
     assert run.line("App ") == f"App       down  {APP}"
     assert run.line("Sessions: ") == "Sessions: unknown (app down)"
     assert run.line("Hook failures") == "Hook failures (last hour): unknown (app down)"
+    assert run.line("Alerts: ") == "Alerts: unknown (app down)"
     assert run.line("cc-observatory ") == f"cc-observatory {VERSION}"
 
 
@@ -249,6 +268,7 @@ def test_the_app_down_ignores_a_stray_diagnostics_answer(fakes: Fakes, config: P
     assert document["diagnostics"] == {"understood": False, "reason": "app_down"}
     assert document["sessions"] is None
     assert document["hook_failures"] is None
+    assert document["alerts"] is None
 
 
 def test_the_collector_and_grafana_down_exit_0(fakes: Fakes, config: Path) -> None:
@@ -566,6 +586,7 @@ def test_json_shape(fakes: Fakes, config: Path) -> None:
         "diagnostics",
         "sessions",
         "hook_failures",
+        "alerts",
     ]
     assert document["version"] == VERSION
     assert document["app"] == {"up": True, "url": APP, "version": VERSION}
@@ -583,6 +604,7 @@ def test_json_shape(fakes: Fakes, config: Path) -> None:
         "non_blocking_error": 0,
         "cancelled": 0,
     }
+    assert document["alerts"] == {"available": True, **_alerts()}
 
 
 def test_json_with_the_app_down(fakes: Fakes, config: Path) -> None:
@@ -598,6 +620,116 @@ def test_json_with_the_app_down(fakes: Fakes, config: Path) -> None:
     assert document["diagnostics"] == {"understood": False, "reason": "app_down"}
     assert document["sessions"] is None
     assert document["hook_failures"] is None
+    assert document["alerts"] is None
+
+
+# Alerts (ADR 0046).
+
+
+@pytest.mark.parametrize(
+    ("alerts", "line"),
+    [
+        (_alerts(), "Alerts: 2 on; Discord: on"),
+        (_alerts(configured=False), "Alerts: 2 on; Discord: off"),
+        (_alerts(suspended_status=404), "Alerts: 2 on; Discord: suspended (status 404)"),
+        (_alerts(suspended_status=401), "Alerts: 2 on; Discord: suspended (status 401)"),
+        ({**_alerts(), "open": 1}, "Alerts: 1 on; Discord: on"),
+        (None, "Alerts: unknown (the app could not read its alerts)"),
+    ],
+)
+def test_the_alerts_line(fakes: Fakes, config: Path, alerts: object, line: str) -> None:
+    fakes.answers[("GET", DIAGNOSTICS)] = _body(_diagnostics(alerts=alerts))
+
+    run = _status(fakes, config)
+
+    # Discord's state never changes the exit code: only the app down does (ADR 0039).
+    assert run.code == 0
+    assert run.line("Alerts: ") == line
+
+
+def test_an_app_that_predates_alerts(fakes: Fakes, config: Path) -> None:
+    document = _diagnostics()
+    del document["alerts"]
+    fakes.answers[("GET", DIAGNOSTICS)] = _body(document)
+
+    text = _status(fakes, config)
+    as_json = _status(fakes, config, "--json")
+
+    assert text.code == as_json.code == 0
+    assert text.line("Alerts: ") == "Alerts: unknown (the app predates alerts; rebuild it)"
+    # The rest of a v0.5.0 app's answer still shows.
+    assert text.line("Sessions: ").startswith("Sessions: 2 working")
+    assert as_json.json()["alerts"] == {"available": False, "reason": "predates"}
+    assert as_json.json()["sessions"] is not None
+
+
+def test_json_alerts_of_a_suspended_webhook(fakes: Fakes, config: Path) -> None:
+    alerts = _alerts(suspended_status=404, pending=1, failed_24h=2, expired_24h=3)
+    fakes.answers[("GET", DIAGNOSTICS)] = _body(_diagnostics(alerts=alerts))
+
+    run = _status(fakes, config, "--json")
+
+    assert run.code == 0
+    assert run.json()["alerts"] == {"available": True, **alerts}
+
+
+def test_json_alerts_the_app_could_not_read(fakes: Fakes, config: Path) -> None:
+    fakes.answers[("GET", DIAGNOSTICS)] = _body(_diagnostics(alerts=None))
+
+    run = _status(fakes, config, "--json")
+
+    assert run.json()["alerts"] == {"available": False, "reason": "unread"}
+    assert run.json()["diagnostics"] == {"understood": True, "reason": None}
+
+
+def test_malformed_alerts_leave_the_rest_of_the_diagnostics(fakes: Fakes, config: Path) -> None:
+    fakes.answers[("GET", DIAGNOSTICS)] = _body(_diagnostics(alerts=_alerts(configured="yes")))
+
+    text = _status(fakes, config)
+    as_json = _status(fakes, config, "--json")
+
+    assert text.code == as_json.code == 0
+    assert text.line("Alerts: ") == "Alerts: unknown (the app's alerts were not understood)"
+    assert text.line("Sessions: ").startswith("Sessions: 2 working")
+    assert text.line("Hook failures").endswith("(12 runs)")
+    document = as_json.json()
+    assert document["alerts"] == {"available": False, "reason": "not_understood"}
+    assert document["diagnostics"] == {"understood": True, "reason": None}
+    assert document["sessions"] is not None
+    assert document["hook_failures"] == {
+        "available": True,
+        "window_s": 3600,
+        "executions": 12,
+        "non_blocking_error": 0,
+        "cancelled": 0,
+    }
+
+
+def test_json_alerts_without_diagnostics_are_null(fakes: Fakes, config: Path) -> None:
+    fakes.answers[("GET", DIAGNOSTICS)] = HttpAnswer(500)
+
+    run = _status(fakes, config, "--json")
+
+    assert run.json()["diagnostics"] == {"understood": False, "reason": "not_understood"}
+    assert run.json()["alerts"] is None
+
+
+def test_no_webhook_url_reaches_status_output(fakes: Fakes, config: Path) -> None:
+    url = "https://discord.com/api/webhooks/123456789012345678/CANARY-token"
+    alerts = {**_alerts(suspended_status=404, webhook=url), "rules": [url, "daily_cost"]}
+    fakes.answers[("GET", DIAGNOSTICS)] = _body(_diagnostics(alerts=alerts, url=url))
+
+    text = _status(fakes, config)
+    as_json = _status(fakes, config, "--json")
+
+    assert as_json.json()["alerts"] == {
+        "available": True,
+        **_alerts(suspended_status=404),
+        "rules": ["daily_cost"],
+    }
+    for output in (text.out + text.err, as_json.out + as_json.err):
+        assert "CANARY" not in output
+        assert "/webhooks/" not in output
 
 
 # Usage errors.

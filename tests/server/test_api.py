@@ -29,6 +29,7 @@ from pydantic import BaseModel, ValidationError
 from sqlalchemy import Engine, insert, select
 from sqlalchemy.pool import QueuePool
 
+from ccobs.domain.alerts import DAY_SUBJECT, AlertCleared, AlertFired, AlertRule
 from ccobs.domain.hook_config import HOOK_PATH
 from ccobs.server import api
 from ccobs.server import app as app_module
@@ -36,8 +37,15 @@ from ccobs.server.app import create_app
 from ccobs.server.config import Settings
 from ccobs.server.db import engine as db_engine
 from ccobs.server.db.engine import EngineRole
-from ccobs.server.db.models import AgentModel, Base, BlockModel, HookEventModel, SessionModel
-from ccobs.server.db.repository import Repository, SessionView
+from ccobs.server.db.models import (
+    AgentModel,
+    AlertModel,
+    Base,
+    BlockModel,
+    HookEventModel,
+    SessionModel,
+)
+from ccobs.server.db.repository import AlertView, Repository, SessionView
 from ccobs.server.ingest import HookQueue
 from ccobs.server.migrations import MigrationError
 from ccobs.server.reads import READ_SLOTS, ReadGate
@@ -69,6 +77,7 @@ UNKNOWN: Final = "00000000-0000-4000-8000-0000000000ff"
 CANARY: Final = "CANARY-5d1e8b"
 NOT_FOUND: Final = {"detail": "session not found"}
 API: Final = "/api/v1/sessions"
+ALERTS: Final = "/api/v1/alerts"
 # The routes of one session, after its ID.
 SUFFIXES: Final = ("", "/agents", "/blocks", "/events")
 # Upper bound for any wait on another thread: far above what a pass needs.
@@ -415,7 +424,7 @@ def test_the_events_are_limited(client: TestClient, clock: Clock) -> None:
 
 
 @pytest.mark.parametrize("limit", ["0", "-1", "501", "10" * 20, "1.5", "abc", ""])
-@pytest.mark.parametrize("path", [API, *(f"{API}/{SESSION}{s}" for s in SUFFIXES[1:])])
+@pytest.mark.parametrize("path", [API, ALERTS, *(f"{API}/{SESSION}{s}" for s in SUFFIXES[1:])])
 def test_a_limit_outside_1_to_500_is_a_validation_error(
     replayed: TestClient, path: str, limit: str
 ) -> None:
@@ -734,6 +743,9 @@ class CountingGate(ReadGate):
         (f"{API}/{UNKNOWN}/blocks", 404),
         (f"{API}/{UNKNOWN}/events", 404),
         (f"{API}/{SESSION}/agents?before=unknown", 422),
+        (ALERTS, 200),
+        (f"{ALERTS}?before=5", 200),
+        (f"{ALERTS}?after=0", 200),
     ],
 )
 def test_each_request_takes_one_read_slot(
@@ -806,7 +818,7 @@ def test_a_session_id_at_the_bounds_is_looked_up(client: TestClient, clock: Cloc
 
 # The Host guard and CORS.
 
-ROUTES: Final = (API, *(f"{API}/{SESSION}{suffix}" for suffix in SUFFIXES))
+ROUTES: Final = (API, ALERTS, *(f"{API}/{SESSION}{suffix}" for suffix in SUFFIXES))
 
 
 @pytest.mark.parametrize("path", ROUTES)
@@ -843,6 +855,7 @@ def test_the_routes_stay_off_the_default_threadpool_and_out_of_the_schema(
     routes = [route for route in api.router.routes if isinstance(route, APIRoute)]
 
     assert sorted(route.path for route in routes) == [
+        "/api/v1/alerts",
         "/api/v1/sessions",
         "/api/v1/sessions/{session_id}",
         "/api/v1/sessions/{session_id}/agents",
@@ -1146,3 +1159,204 @@ def test_a_response_validation_error_does_not_quote_the_value() -> None:
     assert "agent_type" in str(raised.value)
     assert CANARY not in str(raised.value)
     assert CANARY not in repr(raised.value)
+
+
+# Alerts (ADR 0044).
+
+PROJECT_CWD: Final = "/home/someone/projects/demo-app"
+ALERT_FIELDS: Final = (
+    "id",
+    "rule",
+    "subject_kind",
+    "session_id",
+    "project",
+    "fired_at_ms",
+    "cleared_at_ms",
+    "value",
+    "threshold",
+)
+
+
+def writer_repository(client: TestClient) -> Repository:
+    repository = app_of(client).state.repository
+    assert isinstance(repository, Repository)
+    return repository
+
+
+def alert(
+    rule: AlertRule = "waiting_user", subject: str = SESSION, at: int = BASE, value: float = 31.5
+) -> AlertFired:
+    return AlertFired(rule=rule, subject=subject, fired_at_ms=at, value=value, threshold=30.0)
+
+
+def seed_alerts(client: TestClient, clock: Clock) -> list[int]:
+    """``SESSION`` (with a cwd) and ``UNKNOWN`` (with none), then a cleared alert of
+    ``SESSION`` with a pending Discord delivery, a daily one and one of ``UNKNOWN``; and
+    an alert of another host. The IDs of this host's alerts, oldest first."""
+    prompt = "UserPromptSubmit"
+    post(
+        client,
+        clock,
+        [
+            (0, {"session_id": SESSION, "hook_event_name": prompt, "cwd": PROJECT_CWD}),
+            (1, {"session_id": UNKNOWN, "hook_event_name": prompt}),
+        ],
+    )
+    persist(client)
+    repository = writer_repository(client)
+    first = repository.insert_alert(
+        HOST, alert(), discord_state="pending", discord_next_at_ms=BASE + 7
+    )
+    repository.clear_alert(
+        HOST, AlertCleared(rule="waiting_user", subject=SESSION, cleared_at_ms=BASE + 90)
+    )
+    daily = repository.insert_alert(
+        HOST, alert("daily_cost", DAY_SUBJECT, BASE + 100, 51.25), discord_state="none"
+    )
+    other = repository.insert_alert(
+        HOST, alert("repeated_failures", UNKNOWN, BASE + 200, 3), discord_state="none"
+    )
+    repository.insert_alert("other-host", alert(at=BASE + 300), discord_state="none")
+    return [first, daily, other]
+
+
+def test_alerts_come_newest_first_with_the_project_name_never_the_cwd(
+    client: TestClient, clock: Clock
+) -> None:
+    first, daily, other = seed_alerts(client, clock)
+
+    body = ok(client, ALERTS)
+
+    assert body == [
+        {
+            "id": other,
+            "rule": "repeated_failures",
+            "subject_kind": "session",
+            "session_id": UNKNOWN,
+            "project": None,
+            "fired_at_ms": BASE + 200,
+            "cleared_at_ms": None,
+            "value": 3.0,
+            "threshold": 30.0,
+        },
+        {
+            "id": daily,
+            "rule": "daily_cost",
+            "subject_kind": "day",
+            "session_id": None,
+            "project": None,
+            "fired_at_ms": BASE + 100,
+            "cleared_at_ms": None,
+            "value": 51.25,
+            "threshold": 30.0,
+        },
+        {
+            "id": first,
+            "rule": "waiting_user",
+            "subject_kind": "session",
+            "session_id": SESSION,
+            "project": "demo-app",
+            "fired_at_ms": BASE,
+            "cleared_at_ms": BASE + 90,
+            "value": 31.5,
+            "threshold": 30.0,
+        },
+    ]
+    # Never the cwd, nor the internal Discord delivery, nor another host's alert.
+    for leaked in ("someone", "projects/", "discord", "pending", "attempts", "next_at"):
+        assert leaked not in json.dumps(body)
+
+
+def test_alert_pages_cover_every_alert_once_both_ways(client: TestClient, clock: Clock) -> None:
+    ids = seed_alerts(client, clock)
+    repository = writer_repository(client)
+    ids += [
+        repository.insert_alert(HOST, alert(at=BASE + 400 + i), discord_state="none")
+        for i in range(5)
+    ]
+
+    # before: older pages, newest first, until an empty one.
+    seen: list[int] = []
+    page = ok(client, ALERTS, {"limit": 3})
+    while page:
+        assert [a["id"] for a in page] == sorted((a["id"] for a in page), reverse=True)
+        seen += [a["id"] for a in page]
+        page = ok(client, ALERTS, {"limit": 3, "before": page[-1]["id"]})
+    assert seen == ids[::-1]
+
+    # after: newer ones, oldest first, from a cursor the browser kept.
+    seen = []
+    page = ok(client, ALERTS, {"limit": 3, "after": ids[1]})
+    while page:
+        seen += [a["id"] for a in page]
+        page = ok(client, ALERTS, {"limit": 3, "after": page[-1]["id"]})
+    assert seen == ids[2:]
+    assert ok(client, ALERTS, {"after": 0, "limit": 1})[0]["id"] == ids[0]
+    assert ok(client, ALERTS, {"after": api.MAX_CURSOR}) == []
+    assert ok(client, ALERTS, {"before": 0}) == []
+
+
+def test_the_alert_list_is_limited(client: TestClient, clock: Clock) -> None:
+    seed_alerts(client, clock)
+    repository = writer_repository(client)
+    for i in range(api.DEFAULT_LIMIT):
+        repository.insert_alert(HOST, alert(at=BASE + 1000 + i), discord_state="none")
+
+    assert len(ok(client, ALERTS)) == api.DEFAULT_LIMIT == 50
+    assert len(ok(client, ALERTS, {"limit": api.MAX_LIMIT})) == api.DEFAULT_LIMIT + 3
+    assert len(ok(client, ALERTS, {"limit": 2, "after": 0})) == 2
+    assert api.MAX_LIMIT == 500
+
+
+def test_alert_cursors_before_and_after_together_are_a_validation_error(client: TestClient) -> None:
+    response = client.get(ALERTS, params={"before": 987_654, "after": 123_457})
+
+    assert response.status_code == 422
+    ((error),) = response.json()["detail"]
+    assert error == {
+        "loc": ["query"],
+        "msg": "before and after cannot be used together",
+        "type": "value_error",
+    }
+    assert "987654" not in response.text
+    assert "123457" not in response.text
+
+
+@pytest.mark.parametrize("name", ["before", "after"])
+@pytest.mark.parametrize("value", ["-1", "1.5", "abc", "", str(2**63), CANARY])
+def test_an_invalid_alert_cursor_is_a_validation_error_without_echo(
+    client: TestClient, name: str, value: str
+) -> None:
+    response = client.get(ALERTS, params={name: value})
+
+    assert response.status_code == 422
+    assert_validation_body(response.json(), name)
+    assert CANARY not in response.text
+
+
+def test_the_alert_fields_are_exactly_these() -> None:
+    assert tuple(api.AlertOut.model_fields) == ALERT_FIELDS
+    stored = set(AlertModel.__table__.columns.keys())
+    # Stored columns, but for the subject's kind and the project, worked out from the
+    # subject and the session's cwd; no Discord delivery column.
+    assert set(ALERT_FIELDS) - {"subject_kind", "project"} <= stored
+    assert not [name for name in ALERT_FIELDS if name.startswith("discord")]
+    assert api.AlertOut.model_config.get("extra") == "forbid"
+
+
+def test_alerts_read_through_the_readers_engine(
+    client: TestClient, clock: Clock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seed_alerts(client, clock)
+    reader = app_of(client).state.read_repository
+    assert isinstance(reader, Repository)
+    calls: list[str] = []
+    original = reader.alert_views
+
+    def spy(host: str, limit: int, **cursors: int | None) -> list[AlertView]:
+        calls.append(host)
+        return original(host, limit, **cursors)
+
+    monkeypatch.setattr(reader, "alert_views", spy)
+    assert len(ok(client, ALERTS)) == 3
+    assert calls == [HOST]

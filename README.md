@@ -69,9 +69,10 @@ stack" and "Try the app" below), and the CLI comes from PyPI; the rest is planne
   there (v0.4.0), and later dashboards will open already filtered to the agent or
   project you were looking at (v0.7.0).
 - **Alerts** (v0.6.0): browser notifications and, optionally, a Discord webhook when a
-  session has been waiting on you for longer than a threshold, when API errors keep
-  repeating, or when the estimated cost of a session or of a day goes over a limit. You
-  set the thresholds with environment variables or on a settings screen.
+  session has been waiting on you for longer than a threshold (30 seconds by default),
+  when its API requests keep failing, or when the estimated cost of a session or of the
+  last 24 hours goes over a limit (off by default). An Alerts page lists them and holds
+  their settings, which you can also set with environment variables.
 
 ## How it works
 
@@ -266,6 +267,36 @@ address; it also serves them as a read-only JSON API.
   covers the web UI, the API, the app's metrics in Grafana, its settings and retention,
   privacy and troubleshooting.
 
+## Alerts (from v0.6.0)
+
+The app warns you when a session has waited on you for 30 seconds, when its API requests
+failed 3 times within 10 minutes, and, once you turn them on, when the estimated cost of
+a session or of the last 24 hours reaches a limit.
+
+1. Open the **Alerts** page, <http://127.0.0.1:4300/alerts>. It lists the alerts that
+   fired and holds their settings; a value you save there wins over its `CCOBS_ALERT_*`
+   variable until you reset it.
+2. Click **Notify me in this browser** and allow notifications. They show while a tab
+   of the app is open, any page of it.
+3. Optionally, send them to Discord too: create a webhook in your Discord server
+   (**Server Settings**, **Integrations**, **Create Webhook**, **Copy Webhook URL**), put
+   it in the stack's `.env`:
+
+   ~~~bash
+   CCOBS_DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/<id>/<token>
+   ~~~
+
+   Then run `docker compose up -d` and click **Send test message** on the Alerts page.
+   A message holds the alert in words, the host label, the short session ID and a local
+   link, never a path or content; the project name only with
+   `CCOBS_DISCORD_INCLUDE_PROJECT=true`. The webhook URL is a secret: keep `.env` out of
+   anything you share.
+
+- **Cost alerts** use Claude Code's estimate, not your bill. While one is on, the app
+  queries the stack's Prometheus at most once a minute.
+- **More.** [docs/app.md](https://github.com/Luanderson-Dev/cc-observatory/blob/main/docs/app.md#alerts) covers the rules,
+  the settings, notifications, Discord delivery and troubleshooting.
+
 ## Privacy
 
 - **Metadata only by default.** Prompt text, tool inputs and outputs, assistant messages
@@ -282,11 +313,13 @@ address; it also serves them as a read-only JSON API.
   enforce: every port binds to `127.0.0.1`; Prometheus, Loki and Tempo publish no port
   and sit on an internal network with no route out; and the usage reporting and update
   checks of Grafana, Loki and Tempo are turned off. At runtime, nothing leaves your
-  machine except the optional Discord webhook, if you configure one, and DNS lookups of
-  a store's name while that store is stopped (see
+  machine except what the app sends to the optional Discord webhook (alerts and the
+  test message, from v0.6.0), if you configure one, and DNS lookups of a store's name while that store is stopped; the
+  cost alerts' queries go to the stack's own Prometheus and stay on your machine (see
   [SECURITY.md](https://github.com/Luanderson-Dev/cc-observatory/blob/main/SECURITY.md)).
 - **The web UI** (from v0.4.0) has no login either, loads nothing from the internet and
-  changes nothing. It shows the working directory only as the project name, or with your
+  changes nothing in Claude Code; from v0.6.0 the only things it changes are the alert
+  settings. It shows the working directory only as the project name, or with your
   home directory as `~`, and refuses requests that other web pages make through your
   browser (a link to it still just opens it).
 - **Grafana has no login.** Whoever opens it is an Editor, who can query the data and

@@ -19,7 +19,7 @@ Windows).
 | `loki`           | `grafana/loki:3.7.8`                                               | Events (OpenTelemetry log records)               | `backend`         | none (4310 with the debug override) |
 | `tempo`          | `grafana/tempo:3.1.0`, only with `--profile traces`                | Traces                                           | `backend`         | none (4320 with the debug override) |
 | `grafana`        | `grafana/grafana:13.2.4`                                           | Its own database                                 | `backend`, `edge` | 4330                                |
-| `app`            | `cc-observatory-app:local`, built locally (see below)              | Sessions, agents, blocks and hook events         | `backend`, `edge` | 4300 (4301 with the debug override) |
+| `app`            | `cc-observatory-app:local`, built locally (see below)              | Sessions, agents, blocks, hook events and alerts | `backend`, `edge` | 4300 (4301 with the debug override) |
 
 - **Images.** Every upstream image is pinned to an exact tag and its multi-arch index
   digest (`name:tag@sha256:...`), in `compose.yaml` and in the collector's Dockerfile
@@ -50,12 +50,17 @@ Windows).
   `tool_decision` events back from Loki, serves its live state on a metrics listener
   (port 9464 inside the stack, never published) that Prometheus scrapes as the job
   `ccobs-app`, and serves the web UI, whose session pages read each session's tokens and
-  cost from Prometheus and link to Grafana ([app.md](app.md)).
+  cost from Prometheus and link to Grafana ([app.md](app.md)). From v0.6.0 it also
+  evaluates the alert rules, reads the cost alerts' totals from Prometheus while one is
+  on, and sends each alert to a Discord webhook when one is configured
+  ([app.md](app.md#alerts)).
 - **Networks** ([ADR 0018](adr/0018-ports-networks-and-exposure.md)). `backend` is an
   internal network with no route out, so Prometheus, Loki and Tempo, which join only
   `backend`, cannot reach the internet. `edge` is a normal bridge network for the
   three services that publish ports: the collector, Grafana and the app. Every published
-  port binds to `127.0.0.1` only.
+  port binds to `127.0.0.1` only. The app's Discord sender is the one connection that
+  uses `edge` to leave the machine, and only with `CCOBS_DISCORD_WEBHOOK_URL` set
+  ([Checking that nothing leaves the machine](#checking-that-nothing-leaves-the-machine)).
 - **Debug override.** `compose.debug.yaml` publishes Prometheus, Loki and Tempo on
   loopback, for debugging, and the app's metrics listener on `127.0.0.1:4301`
   (`CCOBS_APP_METRICS_PORT`). It also attaches the three stores to `edge`, which gives
@@ -76,10 +81,12 @@ Windows).
   at three files of 10 MB, and 30 seconds to stop cleanly after SIGTERM (15 for Tempo).
   Every container runs as a non-root user.
 - **The app stops well inside its 30 seconds.** After SIGTERM, uvicorn waits at most 5
-  seconds for open requests; then the app stops its metrics listener, then its Loki
-  reconciler and its sweeper (up to 5 seconds each), and gives its writer up to 5
-  seconds to store the hooks still queued, counting any left as dropped. The worst case
-  is about 20 seconds; measured, `docker compose stop app` took 1.2 seconds and the
+  seconds for open requests; then the app stops its metrics listener, then its
+  background threads (the Loki reconciler, the Discord sender, the cost reader, the
+  alert ticker and the sweeper) together, up to 5 seconds for all of them, and gives its
+  writer up to 5 seconds to store the hooks still queued, counting any left as dropped.
+  The worst case is 15 seconds ([ADR 0046](adr/0046-discord-delivery.md)); measured
+  before the alert threads existed, `docker compose stop app` took 1.2 seconds and the
   container exited with code 0 ([ADR 0030](adr/0030-the-app-container.md)).
 
 ## Start, stop and update
@@ -167,8 +174,17 @@ recreates the services whose settings changed. Git ignores `.env`.
 | `CCOBS_SESSION_STALE_AFTER`  | `12h`                    | How long a session or agent can stay silent before the app marks it stale, in the same units; at least `1h`.                             |
 | `CCOBS_TELEMETRY_RECONCILE`  | `true`                   | Whether the app reads Claude Code's `tool_decision` events from Loki to close permission prompts denied with Esc.                        |
 | `CCOBS_LOKI_URL`             | `http://loki:3100`       | Loki's HTTP API as the app reaches it inside the stack.                                                                                  |
-| `CCOBS_PROMETHEUS_URL`       | `http://prometheus:9090` | Prometheus's HTTP API as the app reaches it inside the stack, for the tokens and cost on each session's page.                            |
+| `CCOBS_PROMETHEUS_URL`       | `http://prometheus:9090` | Prometheus's HTTP API as the app reaches it inside the stack, for the tokens and cost on each session's page and the cost alerts.        |
 | `CCOBS_LOG_LEVEL`            | `info`                   | The app's log level: `debug`, `info`, `warning` or `error`.                                                                              |
+
+The app's alerts, from v0.6.0 ([app.md](app.md#alerts) has every rule, its range and
+how the Alerts page overrides it):
+
+| Variable                        | Default                            | Effect                                                                                                                    |
+| ------------------------------- | ---------------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
+| `CCOBS_ALERT_*`                 | see [app.md](app.md#configuration) | Ten settings: each rule on or off, its threshold, and the cooldown between two alerts of one rule and subject.            |
+| `CCOBS_DISCORD_WEBHOOK_URL`     | unset                              | A Discord webhook URL; set, the app sends each alert to it. A secret: `.env` is the place for it, and Git ignores `.env`. |
+| `CCOBS_DISCORD_INCLUDE_PROJECT` | `false`                            | Whether Discord messages name the session's project.                                                                      |
 
 Advanced: the app's hook queue and body limits
 ([ADR 0027](adr/0027-the-app-http-surface-and-hook-queue.md)). A hook that does not fit
@@ -195,13 +211,13 @@ only if you want the hostname stored.
 
 ## Data and retention
 
-| Volume            | Mounted at         | Holds                                                                                                                                            |
-| ----------------- | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `prometheus-data` | `/prometheus`      | Prometheus's TSDB: metric blocks and the write-ahead log.                                                                                        |
-| `loki-data`       | `/loki`            | Loki's chunks, index, write-ahead log and compactor state.                                                                                       |
-| `tempo-data`      | `/var/tempo`       | Tempo's write-ahead log and trace blocks (`traces` profile).                                                                                     |
-| `grafana-data`    | `/var/lib/grafana` | Grafana's database: dashboards saved in the UI, stars and preferences. The datasources and the provisioned dashboard come from `stack/grafana/`. |
-| `app-data`        | `/var/lib/ccobs`   | The app's SQLite database, `ccobs.db`, and its WAL files: sessions, agents, blocks and hook events, metadata only.                               |
+| Volume            | Mounted at         | Holds                                                                                                                                                    |
+| ----------------- | ------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `prometheus-data` | `/prometheus`      | Prometheus's TSDB: metric blocks and the write-ahead log.                                                                                                |
+| `loki-data`       | `/loki`            | Loki's chunks, index, write-ahead log and compactor state.                                                                                               |
+| `tempo-data`      | `/var/tempo`       | Tempo's write-ahead log and trace blocks (`traces` profile).                                                                                             |
+| `grafana-data`    | `/var/lib/grafana` | Grafana's database: dashboards saved in the UI, stars and preferences. The datasources and the provisioned dashboard come from `stack/grafana/`.         |
+| `app-data`        | `/var/lib/ccobs`   | The app's SQLite database, `ccobs.db`, and its WAL files: sessions, agents, blocks, hook events and alerts, metadata only, and the saved alert settings. |
 
 Docker names them `cc-observatory_<volume>`, because `compose.yaml` fixes the project
 name; `docker system df -v` shows their sizes. The collector has no volume: at a stop
@@ -228,8 +244,10 @@ requests waiting to be retried, so what it has not delivered by then is lost.
   query length limit is off. A longer range, such as "Last 90 days" in the dashboard
   (Prometheus keeps 90 days), shows events from the start of Loki's retention instead of
   failing.
-- The app deletes only ended and stale sessions, with their agents, blocks and hook
-  events; a session still open is never deleted. Its retention job runs about a minute
+- The app deletes only ended and stale sessions, with their agents, blocks, hook events
+  and alerts; a session still open is never deleted. A cleared daily-cost alert, which
+  belongs to no session, goes once it fired longer ago than `CCOBS_APP_RETENTION`. Its
+  retention job runs about a minute
   after the app starts, then every hour, and a sweep every minute marks sessions silent
   for `CCOBS_SESSION_STALE_AFTER` stale ([app.md](app.md#data-and-retention)).
 - Disk use over 30 to 90 days of real use has not been measured. ADR 0016 estimates
@@ -557,8 +575,9 @@ program. A hook-error notice in Claude Code's transcript means a hook could not 
 the app: the stack is down or starting, or the hook URL is wrong (it must use
 `127.0.0.1`). `ccobs doctor` checks both ([cli.md](cli.md#ccobs-doctor)).
 [app.md](app.md#troubleshooting) covers these, an empty overview, a session stuck in
-`working` or `waiting_user`, missing tokens and cost, "Live updates paused", a busy
-database, WAL being off and dropped hooks.
+`working` or `waiting_user`, missing tokens and cost, "Live updates paused", missing
+browser notifications or Discord messages, a busy database, WAL being off and dropped
+hooks.
 
 ### An edited dashboard does not show on the home page
 
@@ -679,7 +698,13 @@ checks the settings of the running stack: Loki's and Tempo's usage reports are o
 Grafana applied every outbound setting and ran none of the jobs that call grafana.com;
 Prometheus has no remote write or read, no Alertmanager and no service discovery; the
 collector exports only to the three stores; and `backend` is internal. The app calls
-nothing but Loki, over `backend`, although it is on `edge` too to publish its port.
+nothing but Loki and Prometheus, over `backend`, although it is on `edge` too to publish
+its port; the one exception is the optional Discord webhook (from v0.6.0,
+[ADR 0046](adr/0046-discord-delivery.md)), which it calls over `edge` only while
+`CCOBS_DISCORD_WEBHOOK_URL` is set. That connection carries the alerts, as
+[app.md](app.md#discord) describes, and is the only one of the app's that follows the
+container's `HTTPS_PROXY` and `NO_PROXY`. The cost alerts' queries go to Prometheus over
+`backend`, at most once a minute and only while a cost alert is on.
 
 That no connection leaves, whatever the settings say, is a manual check with
 [`tools/stack/compose.egress-sink.yaml`](../tools/stack/compose.egress-sink.yaml), a
