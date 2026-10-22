@@ -442,6 +442,7 @@ def _stack(env: Environment, args: argparse.Namespace) -> list[Check]:
         rules.check_app(app, app_port=app_port),
         rules.check_hook_endpoint(hook, app_port=app_port),
         rules.check_diagnostics(diagnostics, cli_version=ccobs.__version__),
+        rules.check_alerts(diagnostics),
         rules.check_otlp(env.connect(_HOST, otlp_port, CONNECT_TIMEOUT_S), otlp_port=otlp_port),
         rules.check_grafana(grafana, grafana_port=grafana_port),
     ]

@@ -17,7 +17,8 @@ log never records one (ADR 0029). ``ccobs.server.diagnostics`` does the HTTP.
 
 It also holds the client side: ``parse_diagnostics`` reads the app's
 ``GET /api/v1/diagnostics`` document for ``ccobs doctor`` and ``ccobs status``, with the
-one set of Loki reasons (``UnavailableReason``) that the server writes.
+one set of Loki reasons (``UnavailableReason``) that the server writes, and its optional
+``alerts`` part (ADR 0046), which an app older than v0.6.0 does not send.
 
 Data and string building only: no I/O.
 """
@@ -29,12 +30,16 @@ import re
 from dataclasses import dataclass
 from typing import Final, Literal, cast, get_args
 
+from ccobs.domain.alerts import ALERT_RULES, AlertRule
 from ccobs.domain.denials import EVENT_NAME_KEY, SERVICE_NAME_LABEL
 from ccobs.domain.sessions import SessionStatus
 from ccobs.domain.telemetry import HOST_LABEL, SERVICE_NAME, quote
 from ccobs.domain.usage import parse_vector
 
 __all__ = [
+    "ALERTS_NOT_UNDERSTOOD",
+    "ALERTS_PREDATE",
+    "ALERTS_UNREAD",
     "CANCELLED",
     "CANCELLED_KEY",
     "EXECUTIONS",
@@ -44,9 +49,12 @@ __all__ = [
     "NON_BLOCKING_ERROR",
     "NON_BLOCKING_ERROR_KEY",
     "UNAVAILABLE_REASONS",
+    "AlertsUnavailable",
     "CountedHookFailures",
     "Diagnostics",
     "HookFailures",
+    "ReportedAlerts",
+    "ReportedDiscord",
     "ReportedHooks",
     "ReportedReason",
     "ReportedSessions",
@@ -177,6 +185,40 @@ class UncountedHookFailures:
 
 
 @dataclass(frozen=True, slots=True)
+class ReportedDiscord:
+    """Where Discord delivery stands (ADR 0046): whether a webhook is configured, the
+    status (401, 403 or 404) that suspended sending until the app restarts, the
+    deliveries still ``pending``, and those of the alerts fired in the last 24 hours
+    that ended ``failed`` or ``expired``."""
+
+    configured: bool
+    suspended_status: int | None
+    pending: int
+    failed_24h: int
+    expired_24h: int
+
+
+@dataclass(frozen=True, slots=True)
+class ReportedAlerts:
+    """The alerts part: the rules on (ADR 0041's names, in its order), the alerts
+    still on, those fired in the last 24 hours, and Discord's delivery."""
+
+    rules: tuple[AlertRule, ...]
+    open: int
+    fired_24h: int
+    discord: ReportedDiscord
+
+
+# Why the document has no alerts part to show: the app could not read its alerts
+# (``alerts: null``), it predates them (no ``alerts`` field: older than v0.6.0), or the
+# part is not of the shape this CLI reads (an app newer or older than the CLI).
+type AlertsUnavailable = Literal["unread", "predates", "not_understood"]
+ALERTS_UNREAD: Final[AlertsUnavailable] = "unread"
+ALERTS_PREDATE: Final[AlertsUnavailable] = "predates"
+ALERTS_NOT_UNDERSTOOD: Final[AlertsUnavailable] = "not_understood"
+
+
+@dataclass(frozen=True, slots=True)
 class Diagnostics:
     """The parts of the document doctor and status use. ``version`` is the app's, or
     ``unknown`` when it does not look like a version, so it is safe to show."""
@@ -185,6 +227,7 @@ class Diagnostics:
     sessions: ReportedSessions
     hooks: ReportedHooks
     hook_failures: CountedHookFailures | UncountedHookFailures
+    alerts: ReportedAlerts | AlertsUnavailable = ALERTS_PREDATE
 
 
 def _count(value: object) -> int | None:
@@ -254,11 +297,63 @@ def _failures(value: object) -> CountedHookFailures | UncountedHookFailures | No
     return CountedHookFailures(window_s, HookFailures(executions, errors, cancelled))
 
 
+def _status_code(value: object) -> int | None:
+    if isinstance(value, int) and not isinstance(value, bool) and 100 <= value <= 599:
+        return value
+    return None
+
+
+def _discord(value: object) -> ReportedDiscord | None:
+    if not isinstance(value, dict) or "suspended_status" not in value:
+        return None
+    configured, suspended = value.get("configured"), value.get("suspended_status")
+    status = _status_code(suspended)
+    pending = _count(value.get("pending"))
+    failed = _count(value.get("failed_24h"))
+    expired = _count(value.get("expired_24h"))
+    if (
+        not isinstance(configured, bool)
+        or (suspended is not None and status is None)
+        or pending is None
+        or failed is None
+        or expired is None
+    ):
+        return None
+    return ReportedDiscord(configured, status, pending, failed, expired)
+
+
+def _rules(value: object) -> tuple[AlertRule, ...] | None:
+    if not isinstance(value, list) or not all(isinstance(name, str) for name in value):
+        return None
+    # Only ADR 0041's names, in its order, so a stray name never reaches the output.
+    return tuple(rule for rule in ALERT_RULES if rule in value)
+
+
+def _alerts(document: dict[str, object]) -> ReportedAlerts | AlertsUnavailable:
+    if "alerts" not in document:
+        return ALERTS_PREDATE
+    value = document["alerts"]
+    if value is None:
+        return ALERTS_UNREAD
+    if not isinstance(value, dict):
+        return ALERTS_NOT_UNDERSTOOD
+    rules, discord = _rules(value.get("rules")), _discord(value.get("discord"))
+    open_, fired = _count(value.get("open")), _count(value.get("fired_24h"))
+    if rules is None or discord is None or open_ is None or fired is None:
+        return ALERTS_NOT_UNDERSTOOD
+    return ReportedAlerts(rules, open_, fired, discord)
+
+
 def parse_diagnostics(body: bytes) -> Diagnostics | None:
     """The app's diagnostics document (ADR 0038) from the body of its answer; ``None``
     when it is not JSON, or a part doctor or status use is missing or not of the shape
     the app writes (counts are non-negative integers). A state the app did not list
-    counts 0; a state ADR 0024 does not name is left out."""
+    counts 0; a state ADR 0024 does not name is left out. The ``alerts`` part (ADR
+    0046) is optional: absent (an app older than v0.6.0) it is ``ALERTS_PREDATE``,
+    ``null`` (the app could not read its alerts) ``ALERTS_UNREAD``, and not of the shape
+    the app writes ``ALERTS_NOT_UNDERSTOOD``, while the rest of the answer stands: an
+    app newer or older than the CLI may change it. Keys this CLI does not know are
+    ignored, there as in every part."""
     try:
         document: object = json.loads(body)
     except (ValueError, RecursionError):
@@ -272,4 +367,4 @@ def parse_diagnostics(body: bytes) -> Diagnostics | None:
     if not isinstance(version, str) or sessions is None or hooks is None or failures is None:
         return None
     shown = version if _VERSION_TEXT.fullmatch(version) else "unknown"
-    return Diagnostics(shown, sessions, hooks, failures)
+    return Diagnostics(shown, sessions, hooks, failures, _alerts(document))

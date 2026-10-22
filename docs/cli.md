@@ -230,6 +230,7 @@ that doctor cannot be sure of; `fail` stops data.
 | Stack       | `app`                   | `GET /healthz` on the app answers (fail).                                                                                                                                                       |
 | Stack       | `hook-endpoint`         | A `POST {}` to the hook URL answers 2xx (fail). The app drops it as one `invalid` hook, so each run adds one `invalid` drop to its counters.                                                    |
 | Stack       | `diagnostics`           | The app's `GET /api/v1/diagnostics`: a CLI and app version mismatch, Loki unavailable, hook failures in the last hour or dropped hooks warn; no hook since the app started is info.             |
+| Stack       | `alerts`                | Discord delivery, from the same answer: Discord not configured (alerts in the browser only) or an app older than v0.6.0 is info; alerts that failed or expired in the last 24 h, alerts the app could not read, or alerts not understood (a CLI and an app from different releases), warn; a webhook Discord refused (401, 403 or 404, sending suspended until the app restarts) fails. |
 | Stack       | `otlp`                  | The collector's OTLP/HTTP port accepts a connection (fail).                                                                                                                                     |
 | Stack       | `grafana`               | Grafana's `/api/health` answers (warn).                                                                                                                                                         |
 | Clone       | `stack-readable`        | Linux and macOS only: the containers can read `stack/` (fail; the fix is `chmod -R o+rX stack/`).                                                                                               |
@@ -291,6 +292,8 @@ usage error (a `--stack-dir` that is not a directory, a relative `CLAUDE_CONFIG_
 | `settings-file`, `hooks`, `telemetry-env`                                       | Setup has not run for this configuration directory, or ran with other ports. Run `ccobs setup` with the same `--config-dir` and ports; for `telemetry-env` with another value, `--force`. |
 | `app`, `hook-endpoint`, `otlp`                                                  | The stack is down, or listens on other ports: `docker compose ps` in your clone, then `docker compose up -d`; or pass the ports from your `.env`.                                         |
 | `diagnostics` (warn)                                                            | "not understood": the app predates the CLI; rebuild it with `docker compose build app && docker compose up -d`. A version mismatch: rebuild the app, or upgrade the CLI.                  |
+| `alerts` (fail)                                                                 | Discord refused the webhook: fix `CCOBS_DISCORD_WEBHOOK_URL` in the stack's `.env`, then `docker compose up -d`. Sending stays suspended until the app restarts.                          |
+| `alerts` (warn)                                                                 | "not understood": the CLI and the app come from different releases; upgrade the CLI (`uvx cc-observatory@latest doctor`) or rebuild the app. Alerts that did not reach Discord: `docker compose logs app`. |
 | `disable-all-hooks`, `managed-hooks-only`, `managed-env`, `http-hook-allowlist` | A policy blocks the hooks or the telemetry (see [Troubleshooting](#hooks-are-blocked-by-a-policy)).                                                                                       |
 | `docker`                                                                        | Update Docker to the minimum versions in the table above ([stack.md](stack.md#requirements)).                                                                                             |
 | `stack-readable`                                                                | Run `chmod -R o+rX stack/` in the clone, then `docker compose up -d`.                                                                                                                     |
@@ -319,6 +322,7 @@ Grafana   up    http://127.0.0.1:4330
 Claude Code settings: hooks installed, telemetry on (/home/you/.claude/settings.json)
 Sessions: 1 working, 1 waiting on you, 0 idle, 3 ended, 0 stale; 1 open block
 Hook failures (last hour): 0 non-blocking errors, 0 cancelled (42 runs)
+Alerts: 1 on; Discord: on
 Run `ccobs doctor` for details.
 ~~~
 
@@ -329,6 +333,12 @@ Run `ccobs doctor` for details.
 - **Sessions** and **hook failures** come from `GET /api/v1/diagnostics`. When the app
   does not give them, the line says why, with the reasons of the JSON below. The
   version line adds `(app X.Y.Z)` when the app runs another version than the CLI.
+- **Alerts:** how many alerts are on, and Discord: `on`, `off` (no webhook configured)
+  or `suspended (status N)` (Discord refused the webhook; `ccobs doctor` says how to
+  fix it). An app older than v0.6.0 shows "unknown (the app predates alerts; rebuild
+  it)"; alerts the CLI cannot read (a CLI and an app from different releases) show
+  "unknown (the app's alerts were not understood)" while the other lines still show.
+  Discord's state never changes the exit code.
 
 `--json` prints:
 
@@ -342,6 +352,7 @@ Run `ccobs doctor` for details.
 | `diagnostics`   | `understood` (`true` or `false`) and `reason`: `null`, or why there are none (below).                                                                                                                                                                       |
 | `sessions`      | `by_state` (a count for `working`, `waiting_user`, `idle`, `ended` and `stale`) and `open_blocks`; `null` without diagnostics.                                                                                                                              |
 | `hook_failures` | `available: true` with `window_s`, `executions`, `non_blocking_error` and `cancelled`; or `available: false` with `reason` (`unreachable`, `timeout`, `status`, `shape` or `unknown`: the app cannot read Loki) and `window_s`; `null` without diagnostics. |
+| `alerts`        | `available: true` with the app's `alerts` fields (`rules`, `open`, `fired_24h`, `discord` with `configured`, `suspended_status`, `pending`, `failed_24h`, `expired_24h`); or `available: false` with `reason`: `unread` (the app could not read its alerts), `predates` (an app older than v0.6.0) or `not_understood` (a part of another shape); `null` without diagnostics. |
 
 | `diagnostics.reason` | Meaning                                                                                                       |
 | -------------------- | ------------------------------------------------------------------------------------------------------------- |

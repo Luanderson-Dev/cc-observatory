@@ -83,6 +83,18 @@ def _diagnostics(**change: object) -> dict[str, object]:
             "non_blocking_error": 0,
             "cancelled": 0,
         },
+        "alerts": {
+            "rules": ["waiting_user", "repeated_failures"],
+            "open": 0,
+            "fired_24h": 1,
+            "discord": {
+                "configured": True,
+                "suspended_status": None,
+                "pending": 0,
+                "failed_24h": 0,
+                "expired_24h": 0,
+            },
+        },
     }
     document.update(change)
     return document
@@ -657,6 +669,118 @@ def test_diagnostics_warnings_reach_the_output(fakes: Fakes, config: Path) -> No
     run = _doctor(fakes, config)
 
     assert f"CLI {ccobs.__version__}, app 0.0.1" in run.out
+
+
+# Alerts (ADR 0046).
+
+WEBHOOK_CANARY: Final = "https://discord.com/api/webhooks/123456789012345678/CANARY-token"
+# An app older than v0.6.0: no alerts field.
+_ABSENT: Final = object()
+
+
+def _with_alerts(fakes: Fakes, alerts: object) -> None:
+    document = _diagnostics(alerts=alerts)
+    if alerts is _ABSENT:
+        del document["alerts"]
+    fakes.answers[("GET", f"{APP}/api/v1/diagnostics")] = HttpAnswer(
+        200, json.dumps(document).encode()
+    )
+
+
+def _discord(**change: object) -> dict[str, object]:
+    alerts = _diagnostics()["alerts"]
+    assert isinstance(alerts, dict)
+    return {**alerts, "discord": {**alerts["discord"], **change}}
+
+
+def test_the_alerts_check_follows_diagnostics_in_the_stack_section(
+    fakes: Fakes, config: Path
+) -> None:
+    run = _doctor(fakes, config, "--json")
+
+    stack = [c["id"] for c in json.loads(run.out)["checks"] if c["section"] == "Stack"]
+    assert stack == ["app", "hook-endpoint", "diagnostics", "alerts", "otlp", "grafana"]
+    assert _status(run, "alerts") == "ok"
+    # One diagnostics request serves both checks.
+    assert [url for _, url, _, _ in fakes.requests].count(f"{APP}/api/v1/diagnostics") == 1
+
+
+def test_a_suspended_webhook_fails_doctor(fakes: Fakes, config: Path) -> None:
+    _with_alerts(fakes, _discord(suspended_status=404, failed_24h=2))
+
+    run = _doctor(fakes, config)
+
+    assert run.code == 1
+    assert "  [FAIL] Discord sending is suspended\n" in run.out
+    assert "Discord refused the webhook (status 404); sending is suspended" in run.out
+    assert "CCOBS_DISCORD_WEBHOOK_URL in the stack's .env, then `docker compose up -d`" in run.out
+
+
+def test_undelivered_alerts_warn_and_exit_0(fakes: Fakes, config: Path) -> None:
+    _with_alerts(fakes, _discord(expired_24h=1))
+
+    run = _doctor(fakes, config, "--json")
+
+    assert run.code == 0
+    assert _status(run, "alerts") == "warn"
+
+
+def test_discord_off_is_info_and_exits_0(fakes: Fakes, config: Path) -> None:
+    _with_alerts(fakes, _discord(configured=False))
+
+    run = _doctor(fakes, config)
+
+    assert run.code == 0
+    assert "  [INFO] alerts show in the browser only\n" in run.out
+    assert "Discord is not configured; alerts show in the browser only." in run.out
+
+
+def test_an_app_that_predates_alerts_is_info(fakes: Fakes, config: Path) -> None:
+    _with_alerts(fakes, _ABSENT)
+
+    run = _doctor(fakes, config, "--json")
+
+    assert run.code == 0
+    assert _status(run, "diagnostics") == "ok"
+    assert _status(run, "alerts") == "info"
+    assert _checks(run)["alerts"]["title"] == "the app predates alerts"
+
+
+def test_malformed_alerts_warn_and_the_diagnostics_stand(fakes: Fakes, config: Path) -> None:
+    _with_alerts(fakes, _discord(configured="yes"))
+
+    run = _doctor(fakes, config, "--json")
+
+    assert run.code == 0
+    assert _status(run, "diagnostics") == "ok"
+    assert _status(run, "alerts") == "warn"
+    assert _checks(run)["alerts"]["title"] == "the app's alerts were not understood"
+
+
+def test_the_app_down_skips_the_alerts(fakes: Fakes, config: Path) -> None:
+    fakes.answers = {}
+
+    run = _doctor(fakes, config, "--json")
+
+    assert _status(run, "alerts") == "info"
+    assert _checks(run)["alerts"]["detail"] == "Skipped: the app is down."
+
+
+def test_no_webhook_url_reaches_doctor_output(fakes: Fakes, config: Path) -> None:
+    alerts = _discord(suspended_status=404, webhook=WEBHOOK_CANARY)
+    alerts["rules"] = [WEBHOOK_CANARY, "waiting_user"]
+    document = _diagnostics(host=WEBHOOK_CANARY, alerts=alerts, url=WEBHOOK_CANARY)
+    fakes.answers[("GET", f"{APP}/api/v1/diagnostics")] = HttpAnswer(
+        200, json.dumps(document).encode()
+    )
+
+    text = _doctor(fakes, config)
+    as_json = _doctor(fakes, config, "--json")
+
+    assert text.code == as_json.code == 1
+    for output in (text.out + text.err, as_json.out + as_json.err):
+        assert "CANARY" not in output
+        assert "/webhooks/" not in output
 
 
 # Clone.

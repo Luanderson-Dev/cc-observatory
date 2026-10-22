@@ -38,7 +38,13 @@ from dataclasses import dataclass
 from datetime import timedelta
 from typing import Final, Literal, cast
 
-from ccobs.domain.diagnostics import UncountedHookFailures, parse_diagnostics
+from ccobs.domain.diagnostics import (
+    ALERTS_NOT_UNDERSTOOD,
+    ALERTS_PREDATE,
+    ReportedAlerts,
+    UncountedHookFailures,
+    parse_diagnostics,
+)
 from ccobs.domain.durations import parse_duration
 from ccobs.domain.hook_config import DEFAULT_APP_PORT, HOOK_PATH, hook_settings
 from ccobs.domain.settings_merge import is_ccobs_handler
@@ -70,6 +76,7 @@ __all__ = [
     "SourceLevel",
     "StatEntry",
     "Status",
+    "check_alerts",
     "check_app",
     "check_claude_version",
     "check_content_variables",
@@ -162,6 +169,8 @@ _SERVER_MANAGED_NOTE: Final = (
     "/status in Claude Code shows the sources in effect."
 )
 _SETUP: Final = "ccobs setup"
+_REBUILD_APP: Final = "rebuild the app: `docker compose build app && docker compose up -d`"
+_APP_LOGS: Final = "check the app's log: `docker compose logs app`"
 
 
 @dataclass(frozen=True)
@@ -1015,7 +1024,7 @@ def check_diagnostics(answer: HttpAnswer | None, *, cli_version: str) -> Check:
             "the app's diagnostics were not understood",
             f"GET /api/v1/diagnostics: {_answer_text(answer)}; an app older than this CLI "
             "has no such route.",
-            "rebuild the app: `docker compose build app && docker compose up -d`",
+            _REBUILD_APP,
         )
     lines: list[str] = []
     statuses: list[Status] = []
@@ -1057,6 +1066,88 @@ def check_diagnostics(answer: HttpAnswer | None, *, cli_version: str) -> Check:
         )
     title = "the app's diagnostics need attention" if status == "warn" else "the app's diagnostics"
     return Check("diagnostics", status, title, "\n".join(lines))
+
+
+def _plural(count: int, word: str) -> str:
+    return f"{count} {word}" if count == 1 else f"{count} {word}s"
+
+
+def check_alerts(answer: HttpAnswer | None) -> Check:
+    """Where alerts and their Discord delivery stand (ADR 0046), from the app's
+    ``GET /api/v1/diagnostics``. ``answer`` is None when the app is down. Discord not
+    configured is an info: alerts in the browser alone are a valid setup (ADR 0046).
+    The webhook URL is never in the answer, so never in the check."""
+    check_id, title = "alerts", "alerts"
+    if answer is None:
+        return Check(check_id, "info", title, "Skipped: the app is down.")
+    # The diagnostics check warns on the answer itself.
+    if not answer.ok:
+        return Check(
+            check_id,
+            "info",
+            title,
+            "Skipped: no diagnostics from the app (see `diagnostics` above).",
+        )
+    parsed = parse_diagnostics(answer.body)
+    if parsed is None:
+        return Check(check_id, "info", title, "Skipped: the app's diagnostics were not understood.")
+    alerts = parsed.alerts
+    if alerts == ALERTS_PREDATE:
+        return Check(
+            check_id,
+            "info",
+            "the app predates alerts",
+            f"App {parsed.version} reports no alerts; cc-observatory 0.6.0 and later do.",
+            _REBUILD_APP,
+        )
+    if alerts == ALERTS_NOT_UNDERSTOOD:
+        return Check(
+            check_id,
+            "warn",
+            "the app's alerts were not understood",
+            "The app's alerts were not understood (a newer or older app?).",
+            "run the CLI and the app from the same release: upgrade the CLI "
+            "(`uvx cc-observatory@latest doctor`) or rebuild the app "
+            "(`docker compose build app && docker compose up -d`)",
+        )
+    if not isinstance(alerts, ReportedAlerts):
+        return Check(
+            check_id,
+            "warn",
+            "the app could not read its alerts",
+            "The app could not read its alerts from its database; its other diagnostics are above.",
+            _APP_LOGS,
+        )
+    rules = ", ".join(alerts.rules) or "none"
+    lines = [f"{alerts.open} on, {alerts.fired_24h} fired in the last 24 h; rules on: {rules}."]
+    discord = alerts.discord
+    if not discord.configured:
+        lines.append("Discord is not configured; alerts show in the browser only.")
+        return Check(check_id, "info", "alerts show in the browser only", "\n".join(lines))
+    if discord.suspended_status is not None:
+        lines.append(
+            f"Discord refused the webhook (status {discord.suspended_status}); sending is "
+            "suspended until the app restarts."
+        )
+        return Check(
+            check_id,
+            "fail",
+            "Discord sending is suspended",
+            "\n".join(lines),
+            "check CCOBS_DISCORD_WEBHOOK_URL in the stack's .env, then `docker compose up -d`",
+        )
+    waiting = f"; {_plural(discord.pending, 'alert')} waiting to be sent" if discord.pending else ""
+    lines.append(f"Discord is configured{waiting}.")
+    missed = discord.failed_24h + discord.expired_24h
+    if missed:
+        lines.append(
+            f"{_plural(missed, 'alert')} did not reach Discord in the last 24 h "
+            f"({discord.failed_24h} failed, {discord.expired_24h} expired)."
+        )
+        return Check(
+            check_id, "warn", "some alerts did not reach Discord", "\n".join(lines), _APP_LOGS
+        )
+    return Check(check_id, "ok", "alerts reach Discord", "\n".join(lines))
 
 
 def check_otlp(connected: bool, *, otlp_port: int) -> Check:

@@ -11,6 +11,7 @@ metadata under the same names (ADRs 0014 and 0015).
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Final
 
@@ -18,6 +19,9 @@ import pytest
 
 from ccobs.domain.denials import EVENT_NAME_KEY, SERVICE_NAME_LABEL
 from ccobs.domain.diagnostics import (
+    ALERTS_NOT_UNDERSTOOD,
+    ALERTS_PREDATE,
+    ALERTS_UNREAD,
     CANCELLED,
     CANCELLED_KEY,
     EXECUTIONS,
@@ -30,6 +34,8 @@ from ccobs.domain.diagnostics import (
     CountedHookFailures,
     Diagnostics,
     HookFailures,
+    ReportedAlerts,
+    ReportedDiscord,
     ReportedHooks,
     ReportedSessions,
     UnavailableReason,
@@ -371,3 +377,165 @@ _GOOD_FAILURES: Final = {
 )
 def test_a_malformed_document_is_rejected(body: bytes) -> None:
     assert parse_diagnostics(body) is None
+
+
+# The alerts part (ADR 0046): optional, since an app older than v0.6.0 has none.
+
+_GOOD_DISCORD: Final[dict[str, object]] = {
+    "configured": True,
+    "suspended_status": None,
+    "pending": 1,
+    "failed_24h": 2,
+    "expired_24h": 3,
+}
+
+
+def alerts_document(**change: object) -> dict[str, object]:
+    alerts: dict[str, object] = {
+        "rules": ["waiting_user", "repeated_failures"],
+        "open": 4,
+        "fired_24h": 5,
+        "discord": dict(_GOOD_DISCORD),
+    }
+    alerts.update(change)
+    return alerts
+
+
+def test_the_alerts_part_parses() -> None:
+    parsed = parse_diagnostics(encoded(diagnostics_document(alerts=alerts_document())))
+
+    assert parsed is not None
+    assert parsed.alerts == ReportedAlerts(
+        rules=("waiting_user", "repeated_failures"),
+        open=4,
+        fired_24h=5,
+        discord=ReportedDiscord(
+            configured=True, suspended_status=None, pending=1, failed_24h=2, expired_24h=3
+        ),
+    )
+
+
+@pytest.mark.parametrize("status", [401, 403, 404])
+def test_a_suspension_keeps_its_status(status: int) -> None:
+    discord = {**_GOOD_DISCORD, "suspended_status": status}
+
+    parsed = parse_diagnostics(
+        encoded(diagnostics_document(alerts=alerts_document(discord=discord)))
+    )
+
+    assert parsed is not None
+    assert isinstance(parsed.alerts, ReportedAlerts)
+    assert parsed.alerts.discord.suspended_status == status
+
+
+def test_the_rules_keep_adr_0041s_order_and_leave_unknown_names_out() -> None:
+    rules = ["daily_cost", "planted", "waiting_user", "daily_cost"]
+
+    parsed = parse_diagnostics(encoded(diagnostics_document(alerts=alerts_document(rules=rules))))
+
+    assert parsed is not None
+    assert isinstance(parsed.alerts, ReportedAlerts)
+    assert parsed.alerts.rules == ("waiting_user", "daily_cost")
+
+
+def test_no_rule_on_is_an_empty_tuple() -> None:
+    parsed = parse_diagnostics(encoded(diagnostics_document(alerts=alerts_document(rules=[]))))
+
+    assert parsed is not None
+    assert isinstance(parsed.alerts, ReportedAlerts)
+    assert parsed.alerts.rules == ()
+
+
+def test_an_app_that_predates_alerts_still_parses() -> None:
+    # A v0.5.0 app: no alerts field at all.
+    parsed = parse_diagnostics(encoded(diagnostics_document()))
+
+    assert parsed is not None
+    assert parsed.alerts == ALERTS_PREDATE
+    assert parsed.sessions.open_blocks == 1
+
+
+def test_alerts_the_app_could_not_read_are_unread() -> None:
+    parsed = parse_diagnostics(encoded(diagnostics_document(alerts=None)))
+
+    assert parsed is not None
+    assert parsed.alerts == ALERTS_UNREAD
+
+
+def test_the_three_markers_differ() -> None:
+    assert len({ALERTS_PREDATE, ALERTS_UNREAD, ALERTS_NOT_UNDERSTOOD}) == 3
+
+
+@pytest.mark.parametrize(
+    "alerts",
+    [
+        pytest.param([], id="list"),
+        pytest.param("on", id="text"),
+        pytest.param(0, id="number"),
+        pytest.param({}, id="empty"),
+        alerts_document(rules=None),
+        alerts_document(rules="waiting_user"),
+        alerts_document(rules=[1]),
+        alerts_document(rules=[None]),
+        alerts_document(open=-1),
+        alerts_document(open=True),
+        alerts_document(open="1"),
+        alerts_document(open=None),
+        alerts_document(fired_24h=1.5),
+        {k: v for k, v in alerts_document().items() if k != "fired_24h"},
+        alerts_document(discord=None),
+        alerts_document(discord=[]),
+        alerts_document(discord={**_GOOD_DISCORD, "configured": "yes"}),
+        alerts_document(discord={**_GOOD_DISCORD, "configured": 1}),
+        alerts_document(discord={**_GOOD_DISCORD, "suspended_status": "404"}),
+        alerts_document(discord={**_GOOD_DISCORD, "suspended_status": True}),
+        alerts_document(discord={**_GOOD_DISCORD, "suspended_status": 99}),
+        alerts_document(discord={**_GOOD_DISCORD, "suspended_status": 600}),
+        alerts_document(discord={**_GOOD_DISCORD, "pending": -1}),
+        alerts_document(discord={**_GOOD_DISCORD, "failed_24h": None}),
+        alerts_document(discord={**_GOOD_DISCORD, "expired_24h": 2.0}),
+        alerts_document(discord={k: v for k, v in _GOOD_DISCORD.items() if k != "pending"}),
+        alerts_document(
+            discord={k: v for k, v in _GOOD_DISCORD.items() if k != "suspended_status"}
+        ),
+    ],
+)
+def test_a_malformed_alerts_part_is_not_understood_and_the_rest_stands(alerts: object) -> None:
+    # A bad part is not half shown, but it does not hide the parts that parse: an app
+    # newer or older than the CLI may change it (ADR 0046).
+    parsed = parse_diagnostics(encoded(diagnostics_document(alerts=alerts)))
+
+    without_alerts = parse_diagnostics(encoded(diagnostics_document()))
+    assert without_alerts is not None
+    assert parsed == replace(without_alerts, alerts=ALERTS_NOT_UNDERSTOOD)
+
+
+def test_extra_keys_in_the_alerts_part_are_accepted() -> None:
+    # Forward compatible: a newer app may add fields to alerts and to discord.
+    discord = {**_GOOD_DISCORD, "last_sent_at_ms": 1}
+    alerts = {**alerts_document(discord=discord), "muted": 0}
+
+    parsed = parse_diagnostics(encoded(diagnostics_document(alerts=alerts)))
+
+    assert parsed is not None
+    assert parsed.alerts == ReportedAlerts(
+        rules=("waiting_user", "repeated_failures"),
+        open=4,
+        fired_24h=5,
+        discord=ReportedDiscord(
+            configured=True, suspended_status=None, pending=1, failed_24h=2, expired_24h=3
+        ),
+    )
+
+
+def test_a_changed_alerts_field_type_keeps_the_sessions() -> None:
+    # A newer app that turned open into an object: alerts not understood, sessions read.
+    alerts = alerts_document(open={"count": 4})
+
+    parsed = parse_diagnostics(encoded(diagnostics_document(alerts=alerts)))
+
+    assert parsed is not None
+    assert parsed.alerts == ALERTS_NOT_UNDERSTOOD
+    assert parsed.sessions.open_blocks == 1
+    assert parsed.sessions.by_state["working"] == 2
+    assert isinstance(parsed.hook_failures, CountedHookFailures)

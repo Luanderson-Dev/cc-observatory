@@ -56,8 +56,9 @@ out, on the `edge` network), ADR 0038 and ADR 0039 (`ccobs doctor` reads the sus
 in stage 13 of milestone 5). The message fields, the project switch and the test
 button's rate are the maintainer's decisions P6 and P7 (2026-10-20); the cadence, the
 timeouts, the retry and expiry rules, the coalescing, the escaping, the metric and the
-`CCOBS_APP_URL` setting were set during stage 12 of milestone 5, pending the
-maintainer's review.
+`CCOBS_APP_URL` setting were set during stage 12 of milestone 5, and the diagnostics
+field's shape, its 24-hour window and the severities of doctor's `alerts` check other
+than Discord-not-configured during stage 13, pending the maintainer's review.
 
 **Outbox.** With `CCOBS_DISCORD_WEBHOOK_URL` set, the writer stores each alert that fires
 with its delivery `pending`, due at once (ADR 0042). The Discord sender
@@ -180,6 +181,43 @@ swaps only 2xx answers.
 `create_app(sweeps=False)` leaves the loop off like the other background threads, the
 test button still on.
 
+**Doctor and status.** `GET /api/v1/diagnostics`
+([ADR 0038](0038-a-diagnostics-endpoint-for-ccobs-doctor-and-status.md)) gains an
+`alerts` object, always present from v0.6.0: `rules` (the names of the rules on, in ADR
+0041's order), `open` (the alerts still on), `fired_24h` (fired in the last 24 hours by
+the app's clock) and `discord`: `configured`, `suspended_status` (401, 403 or 404 while
+suspended, else `null`), `pending`, and `failed_24h` and `expired_24h` (the deliveries
+of the alerts fired in the last 24 hours that ended `failed` or `expired`; a delivery has
+no time of its own, and its outcome comes at most an hour after its alert fired). No URL,
+no alert or session ID, no project name. The counts are one aggregate over the host's
+alerts (`Repository.alert_counts`), read in the same read gate slot as the session counts
+(ADR 0033), so on the same budget; if that read fails, `alerts` is `null` and the rest of
+the answer stands. The field is new and optional for the client, so the contract stays
+compatible both ways: a v0.5.0 CLI ignores it, and the shared parser
+(`ccobs.domain.diagnostics.parse_diagnostics`) reads an answer without it as an app that
+predates alerts, `null` as alerts the app could not read, and a present field of
+another shape (a changed type, a missing field) as alerts not understood, while the
+rest of the answer stands: a CLI and an app from different releases still show the
+sessions and hook failures. Keys it does not know, inside `alerts` and `discord` as in
+every part, are ignored, so a newer app may add fields.
+`ccobs doctor` adds the check `alerts` to its Stack section, after `diagnostics`
+([ADR 0039](0039-ccobs-doctor-and-status-checks-sources-and-exit-codes.md)): `fail` while
+sending is suspended ("Discord refused the webhook (status 404); sending is suspended
+until the app restarts.", fix: check `CCOBS_DISCORD_WEBHOOK_URL` in the stack's `.env`,
+then `docker compose up -d`); `warn` when alerts of the last 24 hours failed or expired,
+when the app could not read its alerts (fix: check the app's log), or when its alerts
+were not understood ("The app's alerts were not understood (a newer or older app?).",
+fix: run the CLI and the app from the same release, upgrading the CLI with
+`uvx cc-observatory@latest doctor` or rebuilding the app); `info` when Discord is not configured
+("Discord is not configured; alerts show in the browser only.", chosen when milestone 5
+was planned, pending the maintainer's review: the browser alone is a valid setup, not a
+problem) and when the app predates alerts; `ok`
+otherwise. `ccobs status` adds one line, `Alerts: N on; Discord: on`, `off` or
+`suspended (status N)` (or `unknown` and why), and `--json` adds `alerts`, shaped like
+`hook_failures`: `available: true` with the parsed fields, or `available: false` with
+`reason` (`unread`, `predates` or `not_understood`); `null` only without diagnostics. Its
+exit codes stay ADR 0039's, so Discord's state never changes them.
+
 **Shutdown budget.** The sender adds a thread whose stop may wait on a POST in flight
 (5 s per phase), next to the cost reader's query and the reconciler's. Stopped one after
 the other, with a stuck POST and a stuck cost query, the joins would expire in turn: 5 s
@@ -251,12 +289,26 @@ existed; ADR 0030 stays as accepted.
   the canary end to end: no part of the URL in the logs, the pages, `/api/v1/alerts`,
   `/api/v1/diagnostics`, `/metrics` or the database.
 - `tests/server/test_guards.py`: the guarded POST paths.
+- `tests/server/test_diagnostics.py`: the `alerts` object's shape and counts (open of any
+  age, the 24-hour window on the app's clock, another host's alerts left out), the rules
+  in force, a configured webhook and a real suspension reported without any part of the
+  URL, a failed alerts read answered as `null` with the rest intact, one read gate slot,
+  and the answer read back by the CLI's parser.
+- `tests/test_domain_diagnostics.py`: the `alerts` part present, absent (an app older
+  than v0.6.0), `null`, and malformed (not understood, the rest of the answer intact),
+  and unknown keys inside `alerts` and `discord` accepted.
+- `tests/test_domain_doctor.py`, `tests/test_cli_doctor.py` and
+  `tests/test_cli_status.py`: the `alerts` check at each status (ok, info for Discord off
+  and for an app that predates alerts, warn, fail), its place in the Stack section, the
+  status line and `--json`, and a webhook URL planted in the answer never printed;
+  `tests/server/test_discord_app.py` feeds the app's answer after a real suspension to the
+  `alerts` check and finds no part of the URL.
 
 ## More information
 
 - Discord's [Execute Webhook](https://discord.com/developers/docs/resources/webhook#execute-webhook)
   and [rate limits](https://discord.com/developers/docs/topics/rate-limits) pages.
-- Stage 13 of milestone 5 reports the suspension and whether a webhook is configured in
-  `ccobs doctor`.
+- `ccobs doctor` and `ccobs status` report the suspension and whether a webhook is
+  configured from stage 13 of milestone 5 (Doctor and status, above).
 - Revisit if users want per-rule channels or embeds, or if central mode (ADR 0001)
   sends from several hosts to one webhook.

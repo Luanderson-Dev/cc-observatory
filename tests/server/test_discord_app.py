@@ -30,6 +30,7 @@ from sqlalchemy import insert
 
 from ccobs.domain.alerts import DAY_SUBJECT, AlertFired, AlertRule
 from ccobs.domain.app_metrics import ALERT_DELIVERIES
+from ccobs.domain.doctor import HttpAnswer, check_alerts
 from ccobs.server import app as server_app
 from ccobs.server.alert_settings import DISCORD_TEST_PATH
 from ccobs.server.config import Settings
@@ -456,6 +457,9 @@ def test_the_canary_never_leaves_the_sender(
         assert isinstance(metrics, AppMetrics)
         pages.append(generate_latest(metrics.registry).decode())
         assert sender.suspended_status == 404
+        # What ccobs doctor makes of the app's answer after the suspension (ADR 0046).
+        alerts_check = check_alerts(HttpAnswer(200, client.get("/api/v1/diagnostics").content))
+        pages.append(f"{alerts_check.title}\n{alerts_check.detail}\n{alerts_check.fix}")
         database = settings.database_path
     with sqlite3.connect(database) as connection:
         pages.append("\n".join(connection.iterdump()))
@@ -479,4 +483,5 @@ def test_the_canary_never_leaves_the_sender(
     assert_no_canary(caplog.text)
     for page in pages:
         assert_no_canary(page)
+    assert "Discord refused the webhook (status 404)" in pages[-2]
     assert "/home/canaryuser" not in pages[2]

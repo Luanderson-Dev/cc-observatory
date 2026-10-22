@@ -98,6 +98,7 @@ __all__ = [
     "DETAIL_CLOSED_LIMIT",
     "LIVE_STATUSES",
     "AgentPage",
+    "AlertCounts",
     "AlertRecord",
     "AlertSettingValue",
     "AlertView",
@@ -155,6 +156,7 @@ _DAILY_COST: Final = "daily_cost"
 _PENDING: Final = "pending"
 _NO_DISCORD: Final = "none"
 _EXPIRED: Final = "expired"
+_FAILED: Final = "failed"
 # The values the CHECK constraints allow, typed: a row's rule and delivery state.
 _RULES: Final[Mapping[str, AlertRule]] = {rule: rule for rule in ALERT_RULES}
 _DISCORD_STATES: Final[Mapping[str, DiscordState]] = {state: state for state in DISCORD_STATES}
@@ -380,6 +382,20 @@ class SessionCounts:
 
     by_state: dict[str, int]
     open_blocks: int
+
+
+@dataclass(frozen=True, kw_only=True)
+class AlertCounts:
+    """A host's alerts as ``ccobs doctor`` and ``status`` see them (ADR 0046): how many
+    are still on (any age), how many fired at or after the window's start, the Discord
+    deliveries still ``pending`` (any age), and, of the alerts fired in the window, the
+    deliveries that ended ``failed`` or ``expired``."""
+
+    open: int
+    fired: int
+    pending: int
+    failed: int
+    expired: int
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -1176,6 +1192,36 @@ class Repository:
         return SessionCounts(
             by_state={str(status): int(count) for status, count in by_state},
             open_blocks=int(open_blocks),
+        )
+
+    def alert_counts(self, host: str, *, since_ms: int) -> AlertCounts:
+        """The host's ``AlertCounts`` with the window starting at ``since_ms``
+        (inclusive): one aggregate over the host's alerts, which retention bounds (ADR
+        0042), never a list. A delivery has no time of its own: ``failed`` and
+        ``expired`` count by when their alert fired, which an hour at most separates
+        from the outcome (ADR 0046)."""
+        recent = AlertModel.fired_at_ms >= since_ms
+        state = AlertModel.discord_state
+
+        def counted(*conditions: ColumnElement[bool]) -> ColumnElement[int]:
+            # COUNT skips the NULL a CASE without ELSE gives the rows it does not match.
+            return func.count(case((and_(*conditions), 1)))
+
+        statement = select(
+            counted(AlertModel.cleared_at_ms.is_(None)),
+            counted(recent),
+            counted(state == _PENDING),
+            counted(recent, state == _FAILED),
+            counted(recent, state == _EXPIRED),
+        ).where(AlertModel.host == host)
+        with self.engine.connect() as connection:
+            open_, fired, pending, failed, expired = connection.execute(statement).one()
+        return AlertCounts(
+            open=int(open_),
+            fired=int(fired),
+            pending=int(pending),
+            failed=int(failed),
+            expired=int(expired),
         )
 
     # Reads for the web UI.

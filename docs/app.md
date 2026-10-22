@@ -539,7 +539,14 @@ no session ID, path or content.
   hook event's hooks), `non_blocking_error` and `cancelled` (the hooks that failed or
   timed out, Claude Code's own and your other hooks included); or, when Loki gives no
   usable answer within 2 seconds, `available: false` with `window_s` and a `reason`
-  (`unreachable`, `timeout`, `status` or `shape`). The route still answers 200 then.
+  (`unreachable`, `timeout`, `status` or `shape`). The route still answers 200 then;
+- `alerts` (from v0.6.0, [ADR 0046](adr/0046-discord-delivery.md)): `rules`, the names
+  of the rules on; `open`, the alerts still on; `fired_24h`, those fired in the last 24
+  hours; and `discord`: `configured`, `suspended_status` (401, 403 or 404 once Discord
+  refused the webhook, until the app restarts; else `null`), `pending`, and
+  `failed_24h` and `expired_24h`, the deliveries of the last 24 hours' alerts that did
+  not reach Discord. Never the webhook URL. `null` when the app could not read its
+  alerts; the rest of the answer still stands.
 
 Its database read goes through the same readers as the rest of the API, so it can get
 the 503 `database busy`; it then sends no query to Loki.
