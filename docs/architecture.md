@@ -10,10 +10,11 @@ repository holds:
   and `status`; [cli.md](cli.md) is its reference), `ccobs.domain` (the stored
   telemetry names of [ADR 0014](adr/0014-stored-telemetry-names.md), the hook parser,
   the session state machine, the hook and telemetry settings and their merge, the
-  doctor's rules, and the UI's presentation rules, agent tree, Grafana links and usage
-  queries, all free of I/O), and `ccobs.server`, the app
-  of milestones 2 and 3 (from v0.3.0, its web UI from v0.4.0), which the stack builds
-  and runs as its `app` service; [app.md](app.md) is the reference for operating it;
+  doctor's rules, the UI's presentation rules, agent tree, Grafana links and usage
+  queries, and the alert rules and Discord messages, all free of I/O), and
+  `ccobs.server`, the app of milestones 2, 3 and 5 (from v0.3.0, its web UI from v0.4.0,
+  its alerts from v0.6.0), which the stack builds and runs as its `app` service;
+  [app.md](app.md) is the reference for operating it;
 - the tooling around them, unit tests, and integration tests that run the stack in an
   isolated compose project;
 - development-only tools, not packaged: fixture capture (`tools/capture/`) and the
@@ -21,9 +22,9 @@ repository holds:
   service, an egress check);
 - sanitized fixtures recorded from real Claude Code sessions (`tests/fixtures/`).
 
-The app's alerts on this page are the planned design, and each part names the
-milestone that brings it (milestones and releases are listed in the roadmap in the
-[README](../README.md)).
+Each part of this page names the release or milestone that brings it (milestones and
+releases are listed in the roadmap in the [README](../README.md)); what a later
+milestone brings is marked as planned.
 
 Decisions and their reasons are recorded as architecture decision records (ADRs, MADR
 format) in [`docs/adr/`](adr/README.md). When this page and an ADR disagree, the ADR
@@ -65,16 +66,16 @@ and [app.md](app.md) the app's.
 
 ## Components
 
-| Component               | Responsibility                                                                                                                                                                                                                                                                                                                                                          | Milestone                                                |
-| ----------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------- |
-| Claude Code             | The program being observed. It exports telemetry over OTLP and calls the app's hook endpoint, both configured in the user settings, which `ccobs setup` writes (or by hand).                                                                                                                                                                                            | (external)                                               |
-| OpenTelemetry Collector | Receives OTLP on 4317 (gRPC) and 4318 (HTTP), deletes personal attributes and, by default, content, sets the `host` label and routes each signal to its backend.                                                                                                                                                                                                        | 1                                                        |
-| Prometheus              | Stores the metrics that the collector pushes to its OTLP receiver. Scrapes its own and the collector's metrics, and the app's metrics listener (from v0.3.0). Answers the app's queries for each session's tokens and cost (from v0.4.0).                                                                                                                               | 1                                                        |
-| Loki                    | Stores Claude Code's events (OpenTelemetry log records). The app reads its `tool_decision` rejects back (from v0.3.0).                                                                                                                                                                                                                                                  | 1                                                        |
-| Tempo                   | Stores traces. Runs only in the optional `traces` compose profile, because tracing is a beta feature in Claude Code and is off by default.                                                                                                                                                                                                                              | 1                                                        |
-| Grafana                 | Deep analysis, with provisioned datasources (Prometheus, Loki, Tempo) and dashboards. No login: whoever opens it is an Editor. The app's pages link to it (from v0.4.0).                                                                                                                                                                                                | 1 (datasources, overview dashboard), 6 (more dashboards) |
-| App (FastAPI, SQLite)   | From v0.3.0: receives hooks, runs the session state machine, stores sessions, agents and blocks, serves a read-only JSON API and its live state as metrics, and reads Claude Code's rejects from Loki. From v0.4.0: serves the web UI with live updates, reads each session's tokens and cost from Prometheus and links to Grafana. Later: stores and sends the alerts. | 2 (ingestion, API, metrics), 3 (UI), 5 (alerts)          |
-| `ccobs` CLI             | `setup` and `uninstall` add and remove the hooks and telemetry variables in the user settings (`~/.claude/settings.json`); `doctor` and `status` check the settings, the policies and the stack. Published on PyPI as `cc-observatory`; standard library only, it never imports server-only dependencies. [cli.md](cli.md) is its reference.                            | 4                                                        |
+| Component               | Responsibility                                                                                                                                                                                                                                                                                                                                                                                                                              | Milestone                                                |
+| ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------- |
+| Claude Code             | The program being observed. It exports telemetry over OTLP and calls the app's hook endpoint, both configured in the user settings, which `ccobs setup` writes (or by hand).                                                                                                                                                                                                                                                                | (external)                                               |
+| OpenTelemetry Collector | Receives OTLP on 4317 (gRPC) and 4318 (HTTP), deletes personal attributes and, by default, content, sets the `host` label and routes each signal to its backend.                                                                                                                                                                                                                                                                            | 1                                                        |
+| Prometheus              | Stores the metrics that the collector pushes to its OTLP receiver. Scrapes its own and the collector's metrics, and the app's metrics listener (from v0.3.0). Answers the app's queries for each session's tokens and cost (from v0.4.0).                                                                                                                                                                                                   | 1                                                        |
+| Loki                    | Stores Claude Code's events (OpenTelemetry log records). The app reads its `tool_decision` rejects back (from v0.3.0).                                                                                                                                                                                                                                                                                                                      | 1                                                        |
+| Tempo                   | Stores traces. Runs only in the optional `traces` compose profile, because tracing is a beta feature in Claude Code and is off by default.                                                                                                                                                                                                                                                                                                  | 1                                                        |
+| Grafana                 | Deep analysis, with provisioned datasources (Prometheus, Loki, Tempo) and dashboards. No login: whoever opens it is an Editor. The app's pages link to it (from v0.4.0).                                                                                                                                                                                                                                                                    | 1 (datasources, overview dashboard), 6 (more dashboards) |
+| App (FastAPI, SQLite)   | From v0.3.0: receives hooks, runs the session state machine, stores sessions, agents and blocks, serves a read-only JSON API and its live state as metrics, and reads Claude Code's rejects from Loki. From v0.4.0: serves the web UI with live updates, reads each session's tokens and cost from Prometheus and links to Grafana. From v0.6.0: evaluates the alert rules, stores the alerts, pings the browser and sends them to Discord. | 2 (ingestion, API, metrics), 3 (UI), 5 (alerts)          |
+| `ccobs` CLI             | `setup` and `uninstall` add and remove the hooks and telemetry variables in the user settings (`~/.claude/settings.json`); `doctor` and `status` check the settings, the policies and the stack. Published on PyPI as `cc-observatory`; standard library only, it never imports server-only dependencies. [cli.md](cli.md) is its reference.                                                                                                | 4                                                        |
 
 ## Two data paths
 
@@ -210,7 +211,8 @@ rules and what confirms each one; when this summary and the ADR disagree, the AD
   `working` until the next prompt or event that ends the turn; and a dialog denied with
   Esc stays open until Loki's reject or the next progress event.
 
-Open blocks drive the alerts (milestone 5).
+Open blocks drive the `waiting_user` alert, and `StopFailure` events the
+`repeated_failures` one ([Alerts](#alerts-from-v060)).
 
 ## The web UI (from v0.4.0)
 
@@ -225,8 +227,9 @@ describes what each page shows.
   `ccobs.domain.agent_tree`. htmx 2 swaps the fragments a page refetches. htmx, the
   fonts, the stylesheet and the app's own scripts ship in `src/ccobs/server/static/`,
   the vendored files pinned with SHA-256 checksums in `VENDOR.json`, so nothing loads
-  from another origin and the UI works offline. The UI is read-only: every route but
-  the hook route serves only `GET`.
+  from another origin and the UI works offline. The UI is read-only, with one
+  exception from v0.6.0: the alert settings and the Discord test button, the only
+  routes besides the hook route that take a `POST` ([Alerts](#alerts-from-v060)).
 - **No full paths, no content.** No page holds the full `cwd`: the overview shows
   the project name and the session page the path with the home directory as `~`.
   Homes are recognised by the shape of the path, so a home elsewhere (such as
@@ -296,8 +299,64 @@ strict Content Security Policy (only its own scripts, styles, fonts and images, 
 `Cross-Origin-Opener-Policy` set to `same-origin`, and `Cache-Control: no-store` outside
 `/static/`
 ([ADR 0034](adr/0034-browser-hardening-csp-fetch-metadata-and-response-headers.md)).
+From v0.6.0 the three `POST` routes of the Alerts page (save, reset and the Discord
+test) accept only a same-origin htmx request: `Sec-Fetch-Site: same-origin` when sent,
+an `Origin` equal to `<scheme>://<Host>`, `HX-Request: true` and a urlencoded form,
+checked before the body is read, with no token or cookie
+([ADR 0045](adr/0045-state-changing-routes-and-csrf.md)).
 The hook route keeps its empty 204 whatever these headers say.
 [SECURITY.md](../SECURITY.md) has the threat model.
+
+## Alerts (from v0.6.0)
+
+The app evaluates its alert rules itself; Grafana's alerting and Alertmanager stay off
+([ADR 0007](adr/0007-alerts-browser-and-discord.md)). [app.md](app.md#alerts) describes
+the rules, the settings and the channels for operators.
+
+~~~text
+alert ticker (5 s) ─► writer thread: the rules over the sessions it holds and the last
+                      cost sample; one transaction writes the alerts rows
+cost reader (60 s, only while a cost rule is on) ─► Prometheus ─► sample ─► writer
+writer, after a commit with alerts ─► ChangeHub ALERTS ─► every /ui/stream: event alerts
+                                       ─► notify.js ─► GET /api/v1/alerts ─► Notification
+Discord sender (5 s) ─► writer: due deliveries ─► POST webhook ─► outcomes ─► writer
+~~~
+
+- **Rules and evaluation**
+  ([ADR 0041](adr/0041-alert-rules-defaults-deduplication-and-evaluation.md)). Four
+  rules, `waiting_user`, `repeated_failures`, `session_cost` and `daily_cost`, are pure
+  functions in `ccobs.domain.alerts`: deduplicated by `(rule, subject)`, one fire per
+  episode, one global cooldown. An alert ticker (`ccobs.server.sweeps.AlertTicker`)
+  submits a tick to the writer every 5 seconds; the writer runs the rules over the
+  sessions it holds, with no network, and writes the effects in one transaction.
+- **Storage and settings**
+  ([ADR 0042](adr/0042-alert-tables-settings-precedence-and-retention.md)). The
+  `alerts` table holds each alert, without content, paths or project names, with its
+  Discord delivery state; `alert_settings` holds the values saved on the Alerts page,
+  which win over the `CCOBS_ALERT_*` variables, which win over the defaults. The
+  evaluator's state is rebuilt from these rows and the stored `StopFailure` events at
+  start-up.
+- **Cost reader** ([ADR 0043](adr/0043-background-cost-queries-to-prometheus.md)).
+  `ccobs.server.costs.CostReader`, a daemon thread, sends Prometheus at most two instant
+  queries a minute while a cost rule is on (none otherwise), with no session ID in
+  them, and hands the totals to the writer; a sample older than 3 minutes neither fires
+  nor clears.
+- **Browser** ([ADR 0044](adr/0044-alerts-reach-the-browser.md)). After a commit that
+  wrote alerts, the writer tells the change hub, and every page's stream sends an
+  `alerts` ping with no data. `static/js/notify.js` then reads `GET /api/v1/alerts`
+  after a cursor kept in `localStorage`, shared by the tabs, and shows a `Notification`
+  per new alert, tagged by its ID; no Service Worker, so only while a tab is open.
+- **Settings routes** ([ADR 0045](adr/0045-state-changing-routes-and-csrf.md)). The
+  Alerts page posts its form through htmx to guarded `POST` routes; the writer applies
+  a change in one transaction and the next tick uses it.
+- **Discord** ([ADR 0046](adr/0046-discord-delivery.md)). The `alerts` table is the
+  outbox: `ccobs.server.discord.DiscordSender`, a daemon thread that never touches the
+  database, asks the writer for the deliveries due every 5 seconds, posts up to 10 in
+  one message (`ccobs.domain.discord_message`), and hands the outcome back. It retries
+  transport errors and 5xx, waits out 429, expires a delivery after an hour, and
+  suspends itself on 401, 403 or 404 until the app restarts. Its HTTP client is the
+  app's only one that follows the environment's proxy settings, and the webhook URL is
+  a `SecretStr` that no log, page, row or metric holds.
 
 ## Key constraints
 
@@ -356,8 +415,9 @@ The hook route keeps its empty 204 whatever these headers say.
 - **Local only.** Published ports bind to `127.0.0.1` and there is no login. Since any
   web page can send requests to localhost, the app accepts only the `Host` names
   `localhost`, `127.0.0.1` and `[::1]`, sends no CORS headers, ignores hooks that are
-  not `application/json`, and from v0.4.0 refuses cross-site browser requests and sends
-  a strict CSP ([Browser defences](#browser-defences)). See
+  not `application/json`, from v0.4.0 refuses cross-site browser requests and sends
+  a strict CSP, and from v0.6.0 takes a `POST` only on the hook route and the Alerts
+  page's guarded routes ([Browser defences](#browser-defences)). See
   [SECURITY.md](../SECURITY.md).
 - **Grafana: no login, anonymous Editors, `localhost` only**
   ([ADR 0017](adr/0017-grafana-access-and-dns-rebinding.md)). Its settings are
@@ -380,11 +440,13 @@ The hook route keeps its empty 204 whatever these headers say.
     - the datasources (Prometheus, Loki, Tempo) are provisioned read-only from
       `stack/grafana/`, and the home page is the provisioned Claude Code overview
       dashboard.
-- **No outbound traffic.** At runtime nothing leaves the machine except the optional
-  Discord webhook and, while one of the stores is stopped, DNS lookups of its name
-  ([SECURITY.md](../SECURITY.md)). The bundled configs turn off upstream usage reporting
-  and update checks, and tests check that they stay off, in the configs and in the
-  running stack:
+- **No outbound traffic.** At runtime nothing leaves the machine except the alerts the
+  app sends to the optional Discord webhook (from v0.6.0,
+  [ADR 0046](adr/0046-discord-delivery.md)) and, while one of the stores is stopped,
+  DNS lookups of its name ([SECURITY.md](../SECURITY.md)). The cost alerts' queries go
+  to the stack's own Prometheus over `backend`. The bundled configs turn off upstream
+  usage reporting and update checks, and tests check that they stay off, in the configs
+  and in the running stack:
     - Grafana: usage reporting, the update checks for Grafana and its plugins, feedback
       links, the news feed, Gravatar, external snapshots, the plugin signing key
       download, the plugin preinstall and its updates, plugin installs from the catalog

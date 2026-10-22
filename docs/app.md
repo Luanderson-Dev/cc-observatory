@@ -4,8 +4,9 @@ A reference for operating the app, from v0.3.0 (its web UI from v0.4.0): what it
 what its pages show, how to point Claude Code at it, what it stores and serves, its
 settings, and what to check when something goes wrong. [stack.md](stack.md) covers the
 compose stack it runs in, and [cli.md](cli.md) the `ccobs` commands; the decisions
-behind the app are ADRs 0023 to 0035, and 0038 for its diagnostics route, in
-[`adr/`](adr/README.md), and this page links to them instead of repeating their reasons.
+behind the app are ADRs 0023 to 0035, 0038 for its diagnostics route and 0041 to 0046
+for its alerts, in [`adr/`](adr/README.md), and this page links to them instead of
+repeating their reasons.
 
 Commands run from the repository root, where `compose.yaml` is, in bash (Git Bash on
 Windows).
@@ -40,7 +41,11 @@ The app is the `app` service of the compose stack, a FastAPI process
   session page, and links each session to its logs, tokens and cost in Grafana
   ([ADR 0035](adr/0035-per-session-tokens-and-cost-from-prometheus-and-grafana-links.md));
 - exports its live state as Prometheus metrics on a separate listener that Prometheus
-  scrapes ([ADR 0028](adr/0028-app-metrics-and-their-listener.md)).
+  scrapes ([ADR 0028](adr/0028-app-metrics-and-their-listener.md));
+- from v0.6.0, warns you when a session waits on you, when its API requests keep
+  failing, or when the estimated cost of a session or of the last 24 hours goes over a
+  limit: on its Alerts page, as browser notifications and, if you configure a webhook,
+  in a Discord channel ([Alerts](#alerts)).
 
 `ccobs setup` writes the hooks into Claude Code's user settings for you
 ([cli.md](cli.md)); [Point Claude Code at the app](#point-claude-code-at-the-app) shows
@@ -57,10 +62,12 @@ does not update it, since no registry has the image.
 Open <http://127.0.0.1:4300> in a browser (the port is `CCOBS_APP_PORT`). The UI is
 server-rendered HTML with htmx and files that ship with the app: it loads nothing from
 another origin, works offline and, like the rest of the app, has no login
-([ADR 0031](adr/0031-server-rendered-pages-with-htmx-and-vendored-assets.md)). It is
-read-only: it shows what the app stored and changes nothing, in the app or in Claude
-Code. Until Claude Code sends hooks to the app, the overview shows how to connect it
-(see [Point Claude Code at the app](#point-claude-code-at-the-app)).
+([ADR 0031](adr/0031-server-rendered-pages-with-htmx-and-vendored-assets.md)). It shows
+what the app stored and changes nothing in Claude Code. In the app, from v0.6.0, it
+changes one thing, the alert settings, and it sends one thing, the Discord test message;
+everything else is read-only (see [Alerts](#alerts)). Until Claude Code sends hooks to
+the app, the overview shows how to connect it (see
+[Point Claude Code at the app](#point-claude-code-at-the-app)).
 
 ### Pages
 
@@ -98,10 +105,15 @@ Code. Until Claude Code sends hooks to the app, the overview shows how to connec
   The page shows every open block and running agent, the latest 50 closed blocks and
   stopped agents, and the latest 50 hook events; "Show older ..." appends the next 50
   in place. An unknown session ID gets a "Session not found" page (404).
+- **Alerts** (`GET /alerts`, from v0.6.0, the header's **Alerts** link): the alerts
+  that fired, newest first, then the alert settings, the Discord line and the browser
+  notifications control (see [The Alerts page](#the-alerts-page)).
 - **Times** are elapsed times ticking in the browser; hover one for the moment in your
   time zone.
 - **Theme**: system, light or dark, from the toggle in the header; the choice is kept in
-  the browser's local storage for the app's origin, and nothing else is.
+  the browser's local storage for the app's origin, and, from v0.6.0, so is the newest
+  alert the browser has read (`ccobs.alerts.cursor`, see
+  [Browser notifications](#browser-notifications)); nothing else is.
 - **Errors**: when a read waits more than 5 seconds for one of the app's 4 database
   readers, the page or the part of it says "The database is busy", with a 503; reload it
   a few seconds later. "The app could not read its database" (also a 503) means a read
@@ -119,6 +131,10 @@ pages and may change in any release; scripts should use the
 | `GET /ui/sessions/{session_id}/blocks`, `.../agents` | The next page of closed blocks or stopped agents ("Show older ..."). |
 | `GET /ui/sessions/{session_id}/events`               | Older hook events (`before`), or the new ones (`after`).             |
 | `GET /ui/sessions/{session_id}/usage`                | The "Tokens and cost" section.                                       |
+| `GET /ui/alerts/history`                             | The Alerts page's history alone (`before`), for the live updates.    |
+| `GET /ui/alerts/settings`                            | The alert settings form alone.                                       |
+| `POST /ui/alerts/settings`, `.../settings/reset`     | Save or reset alert settings (see [Alerts](#alerts)); guarded.       |
+| `POST /ui/alerts/discord/test`                       | The Discord test message (see [Discord](#discord)); guarded.         |
 | `GET /ui/stream`                                     | The live updates stream (below).                                     |
 | `GET /static/...`                                    | The stylesheet, scripts, fonts and icon, with their licenses.        |
 
@@ -450,6 +466,234 @@ it sends no query.
   at the stale sweep, and its duration includes the time until then.
 - A reject exported more than 15 minutes after its block opened is ignored.
 
+## Alerts
+
+From v0.6.0 the app warns you when a session needs you or costs more than you want
+([ADR 0007](adr/0007-alerts-browser-and-discord.md)). It evaluates the rules itself,
+on its writer thread, every 5 seconds, and stores each alert that fires
+([ADR 0041](adr/0041-alert-rules-defaults-deduplication-and-evaluation.md),
+[ADR 0042](adr/0042-alert-tables-settings-precedence-and-retention.md)). Every alert
+goes to every channel there is: the [Alerts page](#the-alerts-page),
+[browser notifications](#browser-notifications) while a tab of the app is open, and,
+if you configure a webhook, a [Discord](#discord) channel. Without a webhook nothing
+leaves your machine.
+
+### The rules
+
+| Rule                | On the Alerts page                    | Fires when                                                                                                      | Default            | Range                                       |
+| ------------------- | ------------------------------------- | --------------------------------------------------------------------------------------------------------------- | ------------------ | ------------------------------------------- |
+| `waiting_user`      | When a session waits on you           | A session has been `waiting_user` (a permission prompt or an MCP elicitation open) for the threshold.           | on, 30 seconds     | 5 to 86400 seconds                          |
+| `repeated_failures` | When API requests keep failing        | A session received N `StopFailure` hooks (turns that ended on an API error) within W seconds.                   | on, 3 within 600 s | N from 2 to 100, W from 60 to 86400 seconds |
+| `session_cost`      | When a session costs more than        | A session's estimated cost reaches the limit.                                                                   | off, US$ 10        | US$ 0.01 to 100000                          |
+| `daily_cost`        | When the last 24 hours cost more than | The estimated cost of the last 24 hours, across sessions, reaches the limit (a rolling 24 hours, no time zone). | off, US$ 50        | US$ 0.01 to 100000                          |
+
+- **One alert per episode.** An alert is about one rule and one subject: a session, or
+  the day for `daily_cost`. It fires once, when the value reaches the threshold, and
+  never again while the condition lasts; it clears when the condition ends: the session
+  stops waiting, the failures age out of the window, the cost falls below 90% of the
+  limit, the session ends or goes stale, or you turn the rule off. One session's alert
+  never hides another's.
+- **Cooldown** ("Between two alerts of the same kind", 300 seconds by default, 0 to
+  86400): a new episode of the same rule and subject fires only once that long has
+  passed since the last one fired; if it still holds when the cooldown ends, it fires
+  then.
+- **Waiting on you** counts from the oldest open block, so with the default threshold it
+  fires about 30 seconds after a permission prompt opens. A session that finished its
+  turn and waits for your next prompt is `idle`, not waiting, and never fires it
+  ([Sessions, agents and blocks](#sessions-agents-and-blocks)).
+- **Failures** count every `StopFailure`, whatever its error code, from the main thread
+  or a subagent. A successful turn of the main thread (its `Stop`) clears them all, and
+  so does `SessionEnd`; a subagent's `Stop` does not. ADR 0041 explains why Claude
+  Code's `api_error` events do not count.
+- An alert can take up to 5 seconds to fire, the next evaluation. After a restart, an
+  alert that was on stays on and does not fire again.
+
+### Cost alerts
+
+- **An estimate, not your bill.** The cost is Claude Code's own estimate from its
+  telemetry, the same totals as the session page's
+  ([Tokens and cost](#tokens-and-cost)), not the amount you are billed. The settings
+  form says so too.
+- **Off by default.** Turn them on under Settings on the Alerts page, or with
+  `CCOBS_ALERT_SESSION_COST_ENABLED` and `CCOBS_ALERT_DAILY_COST_ENABLED`.
+- **Prometheus, at most once a minute, only while one is on**
+  ([ADR 0043](adr/0043-background-cost-queries-to-prometheus.md)). While a cost rule is
+  on, a background reader sends `CCOBS_PROMETHEUS_URL` up to two queries a minute: one
+  for every open session's cost, grouped by session ID (no session ID is in the query),
+  and one for the last 24 hours. With both rules off, it sends nothing. The first round
+  runs a minute after the app starts. The queries go to the stack's Prometheus on its
+  internal network and never leave your machine.
+- **They lag** Claude Code's metrics export, about once a minute, so a cost alert can
+  fire a minute or two after the cost was spent. Only sessions that are neither ended
+  nor stale fire `session_cost`.
+- **When Prometheus does not answer**, the cost rules keep their last totals for 3
+  minutes; after that they neither fire nor clear until it answers again, so an alert
+  never clears because Prometheus stopped. After a failed round the next one runs a
+  minute later, then after 2, 4 and 8 minutes, then every 10 minutes until one works;
+  each query counts in `ccobs_prometheus_queries_total` like the session page's
+  ([Metrics](#metrics)).
+- They need the telemetry settings that `ccobs setup` writes, and they can come out low
+  in the same cases as the session page's totals
+  ([Tokens and cost](#tokens-and-cost)).
+
+### Settings: the environment, the Alerts page and Reset
+
+Each setting has a `CCOBS_ALERT_*` variable with the default above
+([Configuration](#configuration)), and the Settings part of the Alerts page can
+override it ([ADR 0042](adr/0042-alert-tables-settings-precedence-and-retention.md),
+[ADR 0045](adr/0045-state-changing-routes-and-csrf.md)):
+
+- The form shows each value in force and where it comes from: **Saved here**, **From
+  the environment** (its `CCOBS_ALERT_*` variable is set) or **Default**. Compose passes
+  every `CCOBS_ALERT_*` variable, with the defaults above unless `.env` says otherwise,
+  so in the stack an unsaved setting shows **From the environment**; **Default** shows
+  only when the app runs outside compose without the variable.
+- **Save changes** saves the fields you changed, and only those: a saved value wins
+  over the environment's, and a field you left alone keeps following the environment.
+  With nothing changed, the form says "No changes to save." A value out of its range
+  saves nothing: the form marks the field with its range and keeps what you typed.
+- **Reset**, next to a saved value, drops it, and **Reset all** drops every saved
+  value; the setting follows the environment again, or the default.
+- A change applies at the next evaluation, within 5 seconds, and to the cost queries
+  from their next round. Saved values are in the app's database, for the app's host
+  label: they survive restarts and upgrades, and `docker compose down -v` deletes them
+  with the volume.
+- An invalid `CCOBS_ALERT_*` value stops the app at start-up with a line that names the
+  variable. A saved value that is no longer valid (a database edited by hand) is
+  ignored, with a log line that names the setting, and the environment's value stays in
+  force.
+
+### The Alerts page
+
+`GET /alerts`, the header's **Alerts** link:
+
+- **Recent alerts**: one strip per alert, newest first, 50 per page ("Older alerts"
+  pages on): what happened ("Waiting on you for over 45s", "API requests failed 3
+  times", "This session cost $12.40 (limit $10)"), the session's project name and
+  short ID, linking to its page (a daily alert shows "All sessions"), when it fired,
+  and "Still on" or "Cleared after" how long. It refreshes itself when an alert
+  fires or clears. With no alert yet, it says when the app warns you, from the rules
+  in force.
+- **Settings**, in this order: the Discord line, the browser notifications control and
+  the settings form.
+    - With a webhook: "Alerts also go to your Discord webhook." (plus "Messages name
+      the project." with `CCOBS_DISCORD_INCLUDE_PROJECT=true`) and the **Send test
+      message** button ([Discord](#discord)). The page never shows the webhook URL.
+    - Without: "Discord is off. Set `CCOBS_DISCORD_WEBHOOK_URL` in the stack's `.env`
+      and restart the app to send alerts there too."
+
+### Browser notifications
+
+From v0.6.0 every page of the app listens for alerts on its live updates stream and
+shows a notification for each new one ([ADR 0044](adr/0044-alerts-reach-the-browser.md)):
+
+- **Turn them on** on the Alerts page: **Notify me in this browser** asks the browser
+  for its permission (browsers ask only after a click). Once you answered, the button
+  becomes a sentence: notifications are on, blocked for the site ("Allow them in the
+  browser's site settings to get them."), or not supported by this browser. Each
+  browser, and each of `127.0.0.1` and `localhost`, asks separately.
+- **Only while a tab of the app is open**, any page of it. There is no Service Worker,
+  so with every tab closed nothing shows; Discord covers that case.
+- **One per alert, across tabs.** The browser keeps the newest alert it has read in
+  its local storage, shared by every tab of the origin, and each notification is tagged
+  with the alert's ID, so two tabs replace one notification instead of stacking two.
+  Rarely, two tabs reading the same burst at once can show an alert again.
+- **Only new alerts that are still on and fired less than 5 minutes ago.** The first
+  time a browser opens the app, nothing shows for the alerts already in the history;
+  an alert that fired while no tab was open shows when you open one, if it is still on
+  and less than 5 minutes old.
+- **What a notification says**: the title names the rule (`cc-observatory: waiting on
+  you`, `API requests failing`, `session cost over the limit` or `daily cost over the
+  limit`); the body says what happened, after the project name and short session ID
+  for a session's alert, never a path or content.
+- **Clicking it** focuses the tab that showed it and opens the session's page (the
+  Alerts page for a daily alert). If that tab was closed or moved to another page, the
+  click does nothing; open the app yourself.
+
+### Discord
+
+With a webhook configured, each alert also goes to a Discord channel, the app's only
+connection that leaves your machine
+([ADR 0046](adr/0046-discord-delivery.md)).
+
+1. **Create the webhook in Discord**, as Discord's
+   [Intro to Webhooks](https://support.discord.com/hc/en-us/articles/228383668-Intro-to-Webhooks)
+   describes: open your server's **Server Settings**, go to the **Integrations** tab,
+   click **Create Webhook**, choose the text channel it posts to (and a name), then click
+   **Copy Webhook URL**.
+2. **Put the URL in the stack's `.env`**, in your clone, next to `compose.yaml` (copy
+   [`.env.example`](../.env.example) first if you have no `.env`):
+
+   ~~~bash
+   CCOBS_DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/<id>/<token>
+   ~~~
+
+   The app accepts only a Discord webhook URL: `https` on `discord.com`,
+   `discordapp.com`, `canary.discord.com` or `ptb.discord.com`, with the path
+   `/api/webhooks/<id>/<token>` (optionally `/api/v<N>/webhooks/...`), and nothing
+   after it. Anything else stops the app at start-up with a line that names the
+   variable and never shows the value.
+3. **Apply it**: `docker compose up -d` recreates the app with the new value.
+4. **Test it**: on the Alerts page, **Send test message** posts "cc-observatory test
+   message from host <host>. Alerts will show up here." and says what Discord answered
+   ("Test message sent.", or the status and what it means). It sends at most one test
+   every 10 seconds, stores nothing and is not an alert.
+
+**What a message says.** One line per alert, in plain words: what happened, the host
+label, the short session ID (8 characters) and a link to the session's page on this
+machine, `<CCOBS_APP_URL>/sessions/<id>` (the Alerts page for a daily alert); up to 10
+alerts in one message. For example:
+
+~~~text
+Waiting on you for over 31s. Host local, session 3f2a9c1e: <http://localhost:4300/sessions/3f2a9c1e-0000-4000-8000-000000000000>
+The last 24 hours cost $51.20 (limit $50). Host local: <http://localhost:4300/alerts>
+~~~
+
+- The project name follows the session ID only with
+  `CCOBS_DISCORD_INCLUDE_PROJECT=true` (off by default, since the message leaves your
+  machine), as `project <name>`, at most 100 characters.
+- A message never holds the working directory, a path, a prompt, a tool input or output,
+  or error text: an alert stores none of them. It pings nobody (no `@everyone`, role or
+  user mention, whatever a name says), and the links show no preview.
+- The links open only on the machine that runs the stack. `CCOBS_APP_URL` follows
+  `CCOBS_APP_PORT` ([Configuration](#configuration)).
+
+**Delivery** ([ADR 0046](adr/0046-discord-delivery.md)):
+
+- A sender thread posts the alerts due every 5 seconds, so an alert reaches Discord
+  within about 5 seconds of firing. Alerts that fire while the webhook is not configured
+  are never sent, even after you configure it.
+- **No answer, a timeout or a 5xx**: tried again after 5 seconds, doubling up to 5
+  minutes, 5 attempts in all; then given up (`failed`).
+- **429 (rate limited)**: nothing goes out until Discord's `retry_after` has passed
+  (at most 15 minutes), then the same alerts are sent.
+- **Still unsent an hour after it fired**: dropped (`expired`); a late alert is no
+  longer news.
+- **401, 403 or 404** (the webhook was deleted, or the URL is wrong): those alerts are
+  `failed`, and **the app sends nothing more to Discord until it restarts**, since
+  Discord bans an address that keeps sending refused requests. `ccobs doctor` fails its
+  `alerts` check ("Discord refused the webhook (status 404); sending is suspended until
+  the app restarts.") and `ccobs status` shows `Discord: suspended (status 404)`
+  ([cli.md](cli.md#ccobs-doctor)). Fix the URL in `.env` and run `docker compose up -d`;
+  if the URL was right, `docker compose restart app` lifts the suspension.
+- **Any other status** (a redirect, which is never followed, or a 400): `failed`, not
+  retried.
+- Delivery is at least once: if the app stops between a post and recording its
+  outcome, the same alerts go again after the restart, within the hour.
+- The connection follows `HTTPS_PROXY`, `NO_PROXY` and `SSL_CERT_FILE` from the app
+  container's environment, for a network that reaches Discord only through a proxy;
+  no other connection of the app does.
+- `ccobs_alert_deliveries_total` counts each alert's outcome ([Metrics](#metrics)).
+
+**The webhook URL is a secret**: anyone who has it can post to your channel. The app
+keeps it out of its logs, pages, API answers, metrics and database, but Docker does
+not: `docker compose config` (without `--quiet`) prints it with the rest of the
+resolved settings, and `docker inspect` of the app container shows it in the
+container's environment. Don't paste their output in an issue. If the URL leaks,
+delete the webhook in Discord (**Server Settings**, **Integrations**, its webhooks), so
+the old URL stops working, create a new one, put its URL in `.env` and run
+`docker compose up -d` ([SECURITY.md](../SECURITY.md)).
+
 ## The JSON API
 
 The app serves a read-only JSON API under `/api/v1`. `GET /api/v1/sessions` lists
@@ -521,6 +765,31 @@ oldest first, which is how the browser catches up from the last `id` it saw, pag
 page until one comes back empty. Unlike the session routes, the default order is newest
 first. `before` and `after` together, or outside 0 to 2^63 - 1, are a 422.
 
+The API itself is read-only. The only routes besides the hook route that take a `POST`
+are the ones behind the Alerts page, under `/ui/` like the pages' other parts, and they
+serve the page, not scripts
+([ADR 0045](adr/0045-state-changing-routes-and-csrf.md)):
+`POST /ui/alerts/settings` (save the fields of the form), `POST /ui/alerts/settings/reset`
+(`field=<name>` resets one setting, no field resets them all) and
+`POST /ui/alerts/discord/test`. Each answers an HTML fragment, and only to a request
+that looks like the page's own: `Sec-Fetch-Site: same-origin` when the header is sent,
+exactly one `Origin` equal to `http://<Host>` (the same `Host` the request sends),
+`HX-Request: true`, and a urlencoded form body. Anything else gets a 403
+(`forbidden`), or a 415 for another body type, before the body is read; a form over 4
+KiB gets a 413. The fields are
+the `CCOBS_ALERT_*` names in lower case without `CCOBS_` (`alert_waiting_threshold_s`,
+...). From curl, for example:
+
+~~~bash
+curl -s http://127.0.0.1:4300/ui/alerts/settings \
+  -H 'Origin: http://127.0.0.1:4300' -H 'HX-Request: true' \
+  --data 'alert_waiting_threshold_s=60'
+~~~
+
+A save answers 200 even when a value is out of range: the fragment then holds the
+error and nothing is saved. A 503 means the app did not confirm the change in time;
+read the form again (`GET /ui/alerts/settings`) to see the settings in force.
+
 From v0.5.0, `GET /api/v1/diagnostics`
 ([ADR 0038](adr/0038-a-diagnostics-endpoint-for-ccobs-doctor-and-status.md)) gives the
 app's state for `ccobs doctor` and `ccobs status` ([cli.md](cli.md)), as counts only:
@@ -589,7 +858,8 @@ in [ADR 0028](adr/0028-app-metrics-and-their-listener.md); the Loki counter is i
 counter in
 [ADR 0035](adr/0035-per-session-tokens-and-cost-from-prometheus-and-grafana-links.md),
 the alerts counter in
-[ADR 0041](adr/0041-alert-rules-defaults-deduplication-and-evaluation.md).
+[ADR 0041](adr/0041-alert-rules-defaults-deduplication-and-evaluation.md) and the
+Discord deliveries counter in [ADR 0046](adr/0046-discord-delivery.md).
 
 | Series                              | Type      | Labels            | Meaning                                                                              |
 | ----------------------------------- | --------- | ----------------- | ------------------------------------------------------------------------------------ |
@@ -606,7 +876,7 @@ the alerts counter in
 | `ccobs_build_info`                  | gauge     | `host`, `version` | Always 1; `version` is the running cc-observatory version.                           |
 | `ccobs_database_wal`                | gauge     | `host`            | 1 if the database runs in WAL mode, 0 if its filesystem refused WAL.                 |
 | `ccobs_loki_queries_total`          | counter   | `host`, `result`  | Queries sent to Loki (Esc denials, diagnostics), by result (`ok`, `error`).          |
-| `ccobs_prometheus_queries_total`    | counter   | `host`, `result`  | Queries sent to Prometheus for tokens and cost, by result (see below).               |
+| `ccobs_prometheus_queries_total`    | counter   | `host`, `result`  | Queries sent to Prometheus for tokens and cost and the cost alerts, by result.       |
 | `ccobs_ui_streams`                  | gauge     | `host`            | Live update streams open to the web UI.                                              |
 | `ccobs_ui_streams_refused_total`    | counter   | `host`            | Live update streams refused because 16 were already open.                            |
 | `ccobs_alerts_fired_total`          | counter   | `host`, `rule`    | Alerts that fired, by rule (the four rules, below).                                  |
@@ -685,8 +955,16 @@ you; going back to an older app image after a migration is not supported
   [What the UI never shows](#what-the-ui-never-shows)). Pages are sent with
   `Cache-Control: no-store`, so the browser keeps no copy of them on disk.
 - The app's only query to Loki holds no session or call ID, so nothing personal reaches
-  Loki's query log. Its queries to Prometheus hold a session ID, and Prometheus logs no
-  query in the stack.
+  Loki's query log. The session page's queries to Prometheus hold a session ID, the
+  cost alerts' queries none, and Prometheus logs no query in the stack.
+- **Alerts** (from v0.6.0) store the rule, the session ID, the times, the value and the
+  threshold, and no content, path or project name
+  ([ADR 0042](adr/0042-alert-tables-settings-precedence-and-retention.md)). Browser
+  notifications show the project name and short session ID, never a path. A Discord
+  message is the only thing the app sends off your machine, and only with a webhook
+  configured: the rule in words, the host label, the short session ID and a local link,
+  plus the project name only with `CCOBS_DISCORD_INCLUDE_PROJECT=true`
+  ([Discord](#discord)).
 
 ## Browser defences
 
@@ -720,10 +998,16 @@ which has no login, defends itself
   `/static/`. A header a route sets itself is kept. An unhandled 500 from Starlette's
   error middleware carries none of them; its body is generic.
 - **Read-only.** Every route but the hook route serves only `GET`; any other method gets
-  a 405. The only exception is the alert settings routes, `POST /ui/alerts/settings`
-  and `POST /ui/alerts/settings/reset` (ADR 0045), which answer 403 unless the request
-  is a same-origin htmx request (`Sec-Fetch-Site: same-origin` when sent, an `Origin`
-  equal to the app's, `HX-Request: true`) and 415 unless its body is a urlencoded form.
+  a 405. The only exceptions are the alert settings routes, `POST /ui/alerts/settings`
+  and `POST /ui/alerts/settings/reset`
+  ([ADR 0045](adr/0045-state-changing-routes-and-csrf.md)), and the Discord test
+  button's `POST /ui/alerts/discord/test`
+  ([ADR 0046](adr/0046-discord-delivery.md)), which answer 403 unless the request is a
+  same-origin htmx request (`Sec-Fetch-Site: same-origin` when sent, an `Origin` equal
+  to the app's, `HX-Request: true`) and 415 unless its body is a urlencoded form. A page
+  of another origin can neither forge `Origin` nor add `HX-Request` without a CORS
+  preflight, which fails, so it cannot change your settings or send a test message
+  through your browser.
 - **The hook route is outside all of this.** It answers its empty 204 with no added
   header, whatever `Sec-Fetch-*` headers say (Claude Code sends none).
 - **Nothing extra.** No `/docs`, `/redoc` or `/openapi.json`, no access log, no
@@ -755,6 +1039,31 @@ in `.env` and run `docker compose up -d`.
 | `CCOBS_HOOK_QUEUE_MAX_ITEMS` | `10000`                  | Advanced: most hooks the queue holds at once, 1 to 1000000.                                                        |
 | `CCOBS_HOOK_QUEUE_MAX_BYTES` | `67108864`               | Advanced: most body bytes the queue holds at once (64 MiB), 1 MiB to 1 GiB.                                        |
 | `CCOBS_HOOK_BODY_MAX_BYTES`  | `8388608`                | Advanced: largest hook body read (8 MiB), 64 KiB to 64 MiB and at most the queue's bytes.                          |
+
+The alert settings ([Alerts](#alerts)), from v0.6.0. Each is the value the Alerts page
+falls back to; a value saved there wins over it until you Reset it. Switches take `true`
+or `false`, seconds and counts a whole number, limits a whole or decimal number of US
+dollars:
+
+| Variable                           | Default | Effect                                                                                 |
+| ---------------------------------- | ------- | -------------------------------------------------------------------------------------- |
+| `CCOBS_ALERT_WAITING_ENABLED`      | `true`  | Warn when a session waits on you.                                                      |
+| `CCOBS_ALERT_WAITING_THRESHOLD_S`  | `30`    | After how many seconds of waiting, 5 to 86400.                                         |
+| `CCOBS_ALERT_FAILURES_ENABLED`     | `true`  | Warn when API requests keep failing in a session.                                      |
+| `CCOBS_ALERT_FAILURES_COUNT`       | `3`     | After how many `StopFailure` events, 2 to 100...                                       |
+| `CCOBS_ALERT_FAILURES_WINDOW_S`    | `600`   | ...within how many seconds, 60 to 86400.                                               |
+| `CCOBS_ALERT_SESSION_COST_ENABLED` | `false` | Warn when a session's estimated cost reaches the limit; queries Prometheus while on.   |
+| `CCOBS_ALERT_SESSION_COST_USD`     | `10`    | That limit, 0.01 to 100000.                                                            |
+| `CCOBS_ALERT_DAILY_COST_ENABLED`   | `false` | Warn when the last 24 hours' estimated cost reaches the limit; queries Prometheus too. |
+| `CCOBS_ALERT_DAILY_COST_USD`       | `50`    | That limit, 0.01 to 100000.                                                            |
+| `CCOBS_ALERT_COOLDOWN_S`           | `300`   | Least time between two alerts of one rule about one session (or the day), 0 to 86400.  |
+
+And Discord ([Discord](#discord)), which the Alerts page does not change:
+
+| Variable                        | Default | Effect                                                                                                                 |
+| ------------------------------- | ------- | ---------------------------------------------------------------------------------------------------------------------- |
+| `CCOBS_DISCORD_WEBHOOK_URL`     | unset   | The webhook alerts go to; a secret. Unset or empty, the app sends nothing to Discord. Commented out in `.env.example`. |
+| `CCOBS_DISCORD_INCLUDE_PROJECT` | `false` | Whether Discord messages name the session's project: `true` or `false`.                                                |
 
 Compose also passes `CCOBS_GRAFANA_URL`, Grafana as the browser opens it, for the UI's
 links. It is not offered in `.env`: compose sets it to Grafana's root URL,
@@ -910,6 +1219,57 @@ filesystem under the data directory refused WAL, so reads block the writer. The 
 volume of the stack supports it; this happens when the data directory is on a network
 or shared filesystem. Keep it on a local disk.
 
+### No browser notification
+
+A notification shows only for a new alert that is still on, fired less than 5 minutes
+ago, while a tab of the app is open ([Browser notifications](#browser-notifications)).
+If one fired (it is on the Alerts page) and none showed:
+
+- **The permission.** The Alerts page says "This browser shows a notification for each
+  new alert while a tab of the app is open." once it is allowed. If it says they are
+  blocked, allow notifications for the site in the browser's site settings (the icon
+  left of the address), then reload. `127.0.0.1` and `localhost` are two sites, each
+  with its own permission.
+- **Windows.** Do not disturb (Focus assist on Windows 10) hides notifications, and
+  Windows can turn them off for the browser itself: check both in **Settings >
+  System > Notifications** (**Notifications & actions** on Windows 10).
+- **macOS.** **System Settings > Notifications**, then the browser: notifications must
+  be allowed for it, and a Focus mode can hide them.
+- **The browser's own settings**: a setting that blocks or quiets notification
+  requests for every site keeps the permission prompt from showing.
+- **No tab open, or a paused stream.** A tab that shows "Live updates paused" gets no
+  alert ping until it reconnects ([below](#live-updates-paused-reconnecting)); the 17th
+  tab of the app is one.
+- **The first visit.** The first time a browser opens the app, it starts after the
+  newest alert already stored and shows none of them.
+
+### No Discord message
+
+1. Run `ccobs doctor` ([cli.md](cli.md#ccobs-doctor)). Its `alerts` check says whether
+   Discord is configured (info when it is not: set `CCOBS_DISCORD_WEBHOOK_URL`, see
+   [Discord](#discord)), whether Discord refused the webhook (fail: sending is
+   suspended until the app restarts), and how many of the last 24 hours' alerts failed
+   or expired (warn). `ccobs status` shows the same in one line.
+2. On the Alerts page, **Send test message** checks the webhook now and says what
+   Discord answered.
+3. Read the app's log, `docker compose logs app | grep -i discord`. Each line names a
+   status or an error type, never the URL:
+    - `discord refused the webhook (status 404); sending suspended until the app
+      restarts: check CCOBS_DISCORD_WEBHOOK_URL`: the webhook was deleted or the URL
+      is wrong; fix it in `.env` and run `docker compose up -d` (with the same URL,
+      `docker compose restart app`);
+    - `discord delivery of N alerts failed (connection error); will retry`, or a
+      timeout, or a 5xx status: Discord is unreachable from the container, or down. On
+      a network that reaches the internet only through a proxy, set `HTTPS_PROXY` (and
+      `NO_PROXY`) in the app container's environment, for example in a compose
+      override file; the app follows them for Discord only;
+    - `discord rate limited the webhook; next message in N s`: Discord asked to wait;
+      the alerts go after it;
+    - `discord rejected a message of N alerts (status N); not retried`: a status that a
+      retry would not change;
+    - `discord: N alerts expired unsent`: they stayed unsent for an hour.
+4. An alert that fired before the webhook was configured is never sent.
+
 ### Checking for dropped hooks
 
 In Grafana's Explore, with the Prometheus datasource, query
@@ -979,6 +1339,14 @@ measurement, or unverified.
 - **Home directories** (by design): recognised by the shape of the path, so a home in
   an unusual place shows as it is (see
   [What the UI never shows](#what-the-ui-never-shows)).
+- **Alerts** (by design, ADRs 0041 to 0046): evaluated every 5 seconds, so two episodes
+  of one session less than 5 seconds apart can count as one; cost alerts lag Claude
+  Code's metrics export by a minute or two. Browser notifications show only while a tab
+  of the app is open, can rarely show twice across tabs, and a click does nothing once
+  the tab that showed it is gone. Discord delivery is at least once (a crash between a
+  post and its record sends it again), can wait about 5 seconds, drops an alert still
+  unsent after an hour, and stops after a 401, 403 or 404 until the app restarts; its
+  links open only on the machine that runs the stack.
 - **Memory** (measured on Docker Desktop 29.8, WSL 2, in v0.3.0, before the web UI):
   63.8 MiB idle, 70.1 MiB after about 2,750 hooks, against a 256m limit
   ([stack.md](stack.md#memory-and-disk)).

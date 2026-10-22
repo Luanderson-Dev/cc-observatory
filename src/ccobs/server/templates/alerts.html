@@ -21,7 +21,7 @@
   {% else %}
   <p class="alerts-discord">Discord is off. Set <code>CCOBS_DISCORD_WEBHOOK_URL</code> in the stack's <code>.env</code> and restart the app to send alerts there too.</p>
   {% endif %}
-  {#- The browser notifications control goes here (milestone 5, stage 11). -#}
+  {#- notify.js fills this with the browser notifications control (ADR 0044). -#}
   <div id="alert-notifications" class="alert-notifications"></div>
   {% include "_alert_settings.html" %}
 </section>

@@ -82,7 +82,7 @@ HTTP_TIMEOUT_S: Final = 3.0
 # The session query has one series per session in its range, a few hundred bytes each:
 # 8 MiB holds tens of thousands of sessions.
 MAX_ANSWER_BYTES: Final = 8 * 1024 * 1024
-# After a failure: 2, 4 and 8 minutes, then every 10 minutes until a round succeeds.
+# After a failure: 1, 2, 4 and 8 minutes, then every 10 minutes until a round succeeds.
 BACKOFF_INITIAL_S: Final = 60.0
 BACKOFF_MAX_S: Final = 600.0
 QUERY_PATH: Final = "/api/v1/query"
