@@ -414,7 +414,9 @@ FAILURES: Final[list[tuple[str, httpx.Response | Exception, str, str]]] = [
     ),
     ("not JSON", httpx.Response(200, content=b"<html>12.5</html>"), "invalid", "JSONDecodeError"),
     ("not UTF", httpx.Response(200, content=b"\xff\xfe\xfa"), "invalid", "Error"),
-    ("too deep", httpx.Response(200, content=b"[" * 100_000), "invalid", "RecursionError"),
+    # Nesting too deep for the decoder: RecursionError up to Python 3.13, JSONDecodeError
+    # from 3.14; either way the answer is invalid and only the error's type is logged.
+    ("too deep", httpx.Response(200, content=b"[" * 100_000), "invalid", "Error"),
     (
         "an error answer",
         httpx.Response(200, json={"status": "error", "error": f"bad {SESSION}"}),
