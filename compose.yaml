@@ -77,7 +77,7 @@ services:
   # compose.debug.yaml publishes it on loopback.
   prometheus:
     <<: *service
-    image: prom/prometheus:v3.13.4@sha256:87861b8cf91579109319ebc300f3f1060e6da9c05d6ae8ad15a20c879e84e32e
+    image: prom/prometheus:v3.13.5@sha256:aafa9d694e6a883c02db516d9f6e5b84e14195f49a2a6456a4cca815edda72b9
     command:
       - --config.file=/etc/ccobs/prometheus/prometheus.yaml
       - --storage.tsdb.path=/prometheus
